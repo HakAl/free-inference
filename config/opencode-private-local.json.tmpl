@@ -1,0 +1,100 @@
+{
+  "autoupdate": false,
+  "share": "disabled",
+  "snapshot": false,
+  "lsp": false,
+  "formatter": false,
+  "enabled_providers": [
+    "private-local"
+  ],
+  "model": "private-local/__MODEL_ID__",
+  "small_model": "private-local/__MODEL_ID__",
+  "provider": {
+    "private-local": {
+      "name": "Private Local (Rung 1)",
+      "npm": "@opencode/ai/providers/openai-compatible",
+      "options": {
+        "baseURL": "__API_BASE_URL__",
+        "apiKey": "__API_KEY_VALUE__",
+        "timeout": 120000
+      },
+      "models": {
+        "__MODEL_ID__": {
+          "id": "__SERVED_MODEL_ID__",
+          "name": "__MODEL_ID__ (Rung 1 local)",
+          "tool_call": true,
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          },
+          "limit": {
+            "context": __CONTEXT_LIMIT__,
+            "output": __OUTPUT_LIMIT__
+          }
+        }
+      }
+    }
+  },
+  "mcp": {
+    "servers": {
+      "local_assist": {
+        "type": "local",
+        "command": [
+          "__LAB_PYTHON__",
+          "-m",
+          "local_assist.server"
+        ],
+        "cwd": "__LAB_ROOT__",
+        "environment": {
+          "LOCAL_ASSIST_BASE_URL": "__API_BASE_URL__",
+          "LOCAL_ASSIST_WORKSPACE_ROOT": "__WORKSPACE_DIR__"
+        },
+        "disabled": false,
+        "codemode": false,
+        "timeout": 180000
+      }
+    }
+  },
+  "tools": {
+    "read": true,
+    "glob": true,
+    "grep": true,
+    "list": true,
+    "edit": true,
+    "write": true,
+    "patch": true,
+    "bash": true,
+    "todowrite": true,
+    "todoread": true,
+    "question": true,
+    "webfetch": false,
+    "websearch": false,
+    "context7*": false
+  },
+  "permission": {
+    "*": "ask",
+    "read": "allow",
+    "glob": "allow",
+    "grep": "allow",
+    "list": "allow",
+    "todowrite": "allow",
+    "todoread": "allow",
+    "question": "allow",
+    "local_assist*": "allow",
+    "edit": "__EDIT_PERMISSION__",
+    "write": "__EDIT_PERMISSION__",
+    "patch": "__EDIT_PERMISSION__",
+    "bash": "ask",
+    "external_directory": "ask",
+    "doom_loop": "ask",
+    "webfetch": "deny",
+    "websearch": "deny",
+    "codesearch": "deny",
+    "lsp": "deny",
+    "context7*": "deny"
+  }
+}

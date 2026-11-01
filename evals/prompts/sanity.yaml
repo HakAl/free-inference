@@ -1,0 +1,4 @@
+tests:
+  - id: ocean-one-sentence
+    vars:
+      prompt: "/no_think Write exactly one sentence about the ocean."

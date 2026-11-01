@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import sys
+from typing import Any
+
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from local_assist.errors import LocalAssistError  # noqa: E402
+from local_assist.tools.compress_context import run as compress_context  # noqa: E402
+from local_assist.tools.delegate_task import ALLOWED_KINDS, run as delegate_task  # noqa: E402
+from local_assist.tools.extract_fields import run as extract_fields  # noqa: E402
+from local_assist.tools.propose_eval_prompts import (  # noqa: E402
+    ALLOWED_CATEGORIES,
+    run as propose_eval_prompts,
+)
+
+
+def _read_text_arg(inline_text: str | None, file_path: str | None, *, label: str) -> str:
+    if inline_text is not None and file_path is not None:
+        raise LocalAssistError(
+            "invalid_arguments",
+            f"Pass either --{label} or --{label}-file, not both.",
+        )
+    if file_path is not None:
+        p = Path(file_path).expanduser().resolve()
+        if not p.is_file():
+            raise LocalAssistError("invalid_arguments", f"{label} file not found: {file_path}")
+        return p.read_text(encoding="utf-8")
+    if inline_text is not None:
+        return inline_text
+    if not sys.stdin.isatty():
+        return sys.stdin.read()
+    raise LocalAssistError("invalid_arguments", f"Missing required --{label} or --{label}-file (or stdin).")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "CLI helper to invoke local_assist tools against the cleared Rung 1 local MLX model "
+            "(qwen3-30b-a3b-2507-mlx-4bit on 127.0.0.1:8080/v1). "
+            "Note: if invoked by a remote planner (e.g. Claude Code on Rung 5 standard_api), any context "
+            "read by the planner or tool output returned to the planner enters that planner's data-control rung."
+        )
+    )
+    parser.add_argument(
+        "--auto-serve",
+        action="store_true",
+        help="Opt in to auto-starting the cleared Rung 1 local MLX server (~16 GB resident RAM) if port 8080 is down.",
+    )
+    subparsers = parser.add_subparsers(dest="subcommand", required=True)
+
+    p_delegate = subparsers.add_parser(
+        "delegate_task",
+        help="Delegate a bounded code/test/text/Q&A task to the cleared Rung 1 local model.",
+    )
+    p_delegate.add_argument(
+        "--auto-serve",
+        action="store_true",
+        dest="sub_auto_serve",
+        help="Opt in to auto-starting the cleared Rung 1 local MLX server if port 8080 is down.",
+    )
+    p_delegate.add_argument(
+        "--kind",
+        required=True,
+        choices=sorted(ALLOWED_KINDS),
+        help="Subtask kind.",
+    )
+    p_delegate.add_argument(
+        "--instruction",
+        required=True,
+        help="Task instruction (1..8000 characters).",
+    )
+    p_delegate.add_argument(
+        "--context",
+        default=None,
+        help="Optional inline reference context (<= 32000 characters; mutually exclusive with --context-file).",
+    )
+    p_delegate.add_argument(
+        "--context-file",
+        "--context-path",
+        dest="context_file",
+        default=None,
+        help="Optional local regular-file path read directly by delegate_task (no '..' traversal; mutually exclusive with --context).",
+    )
+    p_delegate.add_argument(
+        "--constraint",
+        dest="constraints",
+        action="append",
+        default=None,
+        help="Optional constraint string (may be passed multiple times, max 20).",
+    )
+    p_delegate.add_argument(
+        "--max-tokens",
+        type=int,
+        default=1536,
+        help="Maximum output tokens (256..2048, default: 1536).",
+    )
+
+    p_compress = subparsers.add_parser(
+        "compress_context",
+        help="Compress a diff, test_output, or logs dump into structured JSON.",
+    )
+    p_compress.add_argument(
+        "--auto-serve",
+        action="store_true",
+        dest="sub_auto_serve",
+        help="Opt in to auto-starting the cleared Rung 1 local MLX server if port 8080 is down.",
+    )
+    p_compress.add_argument(
+        "--kind",
+        required=True,
+        choices=["diff", "test_output", "logs"],
+        help="Kind of context to compress.",
+    )
+    p_compress.add_argument("--text", default=None, help="Inline text to compress.")
+    p_compress.add_argument("--text-file", default=None, help="File path containing text to compress.")
+    p_compress.add_argument("--focus", default=None, help="Optional focus hint.")
+    p_compress.add_argument("--max-items", type=int, default=10, help="Max items per list (1..50, default: 10).")
+
+    p_extract = subparsers.add_parser(
+        "extract_fields",
+        help="Extract structured scalar/list fields from text.",
+    )
+    p_extract.add_argument(
+        "--auto-serve",
+        action="store_true",
+        dest="sub_auto_serve",
+        help="Opt in to auto-starting the cleared Rung 1 local MLX server if port 8080 is down.",
+    )
+    p_extract.add_argument("--text", default=None, help="Inline source text.")
+    p_extract.add_argument("--text-file", default=None, help="File path containing source text.")
+    p_extract.add_argument(
+        "--fields-json",
+        required=True,
+        help="JSON object mapping field_name to {type, description, required}.",
+    )
+
+    p_propose = subparsers.add_parser(
+        "propose_eval_prompts",
+        help="Generate candidate promptfoo eval prompts.",
+    )
+    p_propose.add_argument(
+        "--auto-serve",
+        action="store_true",
+        dest="sub_auto_serve",
+        help="Opt in to auto-starting the cleared Rung 1 local MLX server if port 8080 is down.",
+    )
+    p_propose.add_argument(
+        "--category",
+        required=True,
+        choices=sorted(ALLOWED_CATEGORIES),
+        help="Signal category to target.",
+    )
+    p_propose.add_argument("--n", type=int, default=5, help="Number of candidates (1..25, default: 5).")
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.auto_serve or getattr(args, "sub_auto_serve", False):
+        os.environ["LOCAL_ASSIST_AUTO_SERVE"] = "1"
+
+    try:
+        if args.subcommand == "delegate_task":
+            payload: dict[str, Any] = delegate_task(
+                kind=args.kind,
+                instruction=args.instruction,
+                context=args.context,
+                context_path=args.context_file,
+                constraints=args.constraints,
+                max_tokens=args.max_tokens,
+            )
+        elif args.subcommand == "compress_context":
+            text = _read_text_arg(args.text, args.text_file, label="text")
+            payload = compress_context(
+                kind=args.kind,
+                text=text,
+                focus=args.focus,
+                max_items=args.max_items,
+            )
+        elif args.subcommand == "extract_fields":
+            text = _read_text_arg(args.text, args.text_file, label="text")
+            try:
+                fields = json.loads(args.fields_json)
+            except json.JSONDecodeError as exc:
+                raise LocalAssistError("invalid_arguments", f"Invalid --fields-json: {exc}") from exc
+            payload = extract_fields(text=text, fields=fields)
+        elif args.subcommand == "propose_eval_prompts":
+            payload = propose_eval_prompts(category=args.category, n=args.n)
+        else:
+            raise LocalAssistError("invalid_arguments", f"Unsupported subcommand: {args.subcommand}")
+    except LocalAssistError as exc:
+        err_payload = exc.to_payload()
+        print(json.dumps(err_payload, indent=2, ensure_ascii=False), file=sys.stderr)
+        return 1
+
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

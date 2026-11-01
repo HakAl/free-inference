@@ -1,0 +1,222 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import json
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Any
+from urllib.request import Request, urlopen
+
+ROOT = Path(__file__).resolve().parents[1]
+VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
+if VENV_PYTHON.exists() and Path(sys.executable) != VENV_PYTHON:
+    os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), __file__, *sys.argv[1:]])
+
+sys.path.insert(0, str(ROOT))
+
+from local_assist.registry import (
+    RegistryError,
+    load_model,
+    read_pid_record_for_model,
+    resolve_endpoint,
+)
+
+DEFAULT_TEXT_PROMPT = "/no_think Write exactly one sentence about the ocean."
+# Note: /no_think is a Qwen3 control token and a harmless literal prefix on Gemma 4,
+# which disables thinking via chat_template_args.enable_thinking: false.
+DEFAULT_TOOLS_PROMPT = "/no_think Use the read_file tool to read README.md. Do not answer in prose."
+TIMING_TOOLS_SPEC: list[dict[str, Any]] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read the contents of a file at the given relative path.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Relative path to the file.",
+                    }
+                },
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+        },
+    }
+]
+
+
+def normalize_output(text: str) -> str:
+    import re
+
+    text = re.sub(r"<think>[\s\S]*?</think>\s*", "", text)
+    text = re.sub(r"(<\|im_end\|>|<\|eot_id\|>|</s>)\s*$", "", text)
+    return text.strip()
+
+
+def parse_args(argv: list[str]) -> tuple[str, bool, str] | None:
+    args = argv[1:]
+    if not args:
+        return None
+    tools_mode = False
+    remaining: list[str] = []
+    for arg in args:
+        if arg == "--tools" and not tools_mode:
+            tools_mode = True
+        else:
+            remaining.append(arg)
+    if len(remaining) < 1 or len(remaining) > 2:
+        return None
+    model_id = remaining[0]
+    if len(remaining) == 2:
+        prompt = remaining[1]
+    else:
+        prompt = DEFAULT_TOOLS_PROMPT if tools_mode else DEFAULT_TEXT_PROMPT
+    return model_id, tools_mode, prompt
+
+
+def main(argv: list[str]) -> int:
+    parsed = parse_args(argv)
+    if parsed is None:
+        print("usage: scripts/timing <model-id> [--tools] [prompt]", file=sys.stderr)
+        return 2
+
+    model_id, tools_mode, prompt = parsed
+
+    try:
+        model = load_model(model_id)
+        pid_record = read_pid_record_for_model(model_id)
+        endpoint = resolve_endpoint(model, pid_record=pid_record)
+    except RegistryError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    max_tokens = 120 if tools_mode else 80
+    payload: dict[str, Any] = {
+        "model": endpoint.served_model_id,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.0 if tools_mode else 0.2,
+        "max_tokens": max_tokens,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
+    provider_cfg = (model.get("promptfoo_provider") or {}).get("config") or {}
+    extra_body = provider_cfg.get("extraBody")
+    if isinstance(extra_body, dict) and "chat_template_args" in extra_body:
+        payload["chat_template_args"] = extra_body["chat_template_args"]
+    passthrough = provider_cfg.get("passthrough")
+    if isinstance(passthrough, dict):
+        for key in ("include_reasoning", "reasoning_effort", "chat_template_kwargs"):
+            if key in passthrough:
+                payload[key] = passthrough[key]
+    if tools_mode:
+        payload["tools"] = TIMING_TOOLS_SPEC
+
+    req = Request(
+        f"{endpoint.api_base_url}/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {endpoint.api_key}",
+        },
+        method="POST",
+    )
+
+    started = time.perf_counter()
+    first_token = None
+    chunks = 0
+    tool_call_chunks = 0
+    text_parts: list[str] = []
+    tool_calls_by_index: dict[int, dict[str, str]] = {}
+    usage: dict[str, Any] | None = None
+
+    with urlopen(req, timeout=120) as resp:
+        for raw in resp:
+            line = raw.decode("utf-8", errors="replace").strip()
+            if not line.startswith("data: "):
+                continue
+            data = line[6:]
+            if data == "[DONE]":
+                break
+            event = json.loads(data)
+            if isinstance(event.get("usage"), dict) and event["usage"]:
+                usage = event["usage"]
+            choices = event.get("choices") or []
+            if not choices:
+                continue
+            delta = choices[0].get("delta", {})
+            content = delta.get("content")
+            tool_calls = delta.get("tool_calls")
+            if content:
+                if first_token is None:
+                    first_token = time.perf_counter()
+                chunks += 1
+                text_parts.append(content)
+            if tool_calls:
+                if first_token is None:
+                    first_token = time.perf_counter()
+                if not content:
+                    chunks += 1
+                tool_call_chunks += 1
+                if isinstance(tool_calls, list):
+                    for idx_pos, tc in enumerate(tool_calls):
+                        if not isinstance(tc, dict):
+                            continue
+                        tc_idx = tc.get("index") if isinstance(tc.get("index"), int) else idx_pos
+                        entry = tool_calls_by_index.setdefault(
+                            tc_idx, {"id": "", "name": "", "arguments": ""}
+                        )
+                        if isinstance(tc.get("id"), str) and tc["id"]:
+                            entry["id"] = tc["id"]
+                        fn = tc.get("function")
+                        if isinstance(fn, dict):
+                            if isinstance(fn.get("name"), str) and fn["name"]:
+                                entry["name"] += fn["name"]
+                            if isinstance(fn.get("arguments"), str) and fn["arguments"]:
+                                entry["arguments"] += fn["arguments"]
+
+    ended = time.perf_counter()
+    raw_output = "".join(text_parts)
+    normalized_output = normalize_output(raw_output)
+    tool_calls_emitted = [tool_calls_by_index[k] for k in sorted(tool_calls_by_index)]
+    estimated_prompt_tokens = 400 if tools_mode else 100
+    reserved_total_tokens = estimated_prompt_tokens + max_tokens
+    observed_total = (
+        usage.get("total_tokens")
+        if isinstance(usage, dict) and isinstance(usage.get("total_tokens"), int)
+        else None
+    )
+    result = {
+        "model_id": endpoint.model_id,
+        "repo": endpoint.served_model_id,
+        "endpoint": endpoint.api_base_url,
+        "mode": "tools" if tools_mode else "text",
+        "prompt": prompt,
+        "max_tokens": max_tokens,
+        "ttft_seconds": None if first_token is None else round(first_token - started, 4),
+        "total_seconds": round(ended - started, 4),
+        "stream_chunks": chunks,
+        "tool_call_chunks": tool_call_chunks,
+        "tool_calls_emitted": tool_calls_emitted,
+        "usage": usage,
+        "reserved_token_budget": {
+            "estimated_prompt_tokens": estimated_prompt_tokens,
+            "max_completion_tokens": max_tokens,
+            "reserved_total_tokens": reserved_total_tokens,
+            "effective_total_tokens": observed_total if observed_total is not None else reserved_total_tokens,
+            "used_fallback_reservation": observed_total is None,
+        },
+        "raw_output_chars": len(raw_output),
+        "normalized_output_chars": len(normalized_output),
+        "raw_output_preview": raw_output[:500],
+        "normalized_output_preview": normalized_output[:500],
+    }
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

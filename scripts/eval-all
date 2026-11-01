@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+SUITE="${1:-v1}"
+shift || true
+
+if [ "$#" -gt 0 ]; then
+  MODELS=("$@")
+else
+  MODELS=(
+    "phi-4-mlx-4bit"
+    "qwen3-30b-a3b-2507-mlx-4bit"
+    "qwen3-coder-30b-a3b-mlx-4bit"
+  )
+fi
+
+STATUS=0
+
+for model in "${MODELS[@]}"; do
+  echo "==> Starting $model"
+  scripts/stop-model || true
+  scripts/serve-model "$model"
+
+  echo "==> Waiting for server"
+  for attempt in $(seq 1 60); do
+    if curl -fsS http://127.0.0.1:8080/v1/models >/dev/null; then
+      break
+    fi
+    sleep 5
+    if [ "$attempt" -eq 60 ]; then
+      echo "Server did not become ready for $model" >&2
+      exit 1
+    fi
+  done
+
+  echo "==> Running $SUITE for $model"
+  if ! scripts/eval "$SUITE" "$model"; then
+    echo "Suite $SUITE reported failures for $model" >&2
+    STATUS=1
+  fi
+done
+
+echo "Done."
+exit "$STATUS"

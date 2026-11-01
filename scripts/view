@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+mkdir -p .home/.promptfoo
+export HOME="$PWD/.home"
+export PROMPTFOO_DISABLE_TELEMETRY=1
+
+npx --no-install promptfoo view "$@"

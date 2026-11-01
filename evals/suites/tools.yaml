@@ -1,0 +1,236 @@
+description: Local LLM tool-calling eval suite (OpenAI tools / tool_calls)
+
+prompts:
+  - "{{prompt}}"
+
+providers:
+  - id: openai:chat:Qwen/Qwen3-1.7B-MLX-4bit
+    transform: "typeof output === 'string' ? output.replace(/<\\|im_end\\|>\\s*$/g, '').trim() : output"
+    config:
+      apiBaseUrl: http://127.0.0.1:8080/v1
+      apiKey: none
+      temperature: 0.0
+      max_tokens: 500
+      tools: &agent_tools
+        - type: function
+          function:
+            name: read_file
+            description: Read the UTF-8 contents of a file in the repository.
+            parameters:
+              type: object
+              properties:
+                path:
+                  type: string
+                  description: Relative path from the repository root.
+              required:
+                - path
+              additionalProperties: false
+        - type: function
+          function:
+            name: search_repo
+            description: Search repository files for a regex or literal pattern.
+            parameters:
+              type: object
+              properties:
+                query:
+                  type: string
+                  description: Search pattern.
+                path_glob:
+                  type: string
+                  description: Optional glob filter.
+              required:
+                - query
+              additionalProperties: false
+        - type: function
+          function:
+            name: run_tests
+            description: Run the repository unit test suite.
+            parameters:
+              type: object
+              properties:
+                target:
+                  type: string
+                  description: Optional test module or path.
+              additionalProperties: false
+  - id: openai:chat:mlx-community/phi-4-4bit
+    transform: "typeof output === 'string' ? output.replace(/<\\|im_end\\|>\\s*$/g, '').trim() : output"
+    config:
+      apiBaseUrl: http://127.0.0.1:8080/v1
+      apiKey: none
+      temperature: 0.0
+      max_tokens: 500
+      tools: *agent_tools
+  - id: openai:chat:mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit
+    transform: "typeof output === 'string' ? output.replace(/<\\|im_end\\|>\\s*$/g, '').trim() : output"
+    config:
+      apiBaseUrl: http://127.0.0.1:8080/v1
+      apiKey: none
+      temperature: 0.0
+      max_tokens: 500
+      tools: *agent_tools
+  - id: openai:chat:mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit
+    transform: "typeof output === 'string' ? output.replace(/<\\|im_end\\|>\\s*$/g, '').trim() : output"
+    config:
+      apiBaseUrl: http://127.0.0.1:8080/v1
+      apiKey: none
+      temperature: 0.0
+      max_tokens: 500
+      tools: *agent_tools
+  - id: openai:chat:mlx-community/gpt-oss-20b-MXFP4-Q4
+    transform: file://evals/transforms/harmony.js
+    config:
+      apiBaseUrl: http://127.0.0.1:8080/v1
+      apiKey: none
+      temperature: 0.0
+      max_tokens: 700
+      tools: *agent_tools
+
+tests:
+  - description: single-tool-read-file
+    vars:
+      prompt: |
+        Read the contents of `models.yaml` to inspect the registered models. Call the appropriate tool rather than guessing.
+    assert:
+      - type: javascript
+        value: |
+          return (() => {
+            if (!output || typeof output !== 'object') return false;
+            const toolCalls = Array.isArray(output)
+              ? output
+              : Array.isArray(output.tool_calls)
+                ? output.tool_calls
+                : Array.isArray(output.message?.tool_calls)
+                  ? output.message.tool_calls
+                  : null;
+            if (!Array.isArray(toolCalls) || toolCalls.length !== 1) return false;
+            const call = toolCalls[0];
+            if (!call || typeof call !== 'object' || Array.isArray(call)) return false;
+            if (typeof call.id !== 'string' || call.id.trim().length === 0) return false;
+            if (call.type !== 'function') return false;
+            const fn = call.function;
+            if (!fn || typeof fn !== 'object' || Array.isArray(fn) || fn.name !== 'read_file') return false;
+            if (typeof fn.arguments !== 'string') return false;
+            let args;
+            try {
+              args = JSON.parse(fn.arguments);
+            } catch {
+              return false;
+            }
+            if (!args || typeof args !== 'object' || Array.isArray(args)) return false;
+            const keys = Object.keys(args);
+            if (keys.length !== 1 || keys[0] !== 'path' || typeof args.path !== 'string') return false;
+            const cleanPath = args.path.replace(/^\.\//, '');
+            return cleanPath === 'models.yaml';
+          })();
+
+  - description: parallel-tool-calls-diff-check
+    vars:
+      prompt: |
+        I need to compare `scripts/serve-model` and `scripts/verify-served-model`. Read both files in this turn using tool calls.
+    assert:
+      - type: javascript
+        value: |
+          return (() => {
+            if (!output || typeof output !== 'object') return false;
+            const toolCalls = Array.isArray(output)
+              ? output
+              : Array.isArray(output.tool_calls)
+                ? output.tool_calls
+                : Array.isArray(output.message?.tool_calls)
+                  ? output.message.tool_calls
+                  : null;
+            if (!Array.isArray(toolCalls) || toolCalls.length < 2) return false;
+            const seenIds = new Set();
+            const paths = new Set();
+            for (const call of toolCalls) {
+              if (!call || typeof call !== 'object' || Array.isArray(call)) return false;
+              if (typeof call.id !== 'string' || call.id.trim().length === 0) return false;
+              if (seenIds.has(call.id)) return false;
+              seenIds.add(call.id);
+              if (call.type !== 'function') return false;
+              const fn = call.function;
+              if (!fn || typeof fn !== 'object' || Array.isArray(fn) || fn.name !== 'read_file') return false;
+              if (typeof fn.arguments !== 'string') return false;
+              let args;
+              try {
+                args = JSON.parse(fn.arguments);
+              } catch {
+                return false;
+              }
+              if (!args || typeof args !== 'object' || Array.isArray(args)) return false;
+              const keys = Object.keys(args);
+              if (keys.length !== 1 || keys[0] !== 'path' || typeof args.path !== 'string') return false;
+              paths.add(args.path.replace(/^\.\//, ''));
+            }
+            return paths.size === 2 &&
+              paths.has('scripts/serve-model') &&
+              paths.has('scripts/verify-served-model');
+          })();
+
+  - description: tool-result-followup
+    vars:
+      prompt: >-
+        [
+          {
+            "role": "user",
+            "content": "Read `models.yaml` and tell me the `id` and `license` of the starter model."
+          },
+          {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+              {
+                "id": "call_read_models_1",
+                "type": "function",
+                "function": {
+                  "name": "read_file",
+                  "arguments": "{\"path\":\"models.yaml\"}"
+                }
+              }
+            ]
+          },
+          {
+            "role": "tool",
+            "tool_call_id": "call_read_models_1",
+            "name": "read_file",
+            "content": "models:\n  - id: qwen3-1.7b-mlx-4bit\n    status: candidate\n    repo: Qwen/Qwen3-1.7B-MLX-4bit\n    license: apache-2.0\n"
+          }
+        ]
+    assert:
+      - type: javascript
+        value: |
+          return (() => {
+            if (Array.isArray(output)) return false;
+            if (output && typeof output === 'object') {
+              const calls = output.tool_calls || output.message?.tool_calls || [];
+              if (Array.isArray(calls) && calls.length > 0) return false;
+              const text = String(output.content ?? output.message?.content ?? '');
+              return text.includes('qwen3-1.7b-mlx-4bit') && /apache-2\.0/i.test(text);
+            }
+            const text = String(output ?? '');
+            return text.includes('qwen3-1.7b-mlx-4bit') && /apache-2\.0/i.test(text);
+          })();
+
+  - description: no-tool-when-unnecessary
+    vars:
+      prompt: |
+        Without inspecting any files or calling any tools, explain in two sentences why binary search requires a sorted array.
+    assert:
+      - type: javascript
+        value: |
+          return (() => {
+            if (Array.isArray(output)) return false;
+            let text = '';
+            if (output && typeof output === 'object') {
+              const calls = output.tool_calls || output.message?.tool_calls || [];
+              if (Array.isArray(calls) && calls.length > 0) return false;
+              text = String(output.content ?? output.message?.content ?? '');
+            } else {
+              text = String(output ?? '');
+            }
+            const trimmed = text.trim();
+            if (trimmed.startsWith('[') || trimmed.startsWith('{"tool_calls"')) return false;
+            return trimmed.length > 40 &&
+              /(sorted|order)/i.test(trimmed) &&
+              /(half|middle|divide|compare|discard|eliminate)/i.test(trimmed);
+          })();

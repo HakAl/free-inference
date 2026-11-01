@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
+if VENV_PYTHON.exists() and Path(sys.executable) != VENV_PYTHON:
+    os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), __file__, *sys.argv[1:]])
+
+sys.path.insert(0, str(ROOT))
+
+from local_assist.registry import (
+    RegistryError,
+    load_model,
+    read_pid_record_for_model,
+    resolve_endpoint,
+)
+
+
+def main(argv: list[str]) -> int:
+    if "--" not in argv[1:]:
+        print("usage: scripts/with-session-token <model-id> -- <command> [args...]", file=sys.stderr)
+        return 2
+    sep = argv.index("--")
+    if sep != 2 or len(argv) <= sep + 1:
+        print("usage: scripts/with-session-token <model-id> -- <command> [args...]", file=sys.stderr)
+        return 2
+
+    model_id = argv[1]
+    cmd = argv[sep + 1 :]
+
+    try:
+        model = load_model(model_id)
+        pid_record = read_pid_record_for_model(model_id)
+        if isinstance(pid_record, dict) and pid_record.get("status") == "starting":
+            print(
+                f"Model {model_id} is still starting (status='starting'); wait for scripts/serve-model to finish.",
+                file=sys.stderr,
+            )
+            return 1
+        endpoint = resolve_endpoint(model, pid_record=pid_record, require_api_key=False)
+    except RegistryError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    child_env = dict(os.environ)
+    if endpoint.api_key_keychain_service:
+        if not endpoint.api_key.startswith("se-session-"):
+            print(
+                f"Model {model_id} uses apiKeyKeychainService='{endpoint.api_key_keychain_service}', "
+                "but no active se-key-proxy session token was found. Run scripts/serve-model first.",
+                file=sys.stderr,
+            )
+            return 1
+        child_env["LOCAL_ASSIST_SESSION_TOKEN"] = endpoint.api_key
+
+    cp = subprocess.run(cmd, env=child_env, check=False)
+    return cp.returncode
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

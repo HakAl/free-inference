@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+MODEL_ID="${1:-qwen3-1.7b-mlx-4bit}"
+PROMPT="/no_think Write exactly one sentence about the ocean."
+
+scripts/timing "$MODEL_ID" "$PROMPT"

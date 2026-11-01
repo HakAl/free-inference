@@ -1,0 +1,906 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import contextlib
+import hashlib
+import json
+import math
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
+if VENV_PYTHON.exists() and Path(sys.executable) != VENV_PYTHON:
+    os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), __file__, *sys.argv[1:]])
+
+sys.path.insert(0, str(ROOT))
+
+from local_assist.client import check_private_coding_admission
+from local_assist.errors import LocalAssistError
+from local_assist.registry import (
+    ATTESTED_ENCLAVE_TIERS,
+    EndpointConfig,
+    RegistryError,
+    SESSION_TOKEN_ENV_VAR,
+    load_model,
+    load_models,
+    read_pid_record_for_model,
+    resolve_endpoint,
+)
+
+DEFAULT_CONTEXT_LIMIT = 131072
+DEFAULT_OUTPUT_LIMIT = 16384
+DEFAULT_WAIT_SECONDS = 60.0
+DEFAULT_MAX_CHAT_REQUESTS = 1000
+DEFAULT_MAX_TOKENS_CAP = 16384
+DEFAULT_MAX_REQUEST_BYTES = 8388608
+DEFAULT_TTL_SECONDS = 43200
+DEFAULT_STREAM_TIMEOUT_SECONDS = 300
+DEFAULT_MAX_SESSION_USD: float | None = None
+WORST_CASE_BYTES_PER_TOKEN = 3.0
+RUNG1_LOCAL_ASSIST_BASE_URL = "http://127.0.0.1:8080/v1"
+EXIT_MODEL_MISMATCH = 3
+
+TEMPLATE_CONFIG = ROOT / "config" / "opencode-private-attested.json.tmpl"
+DEFAULT_ISOLATED_HOME = ROOT / ".home" / "opencode-private-attested"
+
+SAFE_ENV_ALLOWLIST = (
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TERM",
+    "COLORTERM",
+    "TMPDIR",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "SYSTEMROOT",
+    "SSH_AUTH_SOCK",
+    "EDITOR",
+    "VISUAL",
+)
+
+
+@contextlib.contextmanager
+def _scoped_admission_env(*, allow_uncleared_model: bool):
+    prev_tee = os.environ.get("LOCAL_ASSIST_ALLOW_ATTESTED_TEE")
+    prev_uncleared = os.environ.get("LOCAL_ASSIST_ALLOW_UNCLEARED_TEE")
+    os.environ["LOCAL_ASSIST_ALLOW_ATTESTED_TEE"] = "1"
+    if allow_uncleared_model:
+        os.environ["LOCAL_ASSIST_ALLOW_UNCLEARED_TEE"] = "1"
+    else:
+        os.environ.pop("LOCAL_ASSIST_ALLOW_UNCLEARED_TEE", None)
+    try:
+        yield
+    finally:
+        if prev_tee is None:
+            os.environ.pop("LOCAL_ASSIST_ALLOW_ATTESTED_TEE", None)
+        else:
+            os.environ["LOCAL_ASSIST_ALLOW_ATTESTED_TEE"] = prev_tee
+        if prev_uncleared is None:
+            os.environ.pop("LOCAL_ASSIST_ALLOW_UNCLEARED_TEE", None)
+        else:
+            os.environ["LOCAL_ASSIST_ALLOW_UNCLEARED_TEE"] = prev_uncleared
+
+
+def resolve_default_attested_model_id(
+    models_list: list[dict[str, Any]] | None = None,
+) -> str:
+    models = models_list if models_list is not None else load_models()
+    cleared_ids: list[str] = []
+    candidate_ids: list[str] = []
+    for entry in models:
+        rt = entry.get("remote_trust")
+        if not isinstance(rt, dict):
+            continue
+        tier = rt.get("tier")
+        if tier not in ATTESTED_ENCLAVE_TIERS:
+            continue
+        mid = str(entry.get("id") or "").strip()
+        if not mid:
+            continue
+        routing = entry.get("routing")
+        pa = routing.get("private_attested") if isinstance(routing, dict) else "blocked"
+        if pa == "cleared":
+            cleared_ids.append(mid)
+        else:
+            candidate_ids.append(mid)
+
+    if len(cleared_ids) == 1:
+        return cleared_ids[0]
+    if len(cleared_ids) > 1:
+        raise LocalAssistError(
+            "routing_gate_blocked",
+            f"Multiple Rung 2/3 models have routing.private_attested='cleared' ({cleared_ids}); "
+            "pass --model <id> explicitly.",
+            details={"cleared_models": cleared_ids},
+        )
+    raise LocalAssistError(
+        "routing_gate_blocked",
+        "No Rung 2/3 model in models.yaml is currently cleared for private-attested routing "
+        "(routing.private_attested='cleared' requires passing automated sanity, v1 10/10, "
+        f"tools 4/4, and opencode-smoke). Registered Rung 2/3 candidates: {candidate_ids}. "
+        "To run an uncleared candidate explicitly, pass: "
+        "./scripts/opencode-attested --model <model-id> --allow-uncleared-model",
+        details={"candidate_models": candidate_ids},
+    )
+
+
+def validate_private_attested_endpoint(
+    endpoint: EndpointConfig,
+    *,
+    allow_uncleared_model: bool = False,
+    err_stream: Any = None,
+) -> None:
+    if endpoint.trust_tier == "local":
+        raise LocalAssistError(
+            "trust_tier_blocked",
+            f"scripts/opencode-attested is strictly for Rung 2/3 attested enclave proxies, "
+            f"got '{endpoint.model_id}' with trust_tier='local'. "
+            "Use ./scripts/opencode-local for Rung 1 local models.",
+            details={
+                "model_id": endpoint.model_id,
+                "trust_tier": endpoint.trust_tier,
+            },
+        )
+    if (
+        endpoint.trust_tier not in ATTESTED_ENCLAVE_TIERS
+        or endpoint.runtime != "proxy"
+        or not endpoint.is_local_host
+        or not endpoint.attestation_method
+        or not endpoint.api_key_keychain_service
+    ):
+        raise LocalAssistError(
+            "trust_tier_blocked",
+            f"scripts/opencode-attested requires a Rung 2/3 attested enclave proxy bound to localhost "
+            f"with apiKeyKeychainService, got '{endpoint.model_id}' "
+            f"(trust_tier='{endpoint.trust_tier}', runtime='{endpoint.runtime}').",
+            details={
+                "model_id": endpoint.model_id,
+                "trust_tier": endpoint.trust_tier,
+                "runtime": endpoint.runtime,
+            },
+        )
+    if not bool(endpoint.capabilities.get("tool_calling")):
+        raise LocalAssistError(
+            "capability_missing",
+            f"Model '{endpoint.model_id}' does not declare capabilities.tool_calling=true in models.yaml.",
+            details={
+                "model_id": endpoint.model_id,
+                "capabilities": endpoint.capabilities,
+            },
+        )
+
+    with _scoped_admission_env(allow_uncleared_model=allow_uncleared_model):
+        check_private_coding_admission(endpoint)
+
+    if endpoint.routing_private_attested != "cleared":
+        out = err_stream if err_stream is not None else sys.stderr
+        print(
+            f"WARNING: Running private-attested with uncleared candidate model '{endpoint.model_id}' "
+            f"(routing.private_attested={endpoint.routing_private_attested!r}).",
+            file=out,
+        )
+
+
+def default_context_limit_for_endpoint(endpoint: EndpointConfig) -> int:
+    if endpoint.context_window is not None and endpoint.context_window > 0:
+        return int(endpoint.context_window)
+    return DEFAULT_CONTEXT_LIMIT
+
+
+def compute_worst_case_session_usd(
+    endpoint: EndpointConfig,
+    *,
+    max_chat_requests: int = DEFAULT_MAX_CHAT_REQUESTS,
+    max_request_bytes: int = DEFAULT_MAX_REQUEST_BYTES,
+    max_tokens_cap: int = DEFAULT_MAX_TOKENS_CAP,
+) -> dict[str, Any]:
+    if max_chat_requests <= 0 or max_request_bytes <= 0 or max_tokens_cap <= 0:
+        raise ValueError(
+            "max_chat_requests, max_request_bytes, and max_tokens_cap must be positive integers"
+        )
+    pricing = endpoint.pricing_per_m_tokens
+    if (
+        not isinstance(pricing, dict)
+        or "input" not in pricing
+        or "output" not in pricing
+    ):
+        raise LocalAssistError(
+            "spend_gate_blocked",
+            f"Model '{endpoint.model_id}' is missing remote_trust.pricing_per_m_tokens.input/output "
+            "in models.yaml; cannot compute worst-case session spend ceiling.",
+            details={"model_id": endpoint.model_id},
+        )
+    input_price = float(pricing["input"])
+    output_price = float(pricing["output"])
+    worst_input_tokens_per_req = int(
+        math.ceil(max_request_bytes / WORST_CASE_BYTES_PER_TOKEN)
+    )
+    worst_input_usd = (
+        max_chat_requests * worst_input_tokens_per_req * input_price
+    ) / 1_000_000.0
+    worst_output_usd = (
+        max_chat_requests * max_tokens_cap * output_price
+    ) / 1_000_000.0
+    worst_total_usd = worst_input_usd + worst_output_usd
+    return {
+        "model_id": endpoint.model_id,
+        "max_chat_requests": int(max_chat_requests),
+        "max_request_bytes": int(max_request_bytes),
+        "max_tokens_cap": int(max_tokens_cap),
+        "worst_input_tokens_per_req": worst_input_tokens_per_req,
+        "input_price_per_m": input_price,
+        "output_price_per_m": output_price,
+        "worst_input_usd": round(worst_input_usd, 6),
+        "worst_output_usd": round(worst_output_usd, 6),
+        "worst_total_usd": round(worst_total_usd, 6),
+    }
+
+
+def check_session_spend_ceiling(
+    endpoint: EndpointConfig,
+    *,
+    max_chat_requests: int = DEFAULT_MAX_CHAT_REQUESTS,
+    max_request_bytes: int = DEFAULT_MAX_REQUEST_BYTES,
+    max_tokens_cap: int = DEFAULT_MAX_TOKENS_CAP,
+    max_session_usd: float | None = DEFAULT_MAX_SESSION_USD,
+    attached: bool = False,
+) -> dict[str, Any]:
+    if max_session_usd is not None and max_session_usd <= 0:
+        raise ValueError("max_session_usd must be positive")
+    est = compute_worst_case_session_usd(
+        endpoint,
+        max_chat_requests=max_chat_requests,
+        max_request_bytes=max_request_bytes,
+        max_tokens_cap=max_tokens_cap,
+    )
+    if max_session_usd is not None and est["worst_total_usd"] > max_session_usd:
+        if attached:
+            raise LocalAssistError(
+                "spend_ceiling_exceeded",
+                f"Refusing to attach to active proxy session for '{endpoint.model_id}': "
+                f"the running session's caps (max_chat_requests={max_chat_requests}, "
+                f"max_request_bytes={max_request_bytes}, max_tokens_cap={max_tokens_cap}) "
+                f"have a worst-case cost of ${est['worst_total_usd']:.2f}, which exceeds "
+                f"--max-session-usd ${max_session_usd:.2f}. Run './scripts/stop-model {endpoint.model_id}' "
+                "and relaunch so opencode-attested starts a proxy with bounded caps, or pass a "
+                "higher --max-session-usd explicitly.",
+                details={**est, "max_session_usd": max_session_usd, "attached": True},
+            )
+        raise LocalAssistError(
+            "spend_ceiling_exceeded",
+            f"Refusing to launch '{endpoint.model_id}': worst-case session cost from caps "
+            f"(max_chat_requests={max_chat_requests}, max_request_bytes={max_request_bytes} "
+            f"[~{est['worst_input_tokens_per_req']} input tokens/req], max_tokens_cap={max_tokens_cap} "
+            f"at ${est['input_price_per_m']:.2f}/${est['output_price_per_m']:.2f} per 1M tokens) "
+            f"is ${est['worst_total_usd']:.2f}, which exceeds --max-session-usd ${max_session_usd:.2f}. "
+            "Pass lower --max-chat-requests / --max-request-bytes / --max-tokens-cap, or raise "
+            "--max-session-usd explicitly.",
+            details={**est, "max_session_usd": max_session_usd, "attached": False},
+        )
+    return est
+
+
+def _extract_attached_session_caps(
+    endpoint: EndpointConfig,
+    active_rec: dict[str, Any] | None,
+    *,
+    default_ttl_seconds: int = DEFAULT_TTL_SECONDS,
+) -> tuple[int, int, int, int]:
+    if not isinstance(active_rec, dict):
+        raise LocalAssistError(
+            "spend_ceiling_exceeded",
+            f"Refusing to attach to active proxy session for '{endpoint.model_id}': "
+            "no PID record with bounded spend caps was found.",
+            details={"model_id": endpoint.model_id, "attached": True},
+        )
+    raw_reqs = active_rec.get("max_chat_requests")
+    raw_bytes = active_rec.get("max_request_bytes")
+    raw_tokens = active_rec.get("max_tokens_cap")
+    raw_ttl = active_rec.get("ttl_seconds")
+    if (
+        not isinstance(raw_reqs, int)
+        or isinstance(raw_reqs, bool)
+        or raw_reqs <= 0
+        or not isinstance(raw_bytes, int)
+        or isinstance(raw_bytes, bool)
+        or raw_bytes <= 0
+        or not isinstance(raw_tokens, int)
+        or isinstance(raw_tokens, bool)
+        or raw_tokens <= 0
+    ):
+        raise LocalAssistError(
+            "spend_ceiling_exceeded",
+            f"Refusing to attach to active proxy session for '{endpoint.model_id}': "
+            f"the running session has unbounded or missing spend caps in its PID record "
+            f"(max_chat_requests={raw_reqs!r}, max_request_bytes={raw_bytes!r}, "
+            f"max_tokens_cap={raw_tokens!r}; max_tokens_cap=0 means unclamped output tokens "
+            f"in se-key-proxy). Run './scripts/stop-model {endpoint.model_id}' and relaunch "
+            "so opencode-attested starts a proxy with bounded caps.",
+            details={
+                "model_id": endpoint.model_id,
+                "attached": True,
+                "max_chat_requests": raw_reqs,
+                "max_request_bytes": raw_bytes,
+                "max_tokens_cap": raw_tokens,
+            },
+        )
+    ttl = (
+        int(raw_ttl)
+        if isinstance(raw_ttl, int) and not isinstance(raw_ttl, bool) and raw_ttl > 0
+        else default_ttl_seconds
+    )
+    return int(raw_reqs), int(raw_bytes), int(raw_tokens), ttl
+
+
+def format_session_banner(
+    endpoint: EndpointConfig,
+    session_meta: dict[str, Any],
+    *,
+    max_session_usd: float | None,
+) -> str:
+    mode_str = "attached to active proxy" if session_meta.get("attached") else "started proxy"
+    ceiling_str = (
+        f"enforced --max-session-usd ${max_session_usd:.2f}"
+        if max_session_usd is not None
+        else "no pre-flight --max-session-usd cap set"
+    )
+    lines = [
+        f"[private-attested] Model: {endpoint.model_id} (served_model_id={endpoint.served_model_id}, {mode_str} at {endpoint.api_base_url})",
+        f"[private-attested] Data-control rung: Rung {endpoint.data_control_rung} ({endpoint.trust_tier}, attestation={endpoint.attestation_method}, usage_policy={endpoint.usage_policy})",
+        f"[private-attested] Data-control notice: workspace files read by the agent, approved bash outputs, conversation history, and local_assist MCP tool outputs (auto-allowed via 'local_assist*: allow' without an interactive prompt) returned to the planner are sent to the attested enclave under Rung {endpoint.data_control_rung} and {endpoint.usage_policy}.",
+        f"[private-attested] Session caps: max_chat_requests={session_meta['max_chat_requests']} (includes small_model title requests), max_tokens_cap={session_meta['max_tokens_cap']}, max_request_bytes={session_meta['max_request_bytes']}, ttl_seconds={session_meta['ttl_seconds']}",
+        f"[private-attested] Pricing: ${session_meta['input_price_per_m']:.2f}/1M input, ${session_meta['output_price_per_m']:.2f}/1M output ({ceiling_str})",
+    ]
+    return "\n".join(lines)
+
+
+def render_private_attested_config(
+    endpoint: EndpointConfig,
+    template_text: str | None = None,
+    *,
+    context_limit: int | None = None,
+    output_limit: int = DEFAULT_OUTPUT_LIMIT,
+    edit_permission: str = "ask",
+    lab_python: Path | None = None,
+    lab_root: Path | None = None,
+    workspace_dir: Path | None = None,
+    api_base_url_override: str | None = None,
+) -> str:
+    if edit_permission not in ("ask", "allow", "deny"):
+        raise ValueError(f"Invalid edit_permission: {edit_permission}")
+    effective_context_limit = (
+        context_limit
+        if context_limit is not None
+        else default_context_limit_for_endpoint(endpoint)
+    )
+    if effective_context_limit <= 0 or output_limit <= 0:
+        raise ValueError("context_limit and output_limit must be positive integers")
+
+    tmpl = template_text if template_text is not None else TEMPLATE_CONFIG.read_text()
+    api_key_placeholder = f"{{env:{SESSION_TOKEN_ENV_VAR}}}"
+    effective_base_url = api_base_url_override or endpoint.api_base_url
+    effective_python = lab_python or (
+        VENV_PYTHON if VENV_PYTHON.exists() else Path(sys.executable)
+    )
+    effective_root = lab_root or ROOT
+    effective_workspace = (workspace_dir or Path.cwd()).resolve()
+    trust_label = f"Rung {endpoint.data_control_rung} {endpoint.trust_tier}"
+
+    rendered = (
+        tmpl.replace("__API_BASE_URL__", effective_base_url)
+        .replace("__API_KEY_VALUE__", api_key_placeholder)
+        .replace("__SERVED_MODEL_ID__", endpoint.served_model_id)
+        .replace("__MODEL_ID__", endpoint.model_id)
+        .replace("__TRUST_TIER__", trust_label)
+        .replace("__CONTEXT_LIMIT__", str(int(effective_context_limit)))
+        .replace("__OUTPUT_LIMIT__", str(int(output_limit)))
+        .replace("__EDIT_PERMISSION__", edit_permission)
+        .replace("__LAB_PYTHON__", str(effective_python))
+        .replace("__LAB_ROOT__", str(effective_root))
+        .replace("__WORKSPACE_DIR__", str(effective_workspace))
+    )
+    json.loads(rendered)
+    return rendered
+
+
+def build_private_attested_env(
+    workspace_dir: Path,
+    isolated_home: Path,
+    opencode_config_path: Path,
+    endpoint: EndpointConfig,
+    *,
+    preserve_host_home: bool = False,
+    base_env: dict[str, str] | None = None,
+) -> dict[str, str]:
+    if not endpoint.api_key or not endpoint.api_key.startswith("se-session-"):
+        raise LocalAssistError(
+            "session_token_missing",
+            f"Model '{endpoint.model_id}' does not have an active se-session-* token; "
+            f"run './scripts/serve-model {endpoint.model_id}' first.",
+            details={"model_id": endpoint.model_id},
+        )
+    src = base_env if base_env is not None else os.environ
+    env: dict[str, str] = {}
+    for key in SAFE_ENV_ALLOWLIST:
+        if key in src:
+            env[key] = src[key]
+
+    effective_home = (
+        src.get("HOME", str(isolated_home)) if preserve_host_home else str(isolated_home)
+    )
+    env.update(
+        {
+            "PWD": str(workspace_dir),
+            "HOME": effective_home,
+            "OPENCODE_TEST_HOME": str(isolated_home),
+            "XDG_CONFIG_HOME": str(isolated_home / ".config"),
+            "XDG_DATA_HOME": str(isolated_home / ".local" / "share"),
+            "XDG_CACHE_HOME": str(isolated_home / ".cache"),
+            "XDG_STATE_HOME": str(isolated_home / ".local" / "state"),
+            "OPENCODE_DISABLE_AUTOUPDATE": "1",
+            "OPENCODE_DISABLE_MODELS_FETCH": "1",
+            "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
+            "OPENCODE_DISABLE_CLAUDE_CODE": "1",
+            "OPENCODE_DISABLE_CLAUDE_CODE_SKILLS": "1",
+            "OPENCODE_CONFIG": str(opencode_config_path),
+            "HF_HUB_OFFLINE": "1",
+            "LOCAL_ASSIST_BASE_URL": RUNG1_LOCAL_ASSIST_BASE_URL,
+            "LOCAL_ASSIST_WORKSPACE_ROOT": str(workspace_dir.resolve()),
+            SESSION_TOKEN_ENV_VAR: endpoint.api_key,
+        }
+    )
+    # L2: Never export LOCAL_ASSIST_ALLOW_ATTESTED_TEE or LOCAL_ASSIST_ALLOW_UNCLEARED_TEE
+    env.pop("LOCAL_ASSIST_ALLOW_ATTESTED_TEE", None)
+    env.pop("LOCAL_ASSIST_ALLOW_UNCLEARED_TEE", None)
+    return env
+
+
+def ensure_model_served(
+    endpoint: EndpointConfig,
+    *,
+    no_serve: bool = False,
+    wait_seconds: float = DEFAULT_WAIT_SECONDS,
+    max_chat_requests: int = DEFAULT_MAX_CHAT_REQUESTS,
+    max_tokens_cap: int = DEFAULT_MAX_TOKENS_CAP,
+    max_request_bytes: int = DEFAULT_MAX_REQUEST_BYTES,
+    ttl_seconds: int = DEFAULT_TTL_SECONDS,
+    stream_timeout_seconds: int = DEFAULT_STREAM_TIMEOUT_SECONDS,
+    max_session_usd: float | None = DEFAULT_MAX_SESSION_USD,
+    runs_dir: Path | None = None,
+    run_cmd: Any = subprocess.run,
+) -> tuple[bool, str | None, dict[str, Any] | None]:
+    # Validate requested caps against spend ceiling before touching any server or Touch ID
+    try:
+        cli_est = check_session_spend_ceiling(
+            endpoint,
+            max_chat_requests=max_chat_requests,
+            max_request_bytes=max_request_bytes,
+            max_tokens_cap=max_tokens_cap,
+            max_session_usd=max_session_usd,
+            attached=False,
+        )
+    except LocalAssistError as exc:
+        return False, str(exc), None
+
+    verify_script = str(ROOT / "scripts" / "verify-served-model")
+    serve_script = str(ROOT / "scripts" / "serve-model")
+
+    initial = run_cmd(
+        [verify_script, endpoint.model_id],
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if initial.returncode == 0:
+        active_rec = read_pid_record_for_model(endpoint.model_id, runs_dir)
+        try:
+            rec_max_reqs, rec_max_bytes, rec_max_tokens, rec_ttl = (
+                _extract_attached_session_caps(
+                    endpoint,
+                    active_rec,
+                    default_ttl_seconds=ttl_seconds,
+                )
+            )
+            attached_est = check_session_spend_ceiling(
+                endpoint,
+                max_chat_requests=rec_max_reqs,
+                max_request_bytes=rec_max_bytes,
+                max_tokens_cap=rec_max_tokens,
+                max_session_usd=max_session_usd,
+                attached=True,
+            )
+        except LocalAssistError as exc:
+            return False, str(exc), None
+        return (
+            True,
+            None,
+            {
+                **attached_est,
+                "attached": True,
+                "ttl_seconds": rec_ttl,
+            },
+        )
+
+    initial_err = (initial.stderr or initial.stdout or "").strip()
+    if initial.returncode == EXIT_MODEL_MISMATCH:
+        return (
+            False,
+            f"Refusing to launch private-attested: another model is already serving at "
+            f"{endpoint.api_base_url} ({initial_err}). Stop the active model first "
+            "with ./scripts/stop-model <active-model-id>.",
+            None,
+        )
+
+    if no_serve:
+        return (
+            False,
+            f"Model '{endpoint.model_id}' is not currently served at {endpoint.api_base_url} "
+            f"and --no-serve was set ({initial_err}).",
+            None,
+        )
+
+    serve_cmd = [
+        serve_script,
+        endpoint.model_id,
+        "--max-chat-requests",
+        str(max_chat_requests),
+        "--max-tokens-cap",
+        str(max_tokens_cap),
+        "--max-request-bytes",
+        str(max_request_bytes),
+        "--ttl-seconds",
+        str(ttl_seconds),
+        "--stream-timeout-seconds",
+        str(stream_timeout_seconds),
+    ]
+    serve_res = run_cmd(
+        serve_cmd,
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if serve_res.returncode != 0:
+        serve_err = (serve_res.stderr or serve_res.stdout or "").strip()
+        return False, f"Failed to start model '{endpoint.model_id}': {serve_err}", None
+
+    wait_res = run_cmd(
+        [verify_script, endpoint.model_id, "--wait", str(wait_seconds)],
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if wait_res.returncode == 0:
+        active_rec = read_pid_record_for_model(endpoint.model_id, runs_dir)
+        if active_rec is not None:
+            try:
+                rec_max_reqs, rec_max_bytes, rec_max_tokens, rec_ttl = (
+                    _extract_attached_session_caps(
+                        endpoint,
+                        active_rec,
+                        default_ttl_seconds=ttl_seconds,
+                    )
+                )
+            except LocalAssistError as exc:
+                return False, str(exc), None
+        else:
+            rec_max_reqs = max_chat_requests
+            rec_max_bytes = max_request_bytes
+            rec_max_tokens = max_tokens_cap
+            rec_ttl = ttl_seconds
+        try:
+            started_est = check_session_spend_ceiling(
+                endpoint,
+                max_chat_requests=rec_max_reqs,
+                max_request_bytes=rec_max_bytes,
+                max_tokens_cap=rec_max_tokens,
+                max_session_usd=max_session_usd,
+                attached=True,
+            )
+        except LocalAssistError as exc:
+            return False, str(exc), None
+        return (
+            True,
+            None,
+            {
+                **started_est,
+                "attached": False,
+                "ttl_seconds": rec_ttl,
+            },
+        )
+
+    wait_err = (wait_res.stderr or wait_res.stdout or "").strip()
+    if wait_res.returncode == EXIT_MODEL_MISMATCH:
+        return (
+            False,
+            f"Refusing to launch private-attested: model mismatch at {endpoint.api_base_url} "
+            f"after startup ({wait_err}).",
+            None,
+        )
+    return (
+        False,
+        f"Model '{endpoint.model_id}' did not become ready within {wait_seconds}s: {wait_err}",
+        None,
+    )
+
+
+def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Launch opencode against a Rung 2/3 private-attested enclave proxy "
+            "(tinfoil-proxy + se-key-proxy) with isolated state, project-config "
+            "lockdown, session spend ceiling, and Rung 1 local_assist MCP."
+        ),
+        epilog=(
+            "Data-control notice: Running opencode-attested sends workspace files read by "
+            "the agent, approved bash outputs, conversation history, and local_assist MCP "
+            "tool outputs returned to the planner to the attested enclave under the model's "
+            "remote_trust.tier (for example enclave_runtime_attested) and usage_policy "
+            "(provider_terms_apply). Always place '--' before opencode subcommands or flags "
+            "(for example: opencode-attested --model tinfoil-deepseek-v4-1-flash "
+            "--allow-uncleared-model -- run 'prompt')."
+        ),
+    )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help=(
+            "Rung 2/3 model id from models.yaml. If omitted, selects the single model "
+            "with routing.private_attested='cleared' (or refuses when none is cleared)."
+        ),
+    )
+    parser.add_argument(
+        "--allow-uncleared-model",
+        action="store_true",
+        default=False,
+        help="Allow launching a Rung 2/3 candidate whose routing.private_attested is not 'cleared'.",
+    )
+    parser.add_argument(
+        "--context-limit",
+        type=int,
+        default=None,
+        help=(
+            f"Context window limit in opencode config (default: min(model.context_window, {DEFAULT_CONTEXT_LIMIT}) "
+            f"so requests stay within --max-request-bytes {DEFAULT_MAX_REQUEST_BYTES})."
+        ),
+    )
+    parser.add_argument(
+        "--output-limit",
+        type=int,
+        default=DEFAULT_OUTPUT_LIMIT,
+        help=f"Max output tokens per turn in opencode config (default: {DEFAULT_OUTPUT_LIMIT}).",
+    )
+    parser.add_argument(
+        "--max-chat-requests",
+        type=int,
+        default=DEFAULT_MAX_CHAT_REQUESTS,
+        help=f"se-key-proxy chat request cap per session, including title-agent requests (default: {DEFAULT_MAX_CHAT_REQUESTS}).",
+    )
+    parser.add_argument(
+        "--max-tokens-cap",
+        type=int,
+        default=DEFAULT_MAX_TOKENS_CAP,
+        help=f"se-key-proxy max_tokens cap per request (default: {DEFAULT_MAX_TOKENS_CAP}).",
+    )
+    parser.add_argument(
+        "--max-request-bytes",
+        type=int,
+        default=DEFAULT_MAX_REQUEST_BYTES,
+        help=f"se-key-proxy max HTTP request body bytes (default: {DEFAULT_MAX_REQUEST_BYTES}).",
+    )
+    parser.add_argument(
+        "--ttl-seconds",
+        type=int,
+        default=DEFAULT_TTL_SECONDS,
+        help=f"se-key-proxy session TTL in seconds (default: {DEFAULT_TTL_SECONDS}).",
+    )
+    parser.add_argument(
+        "--stream-timeout-seconds",
+        type=int,
+        default=DEFAULT_STREAM_TIMEOUT_SECONDS,
+        help=f"se-key-proxy stream timeout in seconds (default: {DEFAULT_STREAM_TIMEOUT_SECONDS}).",
+    )
+    parser.add_argument(
+        "--max-session-usd",
+        type=float,
+        default=DEFAULT_MAX_SESSION_USD,
+        help="Optional maximum worst-case session spend in USD permitted before launch (when omitted, prints pricing and caps without blocking interactive launch).",
+    )
+    parser.add_argument(
+        "--allow-edit",
+        action="store_true",
+        default=False,
+        help="Set edit/write/patch permissions to 'allow' instead of 'ask' (for non-interactive runs).",
+    )
+    parser.add_argument(
+        "--wait",
+        type=float,
+        default=DEFAULT_WAIT_SECONDS,
+        help=f"Seconds to wait for proxy readiness when starting (default: {DEFAULT_WAIT_SECONDS}).",
+    )
+    parser.add_argument(
+        "--no-serve",
+        action="store_true",
+        default=False,
+        help="Do not automatically start the proxy session if it is not already running.",
+    )
+    parser.add_argument(
+        "--preserve-host-home",
+        action="store_true",
+        default=False,
+        help="Keep parent HOME for child shell commands while isolating XDG_* and OPENCODE_TEST_HOME.",
+    )
+    parser.add_argument(
+        "--print-config",
+        action="store_true",
+        default=False,
+        help="Verify/start the proxy, write the isolated opencode.json, print redacted metadata and JSON, and exit.",
+    )
+
+    if "--" in argv[1:]:
+        sep_idx = argv.index("--", 1)
+        our_argv = argv[1:sep_idx]
+        opencode_args = argv[sep_idx + 1 :]
+        args = parser.parse_args(our_argv)
+    else:
+        args, opencode_args = parser.parse_known_args(argv[1:])
+    return args, opencode_args
+
+
+def main(argv: list[str]) -> int:
+    caller_cwd = Path.cwd()
+    args, opencode_args = parse_args(argv)
+
+    try:
+        model_id = args.model or resolve_default_attested_model_id()
+        model = load_model(model_id)
+        initial_pid_record = read_pid_record_for_model(model_id)
+        endpoint_pre = resolve_endpoint(
+            model, pid_record=initial_pid_record, require_api_key=False
+        )
+        validate_private_attested_endpoint(
+            endpoint_pre,
+            allow_uncleared_model=args.allow_uncleared_model,
+        )
+    except (RegistryError, LocalAssistError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    ok, err_msg, session_meta = ensure_model_served(
+        endpoint_pre,
+        no_serve=args.no_serve,
+        wait_seconds=args.wait,
+        max_chat_requests=args.max_chat_requests,
+        max_tokens_cap=args.max_tokens_cap,
+        max_request_bytes=args.max_request_bytes,
+        ttl_seconds=args.ttl_seconds,
+        stream_timeout_seconds=args.stream_timeout_seconds,
+        max_session_usd=args.max_session_usd,
+    )
+    if not ok or session_meta is None:
+        print(err_msg or "Failed to verify served model", file=sys.stderr)
+        if err_msg and "another model is already serving" in err_msg:
+            return EXIT_MODEL_MISMATCH
+        return 1
+
+    try:
+        active_pid_record = read_pid_record_for_model(model_id)
+        endpoint = resolve_endpoint(
+            model, pid_record=active_pid_record, require_api_key=True
+        )
+    except RegistryError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    print(
+        format_session_banner(
+            endpoint,
+            session_meta,
+            max_session_usd=args.max_session_usd,
+        ),
+        file=sys.stderr,
+    )
+
+    isolated_home = DEFAULT_ISOLATED_HOME
+    for subdir in (".config", ".local/share", ".cache", ".local/state"):
+        (isolated_home / subdir).mkdir(parents=True, exist_ok=True)
+
+    edit_permission = "allow" if args.allow_edit else "ask"
+    effective_context_limit = (
+        args.context_limit
+        if args.context_limit is not None
+        else default_context_limit_for_endpoint(endpoint)
+    )
+    config_text = render_private_attested_config(
+        endpoint,
+        context_limit=effective_context_limit,
+        output_limit=args.output_limit,
+        edit_permission=edit_permission,
+        workspace_dir=caller_cwd,
+    )
+    opencode_config_path = isolated_home / "opencode.json"
+    opencode_config_path.write_text(config_text)
+
+    env = build_private_attested_env(
+        caller_cwd,
+        isolated_home,
+        opencode_config_path,
+        endpoint,
+        preserve_host_home=args.preserve_host_home,
+    )
+
+    if args.print_config:
+        print(
+            json.dumps(
+                {
+                    "model_id": endpoint.model_id,
+                    "served_model_id": endpoint.served_model_id,
+                    "trust_tier": endpoint.trust_tier,
+                    "data_control_rung": endpoint.data_control_rung,
+                    "usage_policy": endpoint.usage_policy,
+                    "api_base_url": endpoint.api_base_url,
+                    "session_token": "<redacted-se-session-token>",
+                    "session_caps": session_meta,
+                    "opencode_config_path": str(opencode_config_path),
+                    "isolated_home": str(isolated_home),
+                    "config": json.loads(config_text),
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    opencode_bin = shutil.which("opencode")
+    if not opencode_bin:
+        print("opencode binary not found on PATH", file=sys.stderr)
+        return 1
+
+    # Restart opencode's persistent background service (`opencode serve --service`)
+    # whenever the active session token, proxy startup_nonce, or model_id changed,
+    # so the background server never uses a stale LOCAL_ASSIST_SESSION_TOKEN (HTTP 401).
+    if "--standalone" not in opencode_args:
+        sync_file = isolated_home / ".last-service-sync.json"
+        token_sha = hashlib.sha256((endpoint.api_key or "").encode("utf-8")).hexdigest()
+        current_sync = {
+            "model_id": endpoint.model_id,
+            "startup_nonce": (active_pid_record or {}).get("startup_nonce"),
+            "token_sha256": token_sha,
+        }
+        prev_sync: dict[str, Any] | None = None
+        if sync_file.exists():
+            try:
+                prev_sync = json.loads(sync_file.read_text())
+            except Exception:
+                prev_sync = None
+        if prev_sync != current_sync:
+            subprocess.run(
+                [opencode_bin, "service", "restart"],
+                cwd=str(caller_cwd),
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            sync_file.write_text(json.dumps(current_sync, indent=2))
+
+    proc = subprocess.run(
+        [opencode_bin, *opencode_args],
+        cwd=str(caller_cwd),
+        env=env,
+        check=False,
+    )
+    return int(proc.returncode)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

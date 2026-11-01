@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+export UV_CACHE_DIR="$PWD/.uv-cache"
+export PYTHONPYCACHEPREFIX="$PWD/.pycache"
+
+echo "Checking base tools..."
+mkdir -p .home/.cache .home/.promptfoo .home/huggingface
+command -v uv >/dev/null || { echo "uv is required"; exit 1; }
+command -v python3 >/dev/null || { echo "python3 is required"; exit 1; }
+command -v node >/dev/null || { echo "node is required"; exit 1; }
+command -v npm >/dev/null || { echo "npm is required"; exit 1; }
+node -e '
+const [maj, min] = process.versions.node.split(".").map(Number);
+const ok = (maj === 20 && min >= 20) || maj > 22 || (maj === 22 && min >= 22);
+if (!ok) {
+  console.error("ERROR: Node.js v" + process.versions.node + " is unsupported; promptfoo requires ^20.20.0 || >=22.22.0");
+  process.exit(1);
+}
+'
+
+echo "Creating Python environment..."
+if [ ! -d .venv ]; then
+  uv venv
+else
+  echo "Using existing .venv"
+fi
+uv pip install \
+  "pyyaml>=6.0.2" \
+  "huggingface_hub[hf_transfer]>=0.23.0" \
+  "hf-transfer>=0.1.8" \
+  "mlx>=0.24.0" \
+  "mlx-lm>=0.22.0" \
+  "mlx-vlm>=0.1.0"
+
+echo "Installing Node dependencies..."
+npm ci
+
+echo "Building and verifying Secure Enclave key proxy (bin/se-key-proxy)..."
+./scripts/se-key build
+se_rc=0
+./scripts/se-key selftest || se_rc=$?
+if [ "$se_rc" -eq 77 ]; then
+  echo "Note: Secure Enclave selftest skipped (exit 77: Touch ID / biometrics unavailable on this Mac; Rung 1 local inference works without Touch ID)."
+elif [ "$se_rc" -ne 0 ]; then
+  echo "ERROR: Secure Enclave selftest failed with exit code $se_rc" >&2
+  exit "$se_rc"
+fi
+
+TINFOIL_PROXY_VERSION="0.2.9"
+TINFOIL_PROXY_SHA256="6b526fe32244bcccfcfde3c5d181618b4b06b48498e649cd944cc9b64acf994b"
+mkdir -p bin
+
+verify_tinfoil_proxy() {
+  local bin_path="$1"
+  local actual_sha
+  actual_sha="$(shasum -a 256 "$bin_path" | awk '{print $1}')"
+  if [ "$actual_sha" != "$TINFOIL_PROXY_SHA256" ]; then
+    echo "ERROR: $bin_path SHA-256 mismatch (got $actual_sha, expected $TINFOIL_PROXY_SHA256)" >&2
+    return 1
+  fi
+  codesign -v --strict "$bin_path"
+  local sign_info
+  sign_info="$(codesign -dv --verbose=4 "$bin_path" 2>&1)"
+  echo "$sign_info" | grep -q "TeamIdentifier=8KSH668LZT" || {
+    echo "ERROR: $bin_path does not have expected TeamIdentifier=8KSH668LZT" >&2
+    return 1
+  }
+  if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+    gh attestation verify "$bin_path" --repo tinfoilsh/tinfoil-proxy
+  else
+    echo "Note: skipping 'gh attestation verify' (gh CLI not authenticated); verified pinned SHA-256 and Apple Developer ID signature."
+  fi
+}
+
+if [ -x bin/tinfoil-proxy ] && verify_tinfoil_proxy "bin/tinfoil-proxy" >/dev/null 2>&1; then
+  echo "Verified existing bin/tinfoil-proxy (v${TINFOIL_PROXY_VERSION}, SHA-256 ${TINFOIL_PROXY_SHA256:0:16}...)."
+else
+  echo "Downloading and verifying tinfoil-proxy v${TINFOIL_PROXY_VERSION} (darwin-arm64)..."
+  tmp_dir="$(mktemp -d)"
+  trap 'rm -rf "$tmp_dir"' EXIT
+  curl -fsSL \
+    "https://github.com/tinfoilsh/tinfoil-proxy/releases/download/v${TINFOIL_PROXY_VERSION}/tinfoil-proxy-darwin-arm64.zip" \
+    -o "$tmp_dir/tinfoil-proxy.zip"
+  unzip -q "$tmp_dir/tinfoil-proxy.zip" -d "$tmp_dir"
+  mv "$tmp_dir/tinfoil-proxy-darwin-arm64" "bin/tinfoil-proxy"
+  chmod 0755 "bin/tinfoil-proxy"
+  verify_tinfoil_proxy "bin/tinfoil-proxy"
+fi
+
+echo
+echo "Setup complete."
+echo "Next steps:"
+echo "  1. Rung 1 (local MLX on 127.0.0.1:8080):       ./scripts/opencode-local"
+echo "  2. Seal Tinfoil API key in Secure Enclave:     ./scripts/se-key store free-inference.tinfoil"
+echo "  3. Rung 3 (attested enclave on 127.0.0.1:8081): ./scripts/opencode-attested"

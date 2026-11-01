@@ -1,0 +1,1161 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import hashlib
+import http.server
+import json
+import os
+import re
+import shutil
+import socketserver
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+from urllib.error import HTTPError
+from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+ROOT = Path(__file__).resolve().parents[1]
+VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
+if VENV_PYTHON.exists() and Path(sys.executable) != VENV_PYTHON:
+    os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), __file__, *sys.argv[1:]])
+
+sys.path.insert(0, str(ROOT))
+
+from local_assist.registry import (
+    SESSION_TOKEN_ENV_VAR,
+    EndpointConfig,
+    RegistryError,
+    load_model,
+    read_pid_record_for_model,
+    resolve_endpoint,
+)
+from local_assist.se_key import (
+    redact_and_count_session_tokens,
+    scan_and_redact_directory_tokens,
+)
+
+TEMPLATE_DIR = ROOT / "evals" / "opencode_smoke"
+TEMPLATE_CONFIG = TEMPLATE_DIR / "opencode.json.tmpl"
+TEMPLATE_TARGET = TEMPLATE_DIR / "target.txt"
+EXPECTED_TOKEN = "OPENCODE-LOCAL-SMOKE-TOKEN-9F4A"
+MAX_SMOKE_CHAT_REQUESTS = 3
+MAX_SMOKE_TOKENS_PER_REQUEST = 256
+MAX_SMOKE_REQUEST_BYTES = 8000
+MAX_SMOKE_TOTAL_REQUEST_BYTES = 18000
+MAX_SMOKE_LLM_STEPS = 2
+HOST_STATE_CHECK_SCOPE = (
+    "metadata (dir mtime_ns, file size and mtime_ns) of "
+    "~/.config/opencode, ~/.local/share/opencode, ~/.cache/opencode, "
+    "~/Library/Application Support/opencode"
+)
+SAFE_ENV_ALLOWLIST = (
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TERM",
+    "TMPDIR",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "SYSTEMROOT",
+)
+
+
+def render_opencode_config(
+    endpoint: EndpointConfig,
+    template_text: str | None = None,
+    *,
+    api_base_url_override: str | None = None,
+) -> str:
+    tmpl = template_text if template_text is not None else TEMPLATE_CONFIG.read_text()
+    if endpoint.api_key_keychain_service:
+        api_key_placeholder = f"{{env:{SESSION_TOKEN_ENV_VAR}}}"
+    elif endpoint.api_key_envar:
+        api_key_placeholder = f"{{env:{endpoint.api_key_envar}}}"
+    else:
+        api_key_placeholder = endpoint.api_key
+    effective_base_url = api_base_url_override or endpoint.api_base_url
+    return (
+        tmpl.replace("__API_BASE_URL__", effective_base_url)
+        .replace("__API_KEY_VALUE__", api_key_placeholder)
+        .replace("__SERVED_MODEL_ID__", endpoint.served_model_id)
+        .replace("__MODEL_ID__", endpoint.model_id)
+    )
+
+
+def build_isolated_env(
+    workspace_dir: Path,
+    isolated_home: Path,
+    opencode_config_path: Path,
+    endpoint: EndpointConfig,
+    base_env: dict[str, str] | None = None,
+) -> dict[str, str]:
+    src = base_env if base_env is not None else os.environ
+    env: dict[str, str] = {}
+    for key in SAFE_ENV_ALLOWLIST:
+        if key in src:
+            env[key] = src[key]
+    if endpoint.api_key_keychain_service:
+        if endpoint.api_key.startswith("se-session-"):
+            env[SESSION_TOKEN_ENV_VAR] = endpoint.api_key
+    elif endpoint.api_key_envar and endpoint.api_key_envar in src:
+        env[endpoint.api_key_envar] = src[endpoint.api_key_envar]
+    env.update(
+        {
+            "PWD": str(workspace_dir),
+            "HOME": str(isolated_home),
+            "XDG_CONFIG_HOME": str(isolated_home / ".config"),
+            "XDG_DATA_HOME": str(isolated_home / ".local" / "share"),
+            "XDG_CACHE_HOME": str(isolated_home / ".cache"),
+            "XDG_STATE_HOME": str(isolated_home / ".local" / "state"),
+            "OPENCODE_DISABLE_AUTOUPDATE": "1",
+            "OPENCODE_DISABLE_MODELS_FETCH": "1",
+            "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
+            "OPENCODE_DISABLE_CLAUDE_CODE": "1",
+            "OPENCODE_DISABLE_CLAUDE_CODE_SKILLS": "1",
+            "OPENCODE_CONFIG": str(opencode_config_path),
+        }
+    )
+    return env
+
+
+def snapshot_host_opencode_dirs(real_home: Path) -> str:
+    targets = [
+        real_home / ".config" / "opencode",
+        real_home / ".local" / "share" / "opencode",
+        real_home / ".cache" / "opencode",
+        real_home / "Library" / "Application Support" / "opencode",
+    ]
+    lines: list[str] = []
+    for base in targets:
+        if not base.exists():
+            lines.append(f"{base}: MISSING")
+            continue
+        lines.append(f"{base}: DIR")
+        for root, dirs, files in os.walk(base):
+            dirs.sort()
+            files.sort()
+            root_path = Path(root)
+            rel_root = root_path.relative_to(base)
+            for d in dirs:
+                p = root_path / d
+                st = p.lstat()
+                lines.append(f"  D {rel_root / d} mtime_ns={st.st_mtime_ns}")
+            for f in files:
+                p = root_path / f
+                st = p.lstat()
+                lines.append(f"  F {rel_root / f} size={st.st_size} mtime_ns={st.st_mtime_ns}")
+    return "\n".join(lines) + "\n"
+
+
+def _record_stderr_lines(
+    stderr_text: str,
+    *,
+    source: str,
+    observer_errors: list[str],
+    observer_warnings: list[str],
+) -> None:
+    for raw_line in (stderr_text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("lsof: WARNING:"):
+            observer_warnings.append(f"{source}: {line}")
+        else:
+            observer_errors.append(f"{source} stderr: {line}")
+
+
+def collect_process_tree_pids(
+    root_pid: int,
+    observer_errors: list[str] | None = None,
+    observer_warnings: list[str] | None = None,
+) -> list[int]:
+    pids = [root_pid]
+    idx = 0
+    while idx < len(pids):
+        parent = pids[idx]
+        idx += 1
+        try:
+            proc = subprocess.run(
+                ["pgrep", "-P", str(parent)],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            )
+            if observer_errors is not None and observer_warnings is not None:
+                _record_stderr_lines(
+                    proc.stderr,
+                    source=f"pgrep({parent})",
+                    observer_errors=observer_errors,
+                    observer_warnings=observer_warnings,
+                )
+                if proc.returncode not in (0, 1):
+                    observer_errors.append(
+                        f"pgrep({parent}) unexpected exit code {proc.returncode}"
+                    )
+            for line in proc.stdout.splitlines():
+                line = line.strip()
+                if line.isdigit():
+                    child = int(line)
+                    if child not in pids:
+                        pids.append(child)
+        except Exception as exc:
+            if observer_errors is not None:
+                observer_errors.append(f"pgrep({parent}) exception: {exc}")
+    return pids
+
+
+def is_localhost_lsof_name(name_col: str) -> bool:
+    cleaned = re.sub(r"\s*\([^)]*\)\s*$", "", name_col.strip())
+    if not cleaned:
+        return False
+    endpoints = [ep.strip() for ep in cleaned.split("->")]
+    if not endpoints or any(not ep for ep in endpoints):
+        return False
+    for ep in endpoints:
+        if ep == "*:*":
+            return False
+        if ep.startswith("["):
+            if "]:" not in ep:
+                return False
+            host_part, port_part = ep.split("]:", 1)
+            host = host_part.lstrip("[")
+        else:
+            if ":" not in ep:
+                return False
+            host, port_part = ep.rsplit(":", 1)
+        if not port_part.isdigit():
+            return False
+        if host not in ("127.0.0.1", "localhost", "::1"):
+            return False
+    return True
+
+
+def classify_lsof_socket_line(line: str) -> str:
+    stripped = line.strip()
+    if not stripped or stripped.startswith("COMMAND"):
+        return "header_or_empty"
+    parts = stripped.split()
+    if len(parts) < 9:
+        return "non_localhost"
+    node_col = parts[7].upper()
+    name_col = " ".join(parts[8:])
+    cleaned_name = re.sub(r"\s*\([^)]*\)\s*$", "", name_col.strip())
+    if node_col == "UDP" and cleaned_name == "*:*":
+        return "unconnected_udp"
+    if is_localhost_lsof_name(name_col):
+        return "localhost"
+    return "non_localhost"
+
+
+def _is_workspace_target_file(inp: dict[str, Any], workspace_dir: Path) -> bool:
+    raw = inp.get("filePath") or inp.get("path")
+    if not isinstance(raw, str) or not raw.strip():
+        return False
+    p = Path(raw.strip())
+    resolved = (p if p.is_absolute() else (workspace_dir / p)).resolve()
+    return resolved == (workspace_dir / "target.txt").resolve()
+
+
+def parse_events(events_text: str, workspace_dir: Path) -> dict[str, Any]:
+    tools_called: list[str] = []
+    tool_inputs: list[dict[str, Any]] = []
+    tool_outputs: list[str] = []
+    text_parts: list[str] = []
+    denied_or_error_events: list[Any] = []
+    llm_step_count = 0
+    step_tokens_input = 0
+    step_tokens_output = 0
+
+    for raw_line in events_text.splitlines():
+        line = raw_line.strip()
+        if not line or not line.startswith("{"):
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        ev_type = ev.get("type")
+        part = ev.get("part") if isinstance(ev.get("part"), dict) else {}
+        if ev_type == "step_start":
+            llm_step_count += 1
+        elif ev_type == "step_finish":
+            tok = part.get("tokens") if isinstance(part.get("tokens"), dict) else {}
+            step_tokens_input += int(tok.get("input") or 0)
+            step_tokens_output += int(tok.get("output") or 0)
+        elif ev_type == "tool_use":
+            tool_name = str(part.get("tool") or "")
+            if tool_name:
+                tools_called.append(tool_name)
+            state = part.get("state") if isinstance(part.get("state"), dict) else {}
+            inp = state.get("input") if isinstance(state.get("input"), dict) else {}
+            tool_inputs.append(inp)
+            out = state.get("output")
+            if isinstance(out, str):
+                tool_outputs.append(out)
+            if state.get("status") in ("error", "denied"):
+                denied_or_error_events.append(ev)
+        elif ev_type == "text":
+            txt = part.get("text")
+            if isinstance(txt, str):
+                text_parts.append(txt)
+        elif ev_type in ("error", "permission.asked"):
+            denied_or_error_events.append(ev)
+
+    read_target_only = bool(tool_inputs) and all(
+        _is_workspace_target_file(inp, workspace_dir) for inp in tool_inputs
+    )
+    combined_tool_output = "\n".join(tool_outputs)
+    combined_text = "\n".join(text_parts).strip()
+
+    return {
+        "llm_step_count": llm_step_count,
+        "event_step_tokens": {
+            "input": step_tokens_input,
+            "output": step_tokens_output,
+            "total": step_tokens_input + step_tokens_output,
+        },
+        "tools_called": tools_called,
+        "read_tool_called": "read" in tools_called,
+        "only_read_tool_called": bool(tools_called) and set(tools_called) == {"read"},
+        "read_target_only": read_target_only,
+        "token_in_tool_output": EXPECTED_TOKEN in combined_tool_output,
+        "token_verified": EXPECTED_TOKEN in combined_text,
+        "denied_or_error_count": len(denied_or_error_events),
+        "final_text_preview": combined_text[:500],
+    }
+
+
+class _ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+    daemon_threads = True
+
+
+class _NoRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        req: Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> Request | None:
+        raise HTTPError(req.full_url, code, f"Redirects refused by MeteringForwarder ({code})", headers, fp)
+
+
+class MeteringForwarder:
+    """Loopback-only HTTP metering forwarder that counts, clamps, and caps smoke requests."""
+
+    def __init__(
+        self,
+        upstream_base_url: str,
+        *,
+        max_chat_requests: int = MAX_SMOKE_CHAT_REQUESTS,
+        max_tokens_per_request: int = MAX_SMOKE_TOKENS_PER_REQUEST,
+        max_request_bytes: int = MAX_SMOKE_REQUEST_BYTES,
+        max_total_request_bytes: int = MAX_SMOKE_TOTAL_REQUEST_BYTES,
+    ) -> None:
+        self.upstream_base_url = upstream_base_url.rstrip("/")
+        self.max_chat_requests = max_chat_requests
+        self.max_tokens_per_request = max_tokens_per_request
+        self.max_request_bytes = max_request_bytes
+        self.max_total_request_bytes = max_total_request_bytes
+        self._lock = threading.Lock()
+        self._request_seq = 0
+        self.forwarded_chat_requests = 0
+        self.forwarded_chat_request_bytes = 0
+        self.blocked_chat_requests = 0
+        self.requests_log: list[dict[str, Any]] = []
+        self._server: _ThreadedHTTPServer | None = None
+        self._thread: threading.Thread | None = None
+        self._opener = build_opener(_NoRedirectHandler())
+
+    @property
+    def bound_host(self) -> str:
+        if self._server is None:
+            return ""
+        return str(self._server.server_address[0])
+
+    @property
+    def port(self) -> int:
+        if self._server is None:
+            return 0
+        return int(self._server.server_address[1])
+
+    @property
+    def base_url(self) -> str:
+        return f"http://127.0.0.1:{self.port}/v1"
+
+    def _resolve_upstream_url(self, path: str) -> str:
+        clean_path = path if path.startswith("/") else f"/{path}"
+        if clean_path == "/v1" or clean_path.startswith("/v1/"):
+            suffix = clean_path[3:]
+        else:
+            suffix = clean_path
+        return f"{self.upstream_base_url}{suffix}"
+
+    def start(self) -> None:
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+            def do_GET(self) -> None:
+                self._handle("GET")
+
+            def do_POST(self) -> None:
+                self._handle("POST")
+
+            def _handle(self, method: str) -> None:
+                req_started = time.perf_counter()
+                content_length = int(self.headers.get("Content-Length") or "0")
+                raw_body = self.rfile.read(content_length) if content_length > 0 else b""
+                is_chat = method == "POST" and self.path.rstrip("/").endswith("/chat/completions")
+
+                orig_max_tokens: Any = None
+                orig_max_completion_tokens: Any = None
+                orig_max_output_tokens: Any = None
+                enforced_max_tokens: int | None = None
+                message_count = 0
+                has_tools = False
+                is_stream = False
+
+                def _reject_local(status: int, code: str, message: str) -> None:
+                    err_bytes = json.dumps(
+                        {"error": {"message": message, "type": "invalid_request_error", "code": code}}
+                    ).encode("utf-8")
+                    with outer._lock:
+                        outer._request_seq += 1
+                        r_idx = outer._request_seq
+                        outer.blocked_chat_requests += 1
+                        outer.requests_log.append(
+                            {
+                                "request_index": r_idx,
+                                "method": method,
+                                "path": self.path,
+                                "status": status,
+                                "blocked": True,
+                                "error_code": code,
+                                "request_bytes": len(raw_body),
+                                "response_bytes": len(err_bytes),
+                                "elapsed_seconds": round(time.perf_counter() - req_started, 4),
+                            }
+                        )
+                    self.send_response(status)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(err_bytes)))
+                    self.end_headers()
+                    self.wfile.write(err_bytes)
+                    self.wfile.flush()
+
+                forward_body = raw_body
+                if is_chat:
+                    if len(raw_body) > outer.max_request_bytes:
+                        _reject_local(
+                            413,
+                            "smoke_request_bytes_exceeded",
+                            f"opencode-smoke request body ({len(raw_body)} bytes) exceeds {outer.max_request_bytes}",
+                        )
+                        return
+                    if not raw_body:
+                        _reject_local(400, "smoke_empty_request_body", "Empty chat completion body")
+                        return
+                    try:
+                        parsed_body = json.loads(raw_body.decode("utf-8"))
+                    except Exception:
+                        _reject_local(400, "smoke_invalid_json_body", "Malformed JSON chat completion body")
+                        return
+                    if not isinstance(parsed_body, dict):
+                        _reject_local(400, "smoke_non_object_json_body", "Chat completion body must be a JSON object")
+                        return
+                    orig_max_tokens = parsed_body.get("max_tokens")
+                    orig_max_completion_tokens = parsed_body.get("max_completion_tokens")
+                    orig_max_output_tokens = parsed_body.get("maxOutputTokens")
+                    candidates = [
+                        int(v)
+                        for v in (
+                            orig_max_tokens,
+                            orig_max_completion_tokens,
+                            orig_max_output_tokens,
+                        )
+                        if isinstance(v, int) and v > 0
+                    ]
+                    enforced_max_tokens = min(
+                        [*candidates, outer.max_tokens_per_request]
+                    )
+                    parsed_body["max_tokens"] = enforced_max_tokens
+                    parsed_body.pop("max_completion_tokens", None)
+                    parsed_body.pop("maxOutputTokens", None)
+                    msgs = parsed_body.get("messages")
+                    message_count = len(msgs) if isinstance(msgs, list) else 0
+                    has_tools = bool(parsed_body.get("tools"))
+                    is_stream = bool(parsed_body.get("stream"))
+                    if is_stream:
+                        stream_opts = parsed_body.get("stream_options")
+                        if not isinstance(stream_opts, dict):
+                            stream_opts = {}
+                        stream_opts["include_usage"] = True
+                        parsed_body["stream_options"] = stream_opts
+                    forward_body = json.dumps(parsed_body).encode("utf-8")
+
+                with outer._lock:
+                    if is_chat and outer.forwarded_chat_requests >= outer.max_chat_requests:
+                        outer._request_seq += 1
+                        req_index = outer._request_seq
+                        outer.blocked_chat_requests += 1
+                        err_bytes = json.dumps(
+                            {
+                                "error": {
+                                    "message": (
+                                        f"opencode-smoke request cap ({outer.max_chat_requests}) exceeded"
+                                    ),
+                                    "type": "rate_limit_error",
+                                    "code": "smoke_request_cap_exceeded",
+                                }
+                            }
+                        ).encode("utf-8")
+                        outer.requests_log.append(
+                            {
+                                "request_index": req_index,
+                                "method": method,
+                                "path": self.path,
+                                "status": 429,
+                                "blocked": True,
+                                "error_code": "smoke_request_cap_exceeded",
+                                "request_bytes": len(raw_body),
+                                "response_bytes": len(err_bytes),
+                                "elapsed_seconds": round(time.perf_counter() - req_started, 4),
+                            }
+                        )
+                        self.send_response(429)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(err_bytes)))
+                        self.end_headers()
+                        self.wfile.write(err_bytes)
+                        self.wfile.flush()
+                        return
+                    if (
+                        is_chat
+                        and outer.forwarded_chat_request_bytes + len(raw_body)
+                        > outer.max_total_request_bytes
+                    ):
+                        outer._request_seq += 1
+                        req_index = outer._request_seq
+                        outer.blocked_chat_requests += 1
+                        err_bytes = json.dumps(
+                            {
+                                "error": {
+                                    "message": (
+                                        "opencode-smoke cumulative request bytes "
+                                        f"({outer.forwarded_chat_request_bytes + len(raw_body)}) "
+                                        f"exceed {outer.max_total_request_bytes}"
+                                    ),
+                                    "type": "invalid_request_error",
+                                    "code": "smoke_total_request_bytes_exceeded",
+                                }
+                            }
+                        ).encode("utf-8")
+                        outer.requests_log.append(
+                            {
+                                "request_index": req_index,
+                                "method": method,
+                                "path": self.path,
+                                "status": 413,
+                                "blocked": True,
+                                "error_code": "smoke_total_request_bytes_exceeded",
+                                "request_bytes": len(raw_body),
+                                "response_bytes": len(err_bytes),
+                                "elapsed_seconds": round(time.perf_counter() - req_started, 4),
+                            }
+                        )
+                        self.send_response(413)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(err_bytes)))
+                        self.end_headers()
+                        self.wfile.write(err_bytes)
+                        self.wfile.flush()
+                        return
+                    outer._request_seq += 1
+                    req_index = outer._request_seq
+                    if is_chat:
+                        outer.forwarded_chat_requests += 1
+                        outer.forwarded_chat_request_bytes += len(raw_body)
+
+                upstream_url = outer._resolve_upstream_url(self.path)
+                req_headers: dict[str, str] = {"Accept": self.headers.get("Accept") or "*/*"}
+                if self.headers.get("Content-Type"):
+                    req_headers["Content-Type"] = str(self.headers.get("Content-Type"))
+                if self.headers.get("Authorization"):
+                    req_headers["Authorization"] = str(self.headers.get("Authorization"))
+
+                upstream_req = Request(
+                    upstream_url,
+                    data=forward_body if method == "POST" else None,
+                    headers=req_headers,
+                    method=method,
+                )
+
+                resp_bytes_count = 0
+                observed_usage: dict[str, Any] | None = None
+                status_code = 502
+                sse_tail = ""
+
+                try:
+                    with outer._opener.open(upstream_req, timeout=120) as up_resp:
+                        status_code = int(up_resp.status)
+                        self.send_response(status_code)
+                        ct = up_resp.headers.get("Content-Type") or "application/json"
+                        self.send_header("Content-Type", ct)
+                        self.end_headers()
+                        while True:
+                            chunk = up_resp.read(4096)
+                            if not chunk:
+                                break
+                            resp_bytes_count += len(chunk)
+                            self.wfile.write(chunk)
+                            self.wfile.flush()
+                            text_chunk = sse_tail + chunk.decode("utf-8", errors="replace")
+                            if "\n" in text_chunk:
+                                lines = text_chunk.split("\n")
+                                sse_tail = lines[-1]
+                                for ln in lines[:-1]:
+                                    s_ln = ln.strip()
+                                    if s_ln.startswith("data: ") and s_ln[6:] != "[DONE]":
+                                        try:
+                                            ev = json.loads(s_ln[6:])
+                                            if isinstance(ev, dict) and isinstance(
+                                                ev.get("usage"), dict
+                                            ):
+                                                observed_usage = ev["usage"]
+                                        except Exception:
+                                            pass
+                                    elif not is_stream and s_ln.startswith("{"):
+                                        try:
+                                            ev = json.loads(s_ln)
+                                            if isinstance(ev, dict) and isinstance(
+                                                ev.get("usage"), dict
+                                            ):
+                                                observed_usage = ev["usage"]
+                                        except Exception:
+                                            pass
+                            else:
+                                sse_tail = text_chunk
+                except HTTPError as http_err:
+                    status_code = int(http_err.code)
+                    err_body = http_err.read() if http_err.fp else b""
+                    http_err.close()
+                    resp_bytes_count = len(err_body)
+                    self.send_response(status_code)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    if err_body:
+                        self.wfile.write(err_body)
+                        self.wfile.flush()
+                except Exception:
+                    status_code = 502
+                    self.send_response(status_code)
+                    self.end_headers()
+
+                with outer._lock:
+                    outer.requests_log.append(
+                        {
+                            "request_index": req_index,
+                            "method": method,
+                            "path": self.path,
+                            "status": status_code,
+                            "blocked": False,
+                            "request_bytes": len(forward_body),
+                            "response_bytes": resp_bytes_count,
+                            "message_count": message_count,
+                            "has_tools": has_tools,
+                            "original_max_tokens": orig_max_tokens,
+                            "original_max_completion_tokens": orig_max_completion_tokens,
+                            "original_max_output_tokens": orig_max_output_tokens,
+                            "enforced_max_tokens": enforced_max_tokens,
+                            "observed_usage": observed_usage,
+                            "elapsed_seconds": round(time.perf_counter() - req_started, 4),
+                        }
+                    )
+
+        self._server = _ThreadedHTTPServer(("127.0.0.1", 0), Handler)
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        if self._server is not None:
+            self._server.shutdown()
+            self._server.server_close()
+            self._server = None
+        if self._thread is not None:
+            self._thread.join(timeout=2)
+            self._thread = None
+
+    def summarize_tokens(self) -> dict[str, Any]:
+        prompt_tokens = 0
+        completion_tokens = 0
+        total_tokens = 0
+        missing_usage_requests = 0
+        for rec in self.requests_log:
+            if rec.get("blocked") or rec.get("method") != "POST":
+                continue
+            usage = rec.get("observed_usage")
+            if isinstance(usage, dict) and isinstance(usage.get("total_tokens"), int):
+                p_tok = int(usage.get("prompt_tokens") or 0)
+                c_tok = int(usage.get("completion_tokens") or 0)
+                t_tok = int(usage.get("total_tokens") or (p_tok + c_tok))
+                prompt_tokens += p_tok
+                completion_tokens += c_tok
+                total_tokens += t_tok
+            else:
+                missing_usage_requests += 1
+        return {
+            "forwarded_chat_requests": self.forwarded_chat_requests,
+            "forwarded_chat_request_bytes": self.forwarded_chat_request_bytes,
+            "blocked_chat_requests": self.blocked_chat_requests,
+            "max_chat_requests_allowed": self.max_chat_requests,
+            "max_tokens_per_request_enforced": self.max_tokens_per_request,
+            "max_request_bytes_enforced": self.max_request_bytes,
+            "max_total_request_bytes_enforced": self.max_total_request_bytes,
+            "observed_http_tokens": {
+                "prompt": prompt_tokens,
+                "completion": completion_tokens,
+                "total": total_tokens,
+                "requests_missing_usage": missing_usage_requests,
+            },
+            "reserved_ceiling_tokens": {
+                "input": 4500,
+                "output": self.max_chat_requests * self.max_tokens_per_request,
+                "total": 4500 + (self.max_chat_requests * self.max_tokens_per_request),
+            },
+        }
+
+
+def run_sampled_command(
+    cmd: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str],
+    timeout_s: int,
+    label: str,
+    network_samples: list[str],
+    non_localhost_lines: list[str],
+    unconnected_udp_lines: list[str],
+    observer_errors: list[str],
+    observer_warnings: list[str],
+    extra_root_pids_fn: Any = None,
+    poll_interval_s: float = 0.1,
+) -> dict[str, Any]:
+    stop_sampling = threading.Event()
+    started = time.perf_counter()
+    poll_count = 0
+    positive_socket_samples = 0
+    parsed_socket_lines = 0
+
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(cwd),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+
+    def sample_network() -> None:
+        nonlocal poll_count, positive_socket_samples, parsed_socket_lines
+        while not stop_sampling.is_set():
+            roots = {proc.pid}
+            if callable(extra_root_pids_fn):
+                roots.update(extra_root_pids_fn())
+            pids_set: set[int] = set()
+            for rpid in sorted(roots):
+                pids_set.update(
+                    collect_process_tree_pids(rpid, observer_errors, observer_warnings)
+                )
+            pids = sorted(pids_set)
+            if pids:
+                pid_arg = ",".join(str(p) for p in pids)
+                poll_count += 1
+                try:
+                    lsof_proc = subprocess.run(
+                        ["lsof", "-nP", "-i", "-a", "-p", pid_arg],
+                        capture_output=True,
+                        text=True,
+                        timeout=2,
+                        check=False,
+                    )
+                    _record_stderr_lines(
+                        lsof_proc.stderr,
+                        source=f"lsof({label})",
+                        observer_errors=observer_errors,
+                        observer_warnings=observer_warnings,
+                    )
+                    if lsof_proc.returncode not in (0, 1):
+                        observer_errors.append(
+                            f"lsof({label}) unexpected exit code {lsof_proc.returncode}"
+                        )
+                    if lsof_proc.stdout:
+                        stamp_s = round(time.perf_counter() - started, 3)
+                        network_samples.append(
+                            f"--- {label} t={stamp_s}s pids={pid_arg} ---\n{lsof_proc.stdout}"
+                        )
+                        sample_line_count = 0
+                        for line in lsof_proc.stdout.splitlines():
+                            kind = classify_lsof_socket_line(line)
+                            if kind == "header_or_empty":
+                                continue
+                            sample_line_count += 1
+                            parsed_socket_lines += 1
+                            if kind == "unconnected_udp":
+                                unconnected_udp_lines.append(line)
+                            elif kind == "non_localhost":
+                                non_localhost_lines.append(line)
+                        if sample_line_count > 0:
+                            positive_socket_samples += 1
+                except Exception as exc:
+                    observer_errors.append(f"lsof({label}) exception: {exc}")
+            stop_sampling.wait(poll_interval_s)
+
+    sampler = threading.Thread(target=sample_network, daemon=True)
+    sampler.start()
+    try:
+        stdout_text, stderr_text = proc.communicate(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        stdout_text, stderr_text = proc.communicate()
+    finally:
+        stop_sampling.set()
+        sampler.join(timeout=2)
+    elapsed = round(time.perf_counter() - started, 4)
+    return {
+        "returncode": proc.returncode,
+        "stdout": stdout_text or "",
+        "stderr": stderr_text or "",
+        "elapsed": elapsed,
+        "poll_count": poll_count,
+        "positive_socket_samples": positive_socket_samples,
+        "parsed_socket_lines": parsed_socket_lines,
+    }
+
+
+def evaluate_smoke_gate(
+    *,
+    returncode: int,
+    opencode_host_dirs_unchanged: bool,
+    observer_available: bool,
+    observer_errors: list[str],
+    run_poll_count: int,
+    run_positive_socket_samples: int,
+    run_parsed_socket_lines: int,
+    non_localhost_lines: list[str],
+    unconnected_udp_lines: list[str],
+    forwarder_bound_localhost: bool,
+    server_request_count: int,
+    blocked_chat_requests: int,
+    max_chat_requests: int,
+    parsed_events: dict[str, Any],
+    session_token_redactions: int = 0,
+    session_token_matches: int = 0,
+) -> dict[str, bool]:
+    network_observation_ok = (
+        observer_available
+        and len(observer_errors) == 0
+        and run_poll_count > 0
+        and run_positive_socket_samples > 0
+        and run_parsed_socket_lines > 0
+        and forwarder_bound_localhost
+    )
+    llm_step_count = int(parsed_events.get("llm_step_count") or 0)
+    request_budget_ok = (
+        1 <= server_request_count <= max_chat_requests
+        and blocked_chat_requests == 0
+        and 1 <= llm_step_count <= MAX_SMOKE_LLM_STEPS
+    )
+    passed = (
+        returncode == 0
+        and opencode_host_dirs_unchanged
+        and network_observation_ok
+        and len(non_localhost_lines) == 0
+        and len(unconnected_udp_lines) == 0
+        and request_budget_ok
+        and session_token_redactions == 0
+        and session_token_matches == 0
+        and bool(parsed_events.get("read_tool_called"))
+        and bool(parsed_events.get("only_read_tool_called"))
+        and bool(parsed_events.get("read_target_only"))
+        and bool(parsed_events.get("token_in_tool_output"))
+        and bool(parsed_events.get("token_verified"))
+        and int(parsed_events.get("denied_or_error_count") or 0) == 0
+    )
+    return {
+        "network_observation_ok": network_observation_ok,
+        "request_budget_ok": request_budget_ok,
+        "passed": passed,
+    }
+
+
+def _count_serve_log_chat_posts(serve_log_path: Path) -> int | None:
+    if not serve_log_path.exists():
+        return None
+    try:
+        return sum(
+            1
+            for line in serve_log_path.read_text(errors="replace").splitlines()
+            if '"POST /v1/chat/completions' in line
+        )
+    except Exception:
+        return None
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 2:
+        print("usage: scripts/opencode-smoke <model-id>", file=sys.stderr)
+        return 2
+
+    model_id = argv[1]
+    opencode_bin = shutil.which("opencode")
+    if not opencode_bin:
+        print("opencode binary not found on PATH", file=sys.stderr)
+        return 1
+
+    lsof_bin = shutil.which("lsof")
+    pgrep_bin = shutil.which("pgrep")
+    observer_available = bool(lsof_bin and pgrep_bin)
+
+    try:
+        model = load_model(model_id)
+        pid_record = read_pid_record_for_model(model_id)
+        endpoint = resolve_endpoint(model, pid_record=pid_record)
+    except RegistryError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    verify_proc = subprocess.run(
+        [str(ROOT / "scripts" / "verify-served-model"), model_id],
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if verify_proc.returncode != 0:
+        print(verify_proc.stderr or verify_proc.stdout, file=sys.stderr)
+        return 1
+
+    stamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
+    safe_model = re.sub(r"[^A-Za-z0-9_.-]", "-", model_id)
+    model_hash = hashlib.sha256(model_id.encode("utf-8")).hexdigest()[:8]
+    runs_dir = ROOT / "runs"
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = Path(
+        tempfile.mkdtemp(
+            prefix=f"{stamp}-opencode-smoke-{safe_model}-{model_hash}-",
+            dir=str(runs_dir),
+        )
+    )
+    (out_dir / "served-model.txt").write_text(verify_proc.stdout)
+
+    workspace_dir = out_dir / "workspace"
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(TEMPLATE_TARGET, workspace_dir / "target.txt")
+    subprocess.run(["git", "init", "-q"], cwd=str(workspace_dir), check=True)
+
+    forwarder = MeteringForwarder(
+        endpoint.api_base_url,
+        max_chat_requests=MAX_SMOKE_CHAT_REQUESTS,
+        max_tokens_per_request=MAX_SMOKE_TOKENS_PER_REQUEST,
+    )
+    forwarder.start()
+    try:
+        forwarder_bound_localhost = forwarder.bound_host == "127.0.0.1" and forwarder.port > 0
+        config_text = render_opencode_config(
+            endpoint,
+            api_base_url_override=forwarder.base_url,
+        )
+        opencode_config_path = out_dir / "opencode.json"
+        opencode_config_path.write_text(config_text)
+
+        real_home = Path.home()
+        before_snapshot = snapshot_host_opencode_dirs(real_home)
+        (out_dir / "host-state-before.txt").write_text(before_snapshot)
+
+        isolated_home = out_dir / ".home"
+        for subdir in (".config", ".local/share", ".cache", ".local/state"):
+            (isolated_home / subdir).mkdir(parents=True, exist_ok=True)
+
+        env = build_isolated_env(workspace_dir, isolated_home, opencode_config_path, endpoint)
+
+        network_samples: list[str] = []
+        non_localhost_lines: list[str] = []
+        unconnected_udp_lines: list[str] = []
+        observer_errors: list[str] = []
+        observer_warnings: list[str] = []
+        if not observer_available:
+            observer_errors.append("Required observer binary missing (lsof or pgrep not found on PATH)")
+
+        help_res = run_sampled_command(
+            [opencode_bin, "run", "--help"],
+            cwd=workspace_dir,
+            env=env,
+            timeout_s=30,
+            label="help",
+            network_samples=network_samples,
+            non_localhost_lines=non_localhost_lines,
+            unconnected_udp_lines=unconnected_udp_lines,
+            observer_errors=observer_errors,
+            observer_warnings=observer_warnings,
+        )
+        help_text = help_res["stdout"] + help_res["stderr"]
+        (out_dir / "opencode-help.txt").write_text(help_text)
+
+        required_flags_present = all(
+            flag in help_text for flag in ("--standalone", "--format", "--model")
+        )
+        if not required_flags_present:
+            summary = {
+                "model_id": model_id,
+                "repo": endpoint.served_model_id,
+                "passed": False,
+                "reason": "opencode run --help missing required flags (--standalone, --format, --model)",
+                "out_dir": str(out_dir.relative_to(ROOT)),
+            }
+            (out_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+            print(json.dumps(summary, indent=2))
+            return 1
+
+        prompt = (
+            "/no_think Use your read tool to read target.txt in the current directory "
+            "and reply with the exact token inside."
+        )
+        cmd = [
+            opencode_bin,
+            "run",
+            "--standalone",
+            "--format",
+            "json",
+            "-m",
+            "local_mlx/local_model",
+            prompt,
+        ]
+
+        serve_log_path = runs_dir / "serve.log"
+        serve_posts_before = _count_serve_log_chat_posts(serve_log_path)
+
+        run_res = run_sampled_command(
+            cmd,
+            cwd=workspace_dir,
+            env=env,
+            timeout_s=180,
+            label="run",
+            network_samples=network_samples,
+            non_localhost_lines=non_localhost_lines,
+            unconnected_udp_lines=unconnected_udp_lines,
+            observer_errors=observer_errors,
+            observer_warnings=observer_warnings,
+        )
+        serve_posts_after = _count_serve_log_chat_posts(serve_log_path)
+    finally:
+        forwarder.stop()
+
+    serve_log_delta = (
+        (serve_posts_after - serve_posts_before)
+        if (serve_posts_before is not None and serve_posts_after is not None)
+        else None
+    )
+
+    scrubbed_stdout, stdout_redactions = redact_and_count_session_tokens(run_res["stdout"])
+    scrubbed_stderr, stderr_redactions = redact_and_count_session_tokens(run_res["stderr"])
+    session_token_redactions = stdout_redactions + stderr_redactions
+    (out_dir / "events.jsonl").write_text(scrubbed_stdout)
+    (out_dir / "stderr.log").write_text(scrubbed_stderr)
+    (out_dir / "network-check.txt").write_text("\n".join(network_samples) + "\n")
+    (out_dir / "http-requests.json").write_text(
+        json.dumps(forwarder.requests_log, indent=2) + "\n"
+    )
+
+    after_snapshot = snapshot_host_opencode_dirs(real_home)
+    (out_dir / "host-state-after.txt").write_text(after_snapshot)
+    opencode_host_dirs_unchanged = before_snapshot == after_snapshot
+
+    session_token_scan = scan_and_redact_directory_tokens([out_dir, ROOT / ".home"])
+    in_memory_redactions = stdout_redactions + stderr_redactions
+    session_token_redactions = in_memory_redactions + int(session_token_scan.get("redactions_applied") or 0)
+    session_token_matches = in_memory_redactions + int(session_token_scan.get("matches_found") or 0)
+    session_token_scan["redactions_applied"] = session_token_redactions
+    session_token_scan["matches_found"] = session_token_matches
+
+    parsed = parse_events(scrubbed_stdout, workspace_dir)
+    token_summary = forwarder.summarize_tokens()
+    gate = evaluate_smoke_gate(
+        returncode=run_res["returncode"],
+        opencode_host_dirs_unchanged=opencode_host_dirs_unchanged,
+        observer_available=observer_available,
+        observer_errors=observer_errors,
+        run_poll_count=run_res["poll_count"],
+        run_positive_socket_samples=run_res["positive_socket_samples"],
+        run_parsed_socket_lines=run_res["parsed_socket_lines"],
+        non_localhost_lines=non_localhost_lines,
+        unconnected_udp_lines=unconnected_udp_lines,
+        forwarder_bound_localhost=forwarder_bound_localhost,
+        server_request_count=forwarder.forwarded_chat_requests,
+        blocked_chat_requests=forwarder.blocked_chat_requests,
+        max_chat_requests=MAX_SMOKE_CHAT_REQUESTS,
+        parsed_events=parsed,
+        session_token_redactions=session_token_redactions,
+        session_token_matches=session_token_matches,
+    )
+
+    summary = {
+        "model_id": model_id,
+        "repo": endpoint.served_model_id,
+        "endpoint": endpoint.api_base_url,
+        "opencode_version": "v2.0.32",
+        "exit_code": run_res["returncode"],
+        "elapsed_seconds": run_res["elapsed"],
+        "opencode_host_dirs_unchanged": opencode_host_dirs_unchanged,
+        "host_state_unchanged": opencode_host_dirs_unchanged,
+        "host_state_check_scope": HOST_STATE_CHECK_SCOPE,
+        "observer_available": observer_available,
+        "observer_error_count": len(observer_errors),
+        "observer_errors": observer_errors,
+        "observer_warnings": observer_warnings,
+        "help_poll_count": help_res["poll_count"],
+        "run_poll_count": run_res["poll_count"],
+        "run_positive_socket_samples": run_res["positive_socket_samples"],
+        "run_parsed_socket_lines": run_res["parsed_socket_lines"],
+        "network_observation_ok": gate["network_observation_ok"],
+        "non_localhost_sockets": len(non_localhost_lines),
+        "non_localhost_socket_lines": non_localhost_lines,
+        "unconnected_udp_sockets": len(unconnected_udp_lines),
+        "unconnected_udp_socket_lines": unconnected_udp_lines,
+        "forwarder_bound_localhost": forwarder_bound_localhost,
+        "server_request_count": forwarder.forwarded_chat_requests,
+        "blocked_chat_requests": forwarder.blocked_chat_requests,
+        "serve_log_chat_requests_delta": serve_log_delta,
+        "request_budget_ok": gate["request_budget_ok"],
+        "session_token_redactions": session_token_redactions,
+        "session_token_scan": session_token_scan,
+        "token_accounting": token_summary,
+        "network_check_method": (
+            "lsof polling (100ms interval across process tree for both --help and run, "
+            "requiring >=1 positive socket sample during run and zero observer errors) "
+            "plus in-process 127.0.0.1 HTTP metering forwarder; short-lived non-HTTP "
+            "connections between samples not ruled out without kernel/firewall filter"
+        ),
+        **parsed,
+        "passed": gate["passed"],
+        "out_dir": str(out_dir.relative_to(ROOT)),
+    }
+    (out_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+    print(json.dumps(summary, indent=2))
+    return 0 if gate["passed"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

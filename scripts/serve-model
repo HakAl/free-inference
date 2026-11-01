@@ -1,0 +1,777 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import contextlib
+import fcntl
+import json
+import os
+import secrets
+import select
+import shlex
+import signal
+import socket
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+from urllib.request import Request, urlopen
+
+ROOT = Path(__file__).resolve().parents[1]
+VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
+if VENV_PYTHON.exists() and Path(sys.executable) != VENV_PYTHON:
+    os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), __file__, *sys.argv[1:]])
+
+sys.path.insert(0, str(ROOT))
+
+from local_assist.registry import (
+    LOCAL_HOSTS,
+    RegistryError,
+    build_base_url,
+    legacy_pid_file,
+    list_pid_records,
+    load_model,
+    pid_file_for_model,
+    read_pid_record_for_model,
+    resolve_endpoint,
+    session_token_file_for_model,
+    validate_custom_command_localhost,
+)
+from local_assist.se_key import (
+    SEKeyIntegrityError,
+    verify_se_key_proxy_binary,
+)
+
+
+RUNS = ROOT / "runs"
+DEFAULT_PORT = 8080
+CUSTOM_COMMAND_RUNTIMES = {"proxy", "mlx-vlm", "vllm-mlx", "omlx", "llama.cpp"}
+
+
+def _pid_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _port_is_bound(host: str, port: int) -> bool:
+    bind_host = "127.0.0.1" if host == "localhost" else host
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.5)
+        return s.connect_ex((bind_host, port)) == 0
+
+
+def health(api_base_url: str, api_key: str) -> bool:
+    req = Request(
+        f"{api_base_url}/models",
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+        method="GET",
+    )
+    try:
+        with urlopen(req, timeout=1) as resp:
+            return 200 <= resp.status < 300
+    except Exception:
+        return False
+
+
+def build_command(
+    model: dict,
+    *,
+    runtime: str,
+    host: str,
+    port: int,
+    chat_template_args_override: dict | None,
+) -> tuple[list[str] | None, str | None]:
+    repo = model["repo"]
+    if host not in LOCAL_HOSTS:
+        return None, f"Refusing to bind local server to non-localhost host '{host}'."
+
+    bind_host = "127.0.0.1" if host == "localhost" else host
+    if runtime == "mlx-lm":
+        # `python -m mlx_lm.server` is deprecated in mlx_lm 0.29+; the supported
+        # invocation is `python -m mlx_lm server` (no dot). MLX_METAL_BUFFER_
+        # CACHE_LIMIT_KB is honored from the environment if the operator wants to
+        # cap Metal's buffer cache as an experimental memory mitigation.
+        cmd = [
+            sys.executable,
+            "-m",
+            "mlx_lm",
+            "server",
+            "--model",
+            repo,
+            "--host",
+            bind_host,
+            "--port",
+            str(port),
+        ]
+        chat_template_file = model.get("chat_template_file")
+        if chat_template_file:
+            template_path = (ROOT / chat_template_file).resolve()
+            if not template_path.exists():
+                return None, f"chat_template_file not found: {template_path}"
+            cmd.extend(["--chat-template", template_path.read_text()])
+        chat_template_args = (
+            chat_template_args_override
+            if chat_template_args_override is not None
+            else model.get("chat_template_args")
+        )
+        if chat_template_args:
+            cmd.extend(["--chat-template-args", json.dumps(chat_template_args)])
+        return cmd, None
+
+    if runtime in CUSTOM_COMMAND_RUNTIMES:
+        raw_cmd = model.get("serve_command")
+        if not raw_cmd or not isinstance(raw_cmd, str):
+            return (
+                None,
+                f"runtime={runtime} requires a string serve_command in models.yaml",
+            )
+        rendered = raw_cmd.format(port=port, host=bind_host, repo=repo)
+        cmd = shlex.split(rendered)
+        validation_error = validate_custom_command_localhost(cmd, expected_port=port)
+        if validation_error is not None:
+            return None, validation_error
+        return cmd, None
+
+    return (
+        None,
+        f"scripts/serve-model supports runtime=mlx-lm or {sorted(CUSTOM_COMMAND_RUNTIMES)} with serve_command, got {runtime}",
+    )
+
+
+def build_serve_env(
+    endpoint: Any,
+    *,
+    allow_hf_online: bool = False,
+    base_env: dict[str, str] | None = None,
+) -> dict[str, str]:
+    src = base_env if base_env is not None else os.environ
+    env = {
+        **src,
+        "HF_HUB_ENABLE_HF_TRANSFER": src.get("HF_HUB_ENABLE_HF_TRANSFER", "1"),
+        "HF_HOME": str(ROOT / ".home" / "huggingface"),
+        "HF_HUB_CACHE": str(ROOT / ".home" / "huggingface" / "hub"),
+    }
+    if getattr(endpoint, "trust_tier", None) == "local" and not allow_hf_online:
+        # Force offline mode for local models so cached models never phone home to
+        # huggingface.co on server startup, even if HF_HUB_OFFLINE=0 is in the parent env.
+        env["HF_HUB_OFFLINE"] = "1"
+    return env
+
+
+def _write_exclusive_session_token(path: Path, token: str) -> None:
+    path.unlink(missing_ok=True)
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        os.write(fd, (token + "\n").encode("utf-8"))
+    finally:
+        os.close(fd)
+
+
+def _terminate_proc(proc: subprocess.Popen[Any] | None) -> None:
+    if proc is None:
+        return
+    try:
+        if proc.poll() is None:
+            os.kill(proc.pid, signal.SIGTERM)
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                os.kill(proc.pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
+class _SignalInterruptedError(BaseException):
+    def __init__(self, signum: int) -> None:
+        super().__init__(f"Interrupted by signal {signum}")
+        self.signum = signum
+
+
+@contextlib.contextmanager
+def _pid_lock(runs_dir: Path):
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    pid_lock_path = runs_dir / ".pid.lock"
+    with pid_lock_path.open("w") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+def _after_initial_provisional_write_hook() -> None:
+    return
+
+
+def _write_pid_files(
+    model_pid_file: Path,
+    default_pid_file: Path,
+    record: dict[str, Any],
+) -> None:
+    serialized = json.dumps(record, indent=2) + "\n"
+    model_pid_file.write_text(serialized)
+    default_pid_file.write_text(serialized)
+
+
+def _assert_provisional_record_active(
+    model_pid_file: Path,
+    startup_nonce: str,
+) -> None:
+    if not model_pid_file.exists():
+        raise RuntimeError(
+            "Startup aborted: provisional PID file was removed concurrently by stop-model"
+        )
+    try:
+        current_disk_rec = json.loads(model_pid_file.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"Startup aborted: provisional PID record unreadable: {exc}"
+        ) from exc
+    if (
+        not isinstance(current_disk_rec, dict)
+        or current_disk_rec.get("startup_nonce") != startup_nonce
+    ):
+        raise RuntimeError(
+            "Startup aborted: provisional PID record was modified concurrently"
+        )
+
+
+def _unlink_pid_files_if_matching(
+    model_pid_file: Path,
+    default_pid_file: Path,
+    model_id: str,
+    startup_nonce: str,
+) -> None:
+    for p in (model_pid_file, default_pid_file):
+        try:
+            if not p.exists():
+                continue
+            rec = json.loads(p.read_text())
+            if isinstance(rec, dict) and (
+                rec.get("startup_nonce") == startup_nonce
+                or rec.get("model_id") == model_id
+            ):
+                p.unlink(missing_ok=True)
+        except OSError:
+            pass
+        except json.JSONDecodeError:
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        description="Start the local model or proxy server configured in models.yaml."
+    )
+    parser.add_argument("model_id", help="Model id from models.yaml.")
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Override the port derived from promptfoo_provider.apiBaseUrl.",
+    )
+    parser.add_argument(
+        "--chat-template-args",
+        dest="chat_template_args",
+        default=None,
+        help="JSON object passed to --chat-template-args (mlx-lm runtime).",
+    )
+    parser.add_argument(
+        "--allow-hf-online",
+        action="store_true",
+        default=False,
+        help="Allow Hugging Face Hub network access during local model server startup (default: forced offline).",
+    )
+    parser.add_argument(
+        "--started-by",
+        dest="started_by",
+        default=None,
+        help="Provenance tag recorded in the PID file (for example 'manual' or 'auto-serve').",
+    )
+    parser.add_argument(
+        "--ttl-seconds",
+        dest="ttl_seconds",
+        type=int,
+        default=3600,
+        help="Session TTL in seconds for se-key-proxy before automatic shutdown (default: 3600).",
+    )
+    parser.add_argument(
+        "--max-chat-requests",
+        dest="max_chat_requests",
+        type=int,
+        default=50,
+        help="Maximum POST /v1/chat/completions requests per se-key-proxy session (default: 50).",
+    )
+    parser.add_argument(
+        "--max-tokens-cap",
+        dest="max_tokens_cap",
+        type=int,
+        default=0,
+        help="Maximum max_tokens cap enforced by se-key-proxy per chat request (0 = no proxy cap, default: 0).",
+    )
+    parser.add_argument(
+        "--max-request-bytes",
+        dest="max_request_bytes",
+        type=int,
+        default=262144,
+        help="Maximum HTTP request body bytes allowed by se-key-proxy (default: 262144).",
+    )
+    parser.add_argument(
+        "--stream-timeout-seconds",
+        dest="stream_timeout_seconds",
+        type=int,
+        default=300,
+        help="Maximum total duration in seconds for a single proxied request/stream in se-key-proxy (default: 300).",
+    )
+    args = parser.parse_args(argv[1:])
+
+    chat_template_args_override = None
+    if args.chat_template_args is not None:
+        try:
+            chat_template_args_override = json.loads(args.chat_template_args)
+        except json.JSONDecodeError as exc:
+            print(f"invalid --chat-template-args JSON: {exc}", file=sys.stderr)
+            return 2
+
+    try:
+        model = load_model(args.model_id)
+        existing_pid_record = read_pid_record_for_model(args.model_id, RUNS)
+        endpoint = resolve_endpoint(
+            model,
+            pid_record=existing_pid_record,
+            require_api_key=False,
+        )
+    except RegistryError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    if endpoint.runtime == "remote":
+        print(
+            f"Model {endpoint.model_id} uses runtime=remote ({endpoint.api_base_url}); "
+            "no local server process to start. Run scripts/verify-served-model to check reachability."
+        )
+        return 0
+
+    host = endpoint.host
+    if host not in LOCAL_HOSTS:
+        print(
+            f"Refusing to bind local server for {endpoint.model_id} to non-localhost host '{host}'.",
+            file=sys.stderr,
+        )
+        return 1
+
+    port = args.port if args.port is not None else (endpoint.port or DEFAULT_PORT)
+    api_base_url = build_base_url(host, port)
+
+    RUNS.mkdir(exist_ok=True)
+    (ROOT / ".home" / "huggingface").mkdir(parents=True, exist_ok=True)
+
+    uses_se_key_proxy = bool(endpoint.api_key_keychain_service)
+    se_proxy_bin: Path | None = None
+    upstream_port: int | None = None
+    upstream_cmd: list[str] | None = None
+    upstream_url: str | None = None
+    cmd: list[str] | None = None
+
+    if uses_se_key_proxy:
+        try:
+            se_proxy_bin = verify_se_key_proxy_binary()
+        except SEKeyIntegrityError as exc:
+            print(f"SEKeyIntegrityError: {exc}", file=sys.stderr)
+            return 1
+
+        raw_serve_cmd = model.get("serve_command")
+        if isinstance(raw_serve_cmd, str) and raw_serve_cmd.strip():
+            upstream_port = port + 1000
+            upstream_cmd, err = build_command(
+                model,
+                runtime=endpoint.runtime,
+                host=host,
+                port=upstream_port,
+                chat_template_args_override=chat_template_args_override,
+            )
+            if err or upstream_cmd is None:
+                print(err or "failed to build upstream command", file=sys.stderr)
+                return 1
+            upstream_url = f"http://127.0.0.1:{upstream_port}/v1"
+        elif endpoint.upstream_base_url:
+            upstream_url = endpoint.upstream_base_url
+        else:
+            print(
+                f"Model {endpoint.model_id}: apiKeyKeychainService requires either serve_command or upstreamBaseUrl.",
+                file=sys.stderr,
+            )
+            return 1
+    else:
+        cmd, err = build_command(
+            model,
+            runtime=endpoint.runtime,
+            host=host,
+            port=port,
+            chat_template_args_override=chat_template_args_override,
+        )
+        if err or cmd is None:
+            print(err or "failed to build command", file=sys.stderr)
+            return 1
+
+    started_by = (
+        args.started_by
+        or os.environ.get("LOCAL_ASSIST_STARTED_BY")
+        or "manual"
+    )
+    lock_path = RUNS / ".serve.lock"
+    with lock_path.open("w") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        same_model_record: dict[str, Any] | None = None
+        for _, rec in list_pid_records(RUNS):
+            rec_pid = rec.get("pid")
+            rec_up_pid = rec.get("upstream_pid")
+            rec_port = rec.get("port", DEFAULT_PORT)
+            rec_model_id = rec.get("model_id")
+            if isinstance(rec_pid, int) and rec_port == port and rec_pid > 0:
+                alive = _pid_is_alive(rec_pid)
+                if alive and isinstance(rec_up_pid, int) and not _pid_is_alive(rec_up_pid):
+                    alive = False
+                if alive and rec_model_id:
+                    if rec_model_id != endpoint.model_id:
+                        print(
+                            f"Refusing to start '{endpoint.model_id}' on port {port}: "
+                            f"another model ('{rec_model_id}', pid={rec_pid}) is already active on port {port}. "
+                            f"Run ./scripts/stop-model {rec_model_id} first.",
+                            file=sys.stderr,
+                        )
+                        return 3
+                    same_model_record = rec
+
+        if same_model_record is not None:
+            print(
+                f"Server for '{endpoint.model_id}' is already active (or starting) on port {port} "
+                f"(pid={same_model_record.get('pid')}, {api_base_url})."
+            )
+            print(json.dumps(same_model_record, indent=2))
+            return 0
+
+        if health(api_base_url, endpoint.api_key):
+            print(f"A server is already responding on port {port} ({api_base_url}).")
+            existing = read_pid_record_for_model(endpoint.model_id, RUNS)
+            if existing:
+                print(json.dumps(existing, indent=2))
+            elif legacy_pid_file(RUNS).exists():
+                print(legacy_pid_file(RUNS).read_text().strip())
+            return 0
+
+        log = RUNS / "serve.log"
+        serve_env = build_serve_env(endpoint, allow_hf_online=args.allow_hf_online)
+        model_pid_file = pid_file_for_model(endpoint.model_id, RUNS)
+        default_pid_file = legacy_pid_file(RUNS)
+        startup_nonce = secrets.token_hex(16)
+        started_at_str = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
+        prev_sigint = signal.getsignal(signal.SIGINT)
+        prev_sigterm = signal.getsignal(signal.SIGTERM)
+        prev_sighup = signal.getsignal(signal.SIGHUP)
+
+        def _handle_term_signal(signum: int, _frame: Any) -> None:
+            raise _SignalInterruptedError(signum)
+
+        signal.signal(signal.SIGTERM, _handle_term_signal)
+        signal.signal(signal.SIGHUP, _handle_term_signal)
+
+        try:
+            if uses_se_key_proxy:
+                assert se_proxy_bin is not None and upstream_url is not None
+                if _port_is_bound("127.0.0.1", port):
+                    print(
+                        f"Refusing to start '{endpoint.model_id}': port {port} is already bound on 127.0.0.1.",
+                        file=sys.stderr,
+                    )
+                    return 1
+                if upstream_port is not None and _port_is_bound("127.0.0.1", upstream_port):
+                    print(
+                        f"Refusing to start '{endpoint.model_id}': upstream port {upstream_port} is already bound on 127.0.0.1.",
+                        file=sys.stderr,
+                    )
+                    return 1
+
+                token_path = session_token_file_for_model(endpoint.model_id, RUNS)
+                session_token = f"se-session-{secrets.token_hex(32)}"
+
+                upstream_proc: subprocess.Popen[Any] | None = None
+                se_proc: subprocess.Popen[Any] | None = None
+                tok_r = -1
+                tok_w = -1
+                ready_r = -1
+                ready_w = -1
+                provisional_record: dict[str, Any] = {
+                    "model_id": endpoint.model_id,
+                    "repo": endpoint.served_model_id,
+                    "runtime": endpoint.runtime,
+                    "api_base_url": api_base_url,
+                    "port": port,
+                    "pid": None,
+                    "upstream_pid": None,
+                    "upstream_port": upstream_port,
+                    "upstream_url": upstream_url,
+                    "session_token_file": str(token_path),
+                    "max_chat_requests": args.max_chat_requests,
+                    "max_tokens_cap": args.max_tokens_cap,
+                    "max_request_bytes": args.max_request_bytes,
+                    "ttl_seconds": args.ttl_seconds,
+                    "stream_timeout_seconds": args.stream_timeout_seconds,
+                    "command": [],
+                    "upstream_command": upstream_cmd,
+                    "log": str(log),
+                    "started_at": started_at_str,
+                    "started_by": started_by,
+                    "status": "starting",
+                    "startup_nonce": startup_nonce,
+                }
+                try:
+                    with _pid_lock(RUNS):
+                        _write_pid_files(model_pid_file, default_pid_file, provisional_record)
+                        _write_exclusive_session_token(token_path, session_token)
+                    _after_initial_provisional_write_hook()
+                    tok_r, tok_w = os.pipe()
+                    ready_r, ready_w = os.pipe()
+
+                    if upstream_cmd is not None:
+                        with _pid_lock(RUNS):
+                            _assert_provisional_record_active(model_pid_file, startup_nonce)
+                            print("Starting upstream proxy:", " ".join(shlex.quote(part) for part in upstream_cmd))
+                            isolated_upstream_home = ROOT / ".home"
+                            isolated_upstream_home.mkdir(parents=True, exist_ok=True)
+                            upstream_env = {**serve_env, "HOME": str(isolated_upstream_home)}
+                            with log.open("a") as log_fh:
+                                upstream_proc = subprocess.Popen(
+                                    upstream_cmd,
+                                    cwd=ROOT,
+                                    stdout=log_fh,
+                                    stderr=subprocess.STDOUT,
+                                    env=upstream_env,
+                                    start_new_session=True,
+                                )
+                            provisional_record["upstream_pid"] = upstream_proc.pid
+                            _write_pid_files(model_pid_file, default_pid_file, provisional_record)
+
+                        assert upstream_port is not None
+                        up_deadline = time.monotonic() + 15.0
+                        while time.monotonic() < up_deadline:
+                            if upstream_proc.poll() is not None:
+                                raise RuntimeError(
+                                    f"Upstream proxy process exited immediately with code {upstream_proc.returncode}"
+                                )
+                            if _port_is_bound("127.0.0.1", upstream_port):
+                                break
+                            time.sleep(0.05)
+                        else:
+                            raise RuntimeError(
+                                f"Upstream proxy process (pid={upstream_proc.pid}) did not bind 127.0.0.1:{upstream_port} within 15s"
+                            )
+
+                    os.write(tok_w, (session_token + "\n").encode("utf-8"))
+                    os.close(tok_w)
+                    tok_w = -1
+
+                    se_cmd = [
+                        str(se_proxy_bin),
+                        "proxy",
+                        "--service",
+                        str(endpoint.api_key_keychain_service),
+                        "--listen-host",
+                        "127.0.0.1",
+                        "--listen-port",
+                        str(port),
+                        "--upstream-url",
+                        upstream_url,
+                        "--allowed-model",
+                        endpoint.served_model_id,
+                        "--session-token-fd",
+                        str(tok_r),
+                        "--ready-fd",
+                        str(ready_w),
+                        "--session-token-file",
+                        str(token_path),
+                        "--max-chat-requests",
+                        str(args.max_chat_requests),
+                        "--max-tokens-cap",
+                        str(args.max_tokens_cap),
+                        "--max-request-bytes",
+                        str(args.max_request_bytes),
+                        "--ttl-seconds",
+                        str(args.ttl_seconds),
+                        "--stream-timeout-seconds",
+                        str(args.stream_timeout_seconds),
+                    ]
+                    if upstream_proc is not None:
+                        se_cmd.extend(["--upstream-pid", str(upstream_proc.pid)])
+
+                    with _pid_lock(RUNS):
+                        _assert_provisional_record_active(model_pid_file, startup_nonce)
+                        provisional_record["command"] = se_cmd
+                        print("Starting se-key-proxy (Touch ID required):", " ".join(shlex.quote(part) for part in se_cmd[:8]), "...")
+                        with log.open("a") as log_fh:
+                            se_proc = subprocess.Popen(
+                                se_cmd,
+                                cwd=ROOT,
+                                stdout=log_fh,
+                                stderr=subprocess.STDOUT,
+                                env=serve_env,
+                                pass_fds=(tok_r, ready_w),
+                                start_new_session=True,
+                            )
+                        provisional_record["pid"] = se_proc.pid
+                        _write_pid_files(model_pid_file, default_pid_file, provisional_record)
+
+                    os.close(tok_r)
+                    tok_r = -1
+                    os.close(ready_w)
+                    ready_w = -1
+
+                    ready_buf = b""
+                    deadline = time.monotonic() + 60.0
+                    while time.monotonic() < deadline:
+                        rem = max(0.1, deadline - time.monotonic())
+                        rlist, _, _ = select.select([ready_r], [], [], min(1.0, rem))
+                        if rlist:
+                            chunk = os.read(ready_r, 1024)
+                            if not chunk:
+                                break
+                            ready_buf += chunk
+                            if b"\n" in ready_buf:
+                                break
+                        if se_proc.poll() is not None:
+                            break
+                    os.close(ready_r)
+                    ready_r = -1
+
+                    ready_line = ready_buf.decode("utf-8", errors="replace").strip()
+                    if not ready_line:
+                        raise RuntimeError(
+                            "se-key-proxy failed to unlock or bind (Touch ID cancelled or Keychain item missing)."
+                        )
+                    ready_obj = json.loads(ready_line)
+                    if not isinstance(ready_obj, dict) or ready_obj.get("status") != "ready":
+                        raise RuntimeError(f"se-key-proxy reported unexpected ready payload: {ready_line}")
+
+                    if se_proc.poll() is not None:
+                        raise RuntimeError(f"se-key-proxy exited prematurely with code {se_proc.returncode}")
+                    if upstream_proc is not None and upstream_proc.poll() is not None:
+                        raise RuntimeError(
+                            f"Upstream proxy process exited prematurely with code {upstream_proc.returncode}"
+                        )
+
+                    with _pid_lock(RUNS):
+                        _assert_provisional_record_active(model_pid_file, startup_nonce)
+                        ready_record = dict(provisional_record)
+                        ready_record["status"] = "ready"
+                        _write_pid_files(model_pid_file, default_pid_file, ready_record)
+                except BaseException as exc:
+                    signal.signal(signal.SIGINT, signal.SIG_IGN)
+                    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+                    for fd in (tok_r, tok_w, ready_r, ready_w):
+                        if fd >= 0:
+                            try:
+                                os.close(fd)
+                            except OSError:
+                                pass
+                    _terminate_proc(se_proc)
+                    _terminate_proc(upstream_proc)
+                    with _pid_lock(RUNS):
+                        token_path.unlink(missing_ok=True)
+                        _unlink_pid_files_if_matching(model_pid_file, default_pid_file, endpoint.model_id, startup_nonce)
+                    if isinstance(exc, KeyboardInterrupt):
+                        print(f"Interrupted while starting proxy for '{endpoint.model_id}'.", file=sys.stderr)
+                        return 130
+                    if isinstance(exc, _SignalInterruptedError):
+                        print(f"Interrupted by signal {exc.signum} while starting proxy for '{endpoint.model_id}'.", file=sys.stderr)
+                        return 128 + exc.signum
+                    if isinstance(exc, SystemExit):
+                        raise
+                    print(f"Failed to start proxy for '{endpoint.model_id}': {exc}", file=sys.stderr)
+                    return 1
+
+                print(f"PID {se_proc.pid} (upstream_pid={provisional_record['upstream_pid']}); log {log}")
+                print(f"PID file {default_pid_file} (and {model_pid_file})")
+                return 0
+
+            assert cmd is not None
+            proc: subprocess.Popen[Any] | None = None
+            provisional_local: dict[str, Any] = {
+                "model_id": endpoint.model_id,
+                "repo": endpoint.served_model_id,
+                "runtime": endpoint.runtime,
+                "api_base_url": api_base_url,
+                "port": port,
+                "pid": None,
+                "command": cmd,
+                "log": str(log),
+                "started_at": started_at_str,
+                "started_by": started_by,
+                "hf_offline": serve_env.get("HF_HUB_OFFLINE") == "1",
+                "status": "starting",
+                "startup_nonce": startup_nonce,
+            }
+            try:
+                with _pid_lock(RUNS):
+                    _write_pid_files(model_pid_file, default_pid_file, provisional_local)
+                _after_initial_provisional_write_hook()
+                with _pid_lock(RUNS):
+                    _assert_provisional_record_active(model_pid_file, startup_nonce)
+                    print("Starting:", " ".join(shlex.quote(part) for part in cmd))
+                    with log.open("a") as log_fh:
+                        proc = subprocess.Popen(
+                            cmd,
+                            cwd=ROOT,
+                            stdout=log_fh,
+                            stderr=subprocess.STDOUT,
+                            env=serve_env,
+                            start_new_session=True,
+                        )
+                    ready_local = dict(provisional_local)
+                    ready_local["pid"] = proc.pid
+                    ready_local["status"] = "ready"
+                    _write_pid_files(model_pid_file, default_pid_file, ready_local)
+            except BaseException as exc:
+                signal.signal(signal.SIGINT, signal.SIG_IGN)
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                signal.signal(signal.SIGHUP, signal.SIG_IGN)
+                _terminate_proc(proc)
+                with _pid_lock(RUNS):
+                    _unlink_pid_files_if_matching(model_pid_file, default_pid_file, endpoint.model_id, startup_nonce)
+                if isinstance(exc, KeyboardInterrupt):
+                    print(f"Interrupted while starting '{endpoint.model_id}'.", file=sys.stderr)
+                    return 130
+                if isinstance(exc, _SignalInterruptedError):
+                    print(f"Interrupted by signal {exc.signum} while starting '{endpoint.model_id}'.", file=sys.stderr)
+                    return 128 + exc.signum
+                if isinstance(exc, SystemExit):
+                    raise
+                print(f"Failed to start '{endpoint.model_id}': {exc}", file=sys.stderr)
+                return 1
+
+            print(f"PID {proc.pid}; log {log}")
+            print(f"PID file {default_pid_file} (and {model_pid_file})")
+            return 0
+        finally:
+            signal.signal(signal.SIGINT, prev_sigint)
+            signal.signal(signal.SIGTERM, prev_sigterm)
+            signal.signal(signal.SIGHUP, prev_sighup)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

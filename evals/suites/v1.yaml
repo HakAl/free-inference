@@ -1,0 +1,211 @@
+description: Local LLM v1 practical eval suite
+
+prompts:
+  - "{{prompt}}"
+
+providers:
+  - id: openai:chat:mlx-community/phi-4-4bit
+    transform: "typeof output === 'string' ? output.replace(/<\\|im_end\\|>\\s*$/g, '').trim() : output"
+    config:
+      apiBaseUrl: http://127.0.0.1:8080/v1
+      apiKey: none
+      temperature: 0.2
+      max_tokens: 700
+  - id: openai:chat:mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit
+    transform: "typeof output === 'string' ? output.replace(/<\\|im_end\\|>\\s*$/g, '').trim() : output"
+    config:
+      apiBaseUrl: http://127.0.0.1:8080/v1
+      apiKey: none
+      temperature: 0.2
+      max_tokens: 700
+  - id: openai:chat:mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit
+    transform: "typeof output === 'string' ? output.replace(/<\\|im_end\\|>\\s*$/g, '').trim() : output"
+    config:
+      apiBaseUrl: http://127.0.0.1:8080/v1
+      apiKey: none
+      temperature: 0.2
+      max_tokens: 700
+  - id: openai:chat:mlx-community/gpt-oss-20b-MXFP4-Q4
+    transform: file://evals/transforms/harmony.js
+    config:
+      apiBaseUrl: http://127.0.0.1:8080/v1
+      apiKey: none
+      temperature: 0.2
+      max_tokens: 900
+
+tests:
+  - description: code-explanation-cache-key
+    vars:
+      prompt: |
+        Explain this Python function for a teammate who is reviewing it. Identify one edge case.
+
+        ```python
+        def cache_key(repo, path, revision=None):
+            clean_repo = repo.strip().lower()
+            clean_path = "/".join(part for part in path.split("/") if part and part != ".")
+            if revision:
+                return f"{clean_repo}:{clean_path}@{revision[:12]}"
+            return f"{clean_repo}:{clean_path}"
+        ```
+    assert:
+      - type: javascript
+        value: |
+          return output.length > 120 &&
+            /edge[- ]case/i.test(output) &&
+            /(empty|revision|path|slash|unicode|null|none)/i.test(output);
+
+  - description: bug-fix-python-batching
+    vars:
+      prompt: |
+        Find the bug and provide a corrected implementation. Keep the function signature unchanged.
+
+        ```python
+        def batches(items, size):
+            out = []
+            current = []
+            for item in items:
+                current.append(item)
+                if len(current) == size:
+                    out.append(current)
+                    current = []
+            return out
+        ```
+
+        Expected behavior: `list(batches([1, 2, 3, 4, 5], 2))` should produce `[[1, 2], [3, 4], [5]]`.
+    assert:
+      - type: javascript
+        value: "output.includes('if current:') && (output.includes('append(current)') || output.includes('yield current'))"
+
+  - description: feature-plan-model-registry-status
+    vars:
+      prompt: |
+        We have a `models.yaml` registry with statuses: candidate, reviewed, downloaded, sanity_checked, runnable, evaluated, default, archived.
+        Propose a conservative implementation plan for a script that promotes a model from one status to the next.
+        Include validation rules and failure cases. Do not write code.
+    assert:
+      - type: javascript
+        value: |
+          return output.includes('models.yaml') &&
+            output.includes('candidate') &&
+            output.includes('reviewed') &&
+            output.includes('sanity_checked') &&
+            /(invalid|fail|error|refuse|block)/i.test(output) &&
+            output.length > 300;
+
+  - description: shell-tool-reasoning-safe-commands
+    vars:
+      prompt: |
+        You are in a git repo for a local LLM workbench. A local `mlx_lm.server` should be running on `127.0.0.1:8080`, and this project records the active server in `runs/.serve.pid`.
+        You need to inspect disk usage, current model server state, and uncommitted source changes.
+        List the exact shell commands you would run and explain why each is safe. Do not include destructive commands.
+    assert:
+      - type: javascript
+        value: |
+          return output.includes('git status') &&
+            /du\s+(-[a-zA-Z]*h|-[a-zA-Z]*s)/.test(output) &&
+            /(runs\/\.serve\.pid|curl .*\/v1\/models|scripts\/stop-model|pgrep)/.test(output) &&
+            !/rm\s+-rf|reset\s+--hard|checkout\s+--/i.test(output);
+
+  - description: structured-json-model-summary
+    vars:
+      prompt: |
+        Return only valid JSON, no markdown. Summarize this model:
+
+        id: qwen3-30b-a3b-2507-mlx-4bit
+        role: everyday default
+        params_total: 30.5B
+        params_active: 3.3B
+        disk_gb_estimate: 17.2
+        license: apache-2.0
+
+        Required schema:
+        {"id": string, "role": string, "total_params_b": number, "active_params_b": number, "disk_gb": number, "license": string}
+    assert:
+      - type: is-json
+      - type: javascript
+        value: |
+          return (() => {
+            const parsed = typeof output === 'string' ? JSON.parse(output) : output;
+            return parsed.id === 'qwen3-30b-a3b-2507-mlx-4bit' &&
+              parsed.role === 'everyday default' &&
+              parsed.total_params_b === 30.5 &&
+              parsed.active_params_b === 3.3 &&
+              parsed.disk_gb === 17.2 &&
+              parsed.license === 'apache-2.0';
+          })();
+
+  - description: needle-middle-delta-restore-token
+    vars:
+      document: "__DELTA_INDEXER_LONG_CONTEXT__"
+      prompt: |
+        Read the document below and return only the exact emergency restore token for the Delta indexer. No JSON, no markdown, no explanation.
+
+        DOCUMENT:
+        {{document}}
+    assert:
+      - type: javascript
+        value: "output.trim() === 'DELTA-RESTORE-74B2' || (output.includes('DELTA-RESTORE-74B2') && output.length < 120)"
+
+  - description: long-context-summary-delta-indexer
+    vars:
+      document: "__DELTA_INDEXER_LONG_CONTEXT__"
+      prompt: |
+        Summarize the operational risks in this document in five bullets or fewer. Focus on actions an operator should take or avoid.
+
+        DOCUMENT:
+        {{document}}
+    assert:
+      - type: javascript
+        value: |
+          return output.length > 180 &&
+            output.length < 1800 &&
+            /(memory|batch|worker|supervisor|network|token|restore|compaction|debug|log)/i.test(output) &&
+            /(avoid|do not|check|reduce|enable|disable|restart|rotate|inspect)/i.test(output);
+
+  - description: general-reasoning-rate-limit
+    vars:
+      prompt: |
+        A local eval runner can process 3 prompts per minute per model. You have 4 models and 12 prompts per model.
+        If each model runs sequentially, what is the minimum wall-clock time in minutes? Show the calculation briefly.
+    assert:
+      - type: javascript
+        value: "/(^|[^0-9])16([^0-9]|$)/.test(output) && /12\\s*\\/\\s*3|12.*3|4.*4/.test(output)"
+
+  - description: patch-like-edit-gitignore
+    vars:
+      prompt: |
+        Produce a unified diff that adds these ignore patterns to a `.gitignore` file:
+        - `.cache/`
+        - `*.log`
+        - `runs/`
+
+        Include only the diff.
+    assert:
+      - type: javascript
+        value: "output.includes('diff --git') && output.includes('---') && output.includes('+++') && output.includes('@@') && output.includes('.cache/') && output.includes('*.log') && output.includes('runs/')"
+
+  - description: tool-schema-readiness
+    vars:
+      prompt: |
+        You have this tool schema:
+        {"name":"serve_model","arguments":{"model_id":"string","port":"number"}}
+
+        Return JSON for serving `phi-4-mlx-4bit` on port 8080. Fenced JSON is acceptable, but the object must match:
+        {"tool":"serve_model","arguments":{"model_id":"...","port":...}}
+    assert:
+      - type: javascript
+        value: |
+          return (() => {
+            const text = String(output).trim();
+            const match = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+            const body = match ? match[1] : text;
+            try {
+              const parsed = JSON.parse(body);
+              return parsed.tool === 'serve_model' &&
+                parsed.arguments &&
+                parsed.arguments.model_id === 'phi-4-mlx-4bit' &&
+                parsed.arguments.port === 8080;
+            } catch {
+              return false;
+            }
+          })();

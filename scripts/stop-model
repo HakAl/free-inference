@@ -1,0 +1,174 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import contextlib
+import fcntl
+import json
+import os
+import signal
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from local_assist.registry import (
+    _legacy_unhashed_pid_file,
+    legacy_pid_file,
+    list_pid_records,
+    pid_file_for_model,
+    session_token_file_for_model,
+)
+
+
+RUNS = ROOT / "runs"
+
+
+@contextlib.contextmanager
+def _pid_lock(runs_dir: Path):
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    pid_lock_path = runs_dir / ".pid.lock"
+    with pid_lock_path.open("w") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+def _kill_pid(pid: Any, label: str, stopped_pids: set[int]) -> None:
+    if not isinstance(pid, int) or pid <= 0:
+        return
+    if pid in stopped_pids:
+        return
+    stopped_pids.add(pid)
+    try:
+        os.kill(pid, signal.SIGTERM)
+        print(f"Stopped server pid {pid} ({label}).")
+    except ProcessLookupError:
+        print(f"Server pid {pid} ({label}) was not running.")
+
+
+def _safe_unlink_token_file(candidate: Path, runs_dir: Path) -> None:
+    try:
+        if candidate.is_symlink():
+            return
+        name = candidate.name
+        if not (name.startswith(".se-session-") and name.endswith(".token")):
+            return
+        if candidate.resolve().parent != runs_dir.resolve():
+            return
+        candidate.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _stop_record(record: dict, stopped_pids: set[int]) -> None:
+    pid = record.get("pid")
+    upstream_pid = record.get("upstream_pid")
+    model_id = record.get("model_id", "unknown")
+
+    token_file = record.get("session_token_file")
+    if isinstance(token_file, str) and token_file.strip():
+        _safe_unlink_token_file(Path(token_file), RUNS)
+    if isinstance(model_id, str) and model_id and model_id != "unknown":
+        _safe_unlink_token_file(session_token_file_for_model(model_id, RUNS), RUNS)
+
+    if not isinstance(pid, int) and not isinstance(upstream_pid, int):
+        if record.get("status") == "starting":
+            print(f"Removed provisional starting PID record and session token for {model_id}.")
+        else:
+            print(f"PID file for {model_id} does not contain a valid pid.")
+        return
+    if isinstance(pid, int) and pid > 1:
+        _kill_pid(pid, model_id, stopped_pids)
+    if isinstance(upstream_pid, int) and upstream_pid > 1:
+        _kill_pid(upstream_pid, f"{model_id}:upstream", stopped_pids)
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) > 2:
+        print("usage: scripts/stop-model [model-id | --all]", file=sys.stderr)
+        return 2
+
+    target = argv[1] if len(argv) == 2 else None
+    default_pid = legacy_pid_file(RUNS)
+    stopped_pids: set[int] = set()
+
+    with _pid_lock(RUNS):
+        if target == "--all":
+            records = list_pid_records(RUNS)
+            if not records:
+                print("No active server PID file found.")
+                return 0
+            for path, record in records:
+                _stop_record(record, stopped_pids)
+                path.unlink(missing_ok=True)
+            return 0
+
+        if target is not None:
+            matched = False
+            candidates = [
+                pid_file_for_model(target, RUNS),
+                _legacy_unhashed_pid_file(target, RUNS),
+                default_pid,
+            ]
+            seen_paths: set[Path] = set()
+            for path in candidates:
+                if path in seen_paths or not path.exists():
+                    continue
+                seen_paths.add(path)
+                try:
+                    record = json.loads(path.read_text())
+                except (OSError, json.JSONDecodeError):
+                    continue
+                if not isinstance(record, dict) or record.get("model_id") != target:
+                    continue
+                _stop_record(record, stopped_pids)
+                path.unlink(missing_ok=True)
+                matched = True
+
+            for path, record in list_pid_records(RUNS):
+                if path in seen_paths:
+                    continue
+                if record.get("model_id") == target:
+                    _stop_record(record, stopped_pids)
+                    path.unlink(missing_ok=True)
+                    matched = True
+
+            if not matched:
+                print(f"No active server PID file found for {target}.")
+            return 0
+
+        if default_pid.exists():
+            record = json.loads(default_pid.read_text())
+            _stop_record(record, stopped_pids)
+            default_pid.unlink(missing_ok=True)
+            model_id = record.get("model_id")
+            if isinstance(model_id, str) and model_id:
+                for extra in (
+                    pid_file_for_model(model_id, RUNS),
+                    _legacy_unhashed_pid_file(model_id, RUNS),
+                ):
+                    if extra.exists():
+                        try:
+                            extra_rec = json.loads(extra.read_text())
+                            if isinstance(extra_rec, dict) and extra_rec.get("model_id") == model_id:
+                                extra.unlink(missing_ok=True)
+                        except (OSError, json.JSONDecodeError):
+                            pass
+            return 0
+
+        records = list_pid_records(RUNS)
+        if not records:
+            print("No active server PID file found.")
+            return 0
+
+        path, record = records[0]
+        _stop_record(record, stopped_pids)
+        path.unlink(missing_ok=True)
+        return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

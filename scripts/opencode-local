@@ -1,0 +1,440 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
+if VENV_PYTHON.exists() and Path(sys.executable) != VENV_PYTHON:
+    os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), __file__, *sys.argv[1:]])
+
+sys.path.insert(0, str(ROOT))
+
+from local_assist.client import check_private_coding_admission
+from local_assist.errors import LocalAssistError
+from local_assist.registry import (
+    EndpointConfig,
+    RegistryError,
+    load_model,
+    read_pid_record_for_model,
+    resolve_endpoint,
+)
+
+DEFAULT_MODEL_ID = "qwen3-30b-a3b-2507-mlx-4bit"
+DEFAULT_CONTEXT_LIMIT = 32768
+DEFAULT_OUTPUT_LIMIT = 8192
+DEFAULT_WAIT_SECONDS = 60.0
+EXIT_MODEL_MISMATCH = 3
+
+TEMPLATE_CONFIG = ROOT / "config" / "opencode-private-local.json.tmpl"
+DEFAULT_ISOLATED_HOME = ROOT / ".home" / "opencode-private-local"
+
+SAFE_ENV_ALLOWLIST = (
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TERM",
+    "COLORTERM",
+    "TMPDIR",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "SYSTEMROOT",
+    "SSH_AUTH_SOCK",
+    "EDITOR",
+    "VISUAL",
+)
+
+
+def validate_private_local_endpoint(
+    endpoint: EndpointConfig,
+    *,
+    allow_uncleared_model: bool = False,
+    err_stream: Any = None,
+) -> None:
+    if endpoint.trust_tier != "local":
+        raise LocalAssistError(
+            "trust_tier_blocked",
+            f"scripts/opencode-local is strictly for Rung 1 (trust_tier='local'), "
+            f"got '{endpoint.model_id}' with trust_tier='{endpoint.trust_tier}'. "
+            "Use the private-attested profile for attested enclave proxies.",
+            details={
+                "model_id": endpoint.model_id,
+                "trust_tier": endpoint.trust_tier,
+            },
+        )
+    check_private_coding_admission(endpoint)
+    if not bool(endpoint.capabilities.get("tool_calling")):
+        raise LocalAssistError(
+            "capability_missing",
+            f"Model '{endpoint.model_id}' does not declare capabilities.tool_calling=true in models.yaml.",
+            details={
+                "model_id": endpoint.model_id,
+                "capabilities": endpoint.capabilities,
+            },
+        )
+    if endpoint.routing_private_local != "cleared":
+        if not allow_uncleared_model:
+            raise LocalAssistError(
+                "routing_gate_blocked",
+                f"Model '{endpoint.model_id}' is not cleared for private-local "
+                f"(routing.private_local={endpoint.routing_private_local!r}). "
+                "Only Rung 1 models passing all five automated gates (sanity, v1, tools, "
+                "tools_timing, opencode-smoke) are cleared. Pass --allow-uncleared-model to override.",
+                details={
+                    "model_id": endpoint.model_id,
+                    "routing_private_local": endpoint.routing_private_local,
+                },
+            )
+        out = err_stream if err_stream is not None else sys.stderr
+        print(
+            f"WARNING: Running private-local with uncleared model '{endpoint.model_id}' "
+            f"(routing.private_local={endpoint.routing_private_local!r}).",
+            file=out,
+        )
+
+
+def render_private_local_config(
+    endpoint: EndpointConfig,
+    template_text: str | None = None,
+    *,
+    context_limit: int = DEFAULT_CONTEXT_LIMIT,
+    output_limit: int = DEFAULT_OUTPUT_LIMIT,
+    edit_permission: str = "ask",
+    lab_python: Path | None = None,
+    lab_root: Path | None = None,
+    workspace_dir: Path | None = None,
+    api_base_url_override: str | None = None,
+) -> str:
+    if edit_permission not in ("ask", "allow", "deny"):
+        raise ValueError(f"Invalid edit_permission: {edit_permission}")
+    if context_limit <= 0 or output_limit <= 0:
+        raise ValueError("context_limit and output_limit must be positive integers")
+
+    tmpl = template_text if template_text is not None else TEMPLATE_CONFIG.read_text()
+    api_key_placeholder = (
+        f"{{env:{endpoint.api_key_envar}}}" if endpoint.api_key_envar else endpoint.api_key
+    )
+    effective_base_url = api_base_url_override or endpoint.api_base_url
+    effective_python = lab_python or (VENV_PYTHON if VENV_PYTHON.exists() else Path(sys.executable))
+    effective_root = lab_root or ROOT
+    effective_workspace = (workspace_dir or Path.cwd()).resolve()
+
+    rendered = (
+        tmpl.replace("__API_BASE_URL__", effective_base_url)
+        .replace("__API_KEY_VALUE__", api_key_placeholder)
+        .replace("__SERVED_MODEL_ID__", endpoint.served_model_id)
+        .replace("__MODEL_ID__", endpoint.model_id)
+        .replace("__CONTEXT_LIMIT__", str(int(context_limit)))
+        .replace("__OUTPUT_LIMIT__", str(int(output_limit)))
+        .replace("__EDIT_PERMISSION__", edit_permission)
+        .replace("__LAB_PYTHON__", str(effective_python))
+        .replace("__LAB_ROOT__", str(effective_root))
+        .replace("__WORKSPACE_DIR__", str(effective_workspace))
+    )
+    json.loads(rendered)
+    return rendered
+
+
+def build_private_local_env(
+    workspace_dir: Path,
+    isolated_home: Path,
+    opencode_config_path: Path,
+    endpoint: EndpointConfig,
+    *,
+    preserve_host_home: bool = False,
+    base_env: dict[str, str] | None = None,
+) -> dict[str, str]:
+    src = base_env if base_env is not None else os.environ
+    env: dict[str, str] = {}
+    for key in SAFE_ENV_ALLOWLIST:
+        if key in src:
+            env[key] = src[key]
+    if endpoint.api_key_envar and endpoint.api_key_envar in src:
+        env[endpoint.api_key_envar] = src[endpoint.api_key_envar]
+
+    effective_home = src.get("HOME", str(isolated_home)) if preserve_host_home else str(isolated_home)
+    env.update(
+        {
+            "PWD": str(workspace_dir),
+            "HOME": effective_home,
+            "OPENCODE_TEST_HOME": str(isolated_home),
+            "XDG_CONFIG_HOME": str(isolated_home / ".config"),
+            "XDG_DATA_HOME": str(isolated_home / ".local" / "share"),
+            "XDG_CACHE_HOME": str(isolated_home / ".cache"),
+            "XDG_STATE_HOME": str(isolated_home / ".local" / "state"),
+            "OPENCODE_DISABLE_AUTOUPDATE": "1",
+            "OPENCODE_DISABLE_MODELS_FETCH": "1",
+            "OPENCODE_DISABLE_PROJECT_CONFIG": "1",
+            "OPENCODE_DISABLE_CLAUDE_CODE": "1",
+            "OPENCODE_DISABLE_CLAUDE_CODE_SKILLS": "1",
+            "OPENCODE_CONFIG": str(opencode_config_path),
+            "HF_HUB_OFFLINE": "1",
+            "LOCAL_ASSIST_BASE_URL": endpoint.api_base_url,
+            "LOCAL_ASSIST_WORKSPACE_ROOT": str(workspace_dir.resolve()),
+        }
+    )
+    return env
+
+
+def ensure_model_served(
+    endpoint: EndpointConfig,
+    *,
+    no_serve: bool = False,
+    wait_seconds: float = DEFAULT_WAIT_SECONDS,
+    run_cmd: Any = subprocess.run,
+) -> tuple[bool, str | None]:
+    verify_script = str(ROOT / "scripts" / "verify-served-model")
+    serve_script = str(ROOT / "scripts" / "serve-model")
+
+    initial = run_cmd(
+        [verify_script, endpoint.model_id, "--require-offline"],
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if initial.returncode == 0:
+        return True, None
+
+    initial_err = (initial.stderr or initial.stdout or "").strip()
+    if initial.returncode == EXIT_MODEL_MISMATCH:
+        return (
+            False,
+            f"Refusing to launch private-local: another model is already serving "
+            f"(or active server was started with --allow-hf-online) at "
+            f"{endpoint.api_base_url} ({initial_err}). Stop the active model first "
+            "with ./scripts/stop-model <active-model-id>.",
+        )
+
+    if no_serve:
+        return (
+            False,
+            f"Model '{endpoint.model_id}' is not currently served at {endpoint.api_base_url} "
+            f"and --no-serve was set ({initial_err}).",
+        )
+
+    serve_res = run_cmd(
+        [serve_script, endpoint.model_id],
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if serve_res.returncode != 0:
+        serve_err = (serve_res.stderr or serve_res.stdout or "").strip()
+        return False, f"Failed to start model '{endpoint.model_id}': {serve_err}"
+
+    wait_res = run_cmd(
+        [verify_script, endpoint.model_id, "--wait", str(wait_seconds), "--require-offline"],
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if wait_res.returncode == 0:
+        return True, None
+
+    wait_err = (wait_res.stderr or wait_res.stdout or "").strip()
+    if wait_res.returncode == EXIT_MODEL_MISMATCH:
+        return (
+            False,
+            f"Refusing to launch private-local: model mismatch at {endpoint.api_base_url} "
+            f"after startup ({wait_err}).",
+        )
+    return (
+        False,
+        f"Model '{endpoint.model_id}' did not become ready within {wait_seconds}s: {wait_err}",
+    )
+
+
+def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Launch opencode against the Rung 1 private-local MLX server with "
+            "isolated state, project-config lockdown, and local-assist MCP."
+        ),
+        epilog=(
+            "Always place '--' before opencode subcommands or flags (for example: "
+            "opencode-local -- run 'prompt') so launcher flags such as --model are "
+            "not consumed before opencode sees them. Note: HOME is isolated by default "
+            "(so child bash commands do not read ~/.gitconfig unless --preserve-host-home "
+            "is passed), while SSH_AUTH_SOCK is passed through for approved bash commands."
+        ),
+    )
+    parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL_ID,
+        help=f"Rung 1 model id from models.yaml (default: {DEFAULT_MODEL_ID}).",
+    )
+    parser.add_argument(
+        "--allow-uncleared-model",
+        action="store_true",
+        default=False,
+        help="Allow launching a Rung 1 local model whose routing.private_local is not 'cleared'.",
+    )
+    parser.add_argument(
+        "--context-limit",
+        type=int,
+        default=DEFAULT_CONTEXT_LIMIT,
+        help=f"Context window limit in opencode config (default: {DEFAULT_CONTEXT_LIMIT}).",
+    )
+    parser.add_argument(
+        "--output-limit",
+        type=int,
+        default=DEFAULT_OUTPUT_LIMIT,
+        help=f"Max output tokens per turn in opencode config (default: {DEFAULT_OUTPUT_LIMIT}).",
+    )
+    parser.add_argument(
+        "--allow-edit",
+        action="store_true",
+        default=False,
+        help="Set edit/write/patch permissions to 'allow' instead of 'ask' (for non-interactive runs).",
+    )
+    parser.add_argument(
+        "--wait",
+        type=float,
+        default=DEFAULT_WAIT_SECONDS,
+        help=f"Seconds to wait for server readiness when starting (default: {DEFAULT_WAIT_SECONDS}).",
+    )
+    parser.add_argument(
+        "--no-serve",
+        action="store_true",
+        default=False,
+        help="Do not automatically start the model server if it is not already running.",
+    )
+    parser.add_argument(
+        "--preserve-host-home",
+        action="store_true",
+        default=False,
+        help="Keep parent HOME for child shell commands while isolating XDG_* and OPENCODE_TEST_HOME.",
+    )
+    parser.add_argument(
+        "--print-config",
+        action="store_true",
+        default=False,
+        help="Verify/start the server, write the isolated opencode.json, print its path and JSON, and exit.",
+    )
+
+    if "--" in argv[1:]:
+        sep_idx = argv.index("--", 1)
+        our_argv = argv[1:sep_idx]
+        opencode_args = argv[sep_idx + 1 :]
+        args = parser.parse_args(our_argv)
+    else:
+        args, opencode_args = parser.parse_known_args(argv[1:])
+    return args, opencode_args
+
+
+def main(argv: list[str]) -> int:
+    caller_cwd = Path.cwd()
+    args, opencode_args = parse_args(argv)
+
+    try:
+        model = load_model(args.model)
+        pid_record = read_pid_record_for_model(args.model)
+        endpoint = resolve_endpoint(model, pid_record=pid_record, require_api_key=False)
+        validate_private_local_endpoint(
+            endpoint,
+            allow_uncleared_model=args.allow_uncleared_model,
+        )
+    except (RegistryError, LocalAssistError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    ok, err_msg = ensure_model_served(
+        endpoint,
+        no_serve=args.no_serve,
+        wait_seconds=args.wait,
+    )
+    if not ok:
+        print(err_msg or "Failed to verify served model", file=sys.stderr)
+        return 1
+
+    isolated_home = DEFAULT_ISOLATED_HOME
+    for subdir in (".config", ".local/share", ".cache", ".local/state"):
+        (isolated_home / subdir).mkdir(parents=True, exist_ok=True)
+
+    edit_permission = "allow" if args.allow_edit else "ask"
+    config_text = render_private_local_config(
+        endpoint,
+        context_limit=args.context_limit,
+        output_limit=args.output_limit,
+        edit_permission=edit_permission,
+        workspace_dir=caller_cwd,
+    )
+    opencode_config_path = isolated_home / "opencode.json"
+    opencode_config_path.write_text(config_text)
+
+    env = build_private_local_env(
+        caller_cwd,
+        isolated_home,
+        opencode_config_path,
+        endpoint,
+        preserve_host_home=args.preserve_host_home,
+    )
+
+    if args.print_config:
+        print(
+            json.dumps(
+                {
+                    "model_id": endpoint.model_id,
+                    "served_model_id": endpoint.served_model_id,
+                    "api_base_url": endpoint.api_base_url,
+                    "opencode_config_path": str(opencode_config_path),
+                    "isolated_home": str(isolated_home),
+                    "config": json.loads(config_text),
+                },
+                indent=2,
+            )
+        )
+        return 0
+
+    opencode_bin = shutil.which("opencode")
+    if not opencode_bin:
+        print("opencode binary not found on PATH", file=sys.stderr)
+        return 1
+
+    if "--standalone" not in opencode_args:
+        sync_file = isolated_home / ".last-service-sync.json"
+        active_pid_record = read_pid_record_for_model(args.model)
+        current_sync = {
+            "model_id": endpoint.model_id,
+            "startup_nonce": (active_pid_record or {}).get("startup_nonce"),
+        }
+        prev_sync: dict[str, Any] | None = None
+        if sync_file.exists():
+            try:
+                prev_sync = json.loads(sync_file.read_text())
+            except Exception:
+                prev_sync = None
+        if prev_sync != current_sync:
+            subprocess.run(
+                [opencode_bin, "service", "restart"],
+                cwd=str(caller_cwd),
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            sync_file.write_text(json.dumps(current_sync, indent=2))
+
+    proc = subprocess.run(
+        [opencode_bin, *opencode_args],
+        cwd=str(caller_cwd),
+        env=env,
+        check=False,
+    )
+    return int(proc.returncode)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

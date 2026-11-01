@@ -1,0 +1,296 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import sys
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
+if VENV_PYTHON.exists() and Path(sys.executable) != VENV_PYTHON:
+    os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), __file__, *sys.argv[1:]])
+
+sys.path.insert(0, str(ROOT))
+
+from local_assist._miniyaml import safe_dump, safe_load
+from local_assist.registry import (
+    RegistryError,
+    build_promptfoo_provider_entry,
+    load_model,
+    load_models,
+    read_pid_record_for_model,
+    resolve_endpoint,
+)
+
+TARGET_CHARS = 60000
+NEEDLE_RATIO = 0.80
+PLACEHOLDER = "__DELTA_INDEXER_LONG_CONTEXT__"
+
+SUITE_SOURCES = {
+    "sanity": ROOT / "promptfooconfig.yaml",
+    "v1": ROOT / "evals" / "suites" / "v1.yaml",
+    "tools": ROOT / "evals" / "suites" / "tools.yaml",
+}
+
+BASE_PARAGRAPHS = [
+    "The Delta indexer ingests repository snapshots and converts them into lookup records for local model evaluation. Most operators interact with it through the normal import command, but recovery work occasionally requires reading this document carefully.",
+    "The service keeps three queues: incoming, parse, and publish. Incoming accepts filesystem events. Parse normalizes text and metadata. Publish writes compact records into the local search store. Queue names are stable and should not be renamed without updating dashboards.",
+    "Routine restarts should use the supervisor. Do not kill worker processes unless the supervisor fails to stop them after two attempts. A normal restart should complete in less than thirty seconds on the M4 laptop.",
+    "The default batch size is 128 files. Increasing it can improve throughput on small files, but large Markdown and JSON fixtures can cause memory spikes. If memory pressure is visible, reduce the batch size before changing worker count.",
+    "The publish queue is idempotent. Replaying a publish batch should not create duplicate records because each write uses the repository path and content hash as a stable key. If duplicates appear, inspect the hash normalizer first.",
+    "Archive compaction runs after every 10,000 records. It is safe to pause compaction during a benchmark run, but remember to re-enable it before long ingestion tests. Disabled compaction will bias disk measurements.",
+    "Operators sometimes confuse restore tokens with API tokens. API tokens authenticate callers. Restore tokens identify a known-good queue checkpoint. Never put either value in a prompt sent to a third-party service.",
+    "If the parse queue stalls, first check whether a fixture contains a very long single line. The parser has a guard for this case, but old fixtures may predate it. Splitting the line is usually better than raising the limit.",
+    "The indexer does not require network access after dependencies are installed. It reads local fixtures, writes local records, and exports local reports. Any network access during a benchmark should be treated as suspicious.",
+    "Performance notes from previous runs are not reliable across models. A model that summarizes this document well may still miss a single critical token in the middle, so retrieval checks must ask for exact values.",
+    "The preferred log level for benchmark runs is info. Debug logs are useful while building fixtures but make throughput results noisy. Trace logs should be used only for parser development.",
+]
+
+NEEDLE_PARAGRAPH = (
+    "The emergency restore token for the Delta indexer is DELTA-RESTORE-74B2. "
+    "It was issued during the May recovery drill and should be used only when both parse and publish queues are confirmed idle."
+)
+
+TAIL_PARAGRAPHS = [
+    "After applying the emergency restore token, run a dry publish with audit logging enabled. The dry publish should report the checkpoint name and the number of records it would rewrite. A nonzero rewrite count is expected.",
+    "Do not rotate the emergency restore token during ordinary fixture updates. Rotation is reserved for failed recovery drills, leaked credentials, or migrations that change checkpoint format.",
+    "End of operational notes.",
+]
+
+
+def build_document() -> str:
+    prefix_target = int(TARGET_CHARS * NEEDLE_RATIO)
+    parts = ["Delta Indexer Operational Notes\n"]
+    section = 1
+    while len("\n\n".join(parts)) < prefix_target:
+        for paragraph in BASE_PARAGRAPHS:
+            parts.append(f"Section {section:03d}: {paragraph}")
+            section += 1
+            if len("\n\n".join(parts)) >= prefix_target:
+                break
+
+    parts.append(NEEDLE_PARAGRAPH)
+    while len("\n\n".join(parts)) < TARGET_CHARS:
+        for paragraph in TAIL_PARAGRAPHS + BASE_PARAGRAPHS[:4]:
+            parts.append(f"Appendix {section:03d}: {paragraph}")
+            section += 1
+            if len("\n\n".join(parts)) >= TARGET_CHARS:
+                break
+    return "\n\n".join(parts) + "\n"
+
+
+def _extract_suite_defaults(
+    providers: list[dict[str, Any]], suite_name: str
+) -> tuple[int, float, list[dict[str, Any]] | None]:
+    default_max_tokens = 60 if suite_name == "sanity" else (500 if suite_name == "tools" else 700)
+    default_temp = 0.0 if suite_name == "tools" else 0.2
+    suite_tools = None
+    for p in providers:
+        cfg = p.get("config") if isinstance(p, dict) else None
+        if isinstance(cfg, dict) and cfg.get("tools"):
+            suite_tools = cfg["tools"]
+            break
+    return default_max_tokens, default_temp, suite_tools
+
+
+def _build_bound_provider_for_model(
+    model: dict[str, Any],
+    template_providers: list[dict[str, Any]],
+    suite_name: str,
+) -> dict[str, Any]:
+    default_max_tokens, default_temp, suite_tools = _extract_suite_defaults(
+        template_providers, suite_name
+    )
+    pid_record = read_pid_record_for_model(str(model.get("id") or ""))
+    endpoint = resolve_endpoint(model, pid_record=pid_record, require_api_key=False)
+
+    by_id = {
+        p["id"]: p
+        for p in template_providers
+        if isinstance(p, dict) and isinstance(p.get("id"), str)
+    }
+    template = by_id.get(endpoint.provider_id)
+    if template is not None:
+        tpl_cfg = template.get("config") or {}
+        max_tokens = int(tpl_cfg.get("max_tokens", default_max_tokens))
+        temperature = float(tpl_cfg.get("temperature", default_temp))
+        tools = tpl_cfg.get("tools", suite_tools)
+        base_transform = template.get("transform")
+    else:
+        max_tokens = default_max_tokens
+        temperature = default_temp
+        tools = suite_tools
+        base_transform = None
+
+    entry = build_promptfoo_provider_entry(
+        model,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        tools=tools,
+    )
+    # Apply PID-fallback api_base_url if model omitted apiBaseUrl
+    entry["config"]["apiBaseUrl"] = endpoint.api_base_url
+    custom_transform = (model.get("promptfoo_provider") or {}).get("transform")
+    if not custom_transform and base_transform:
+        entry["transform"] = base_transform
+    return entry
+
+
+def merge_registry_providers(
+    suite_data: dict[str, Any],
+    suite_name: str,
+    *,
+    model_id: str | None = None,
+    models_list: list[dict[str, Any]] | None = None,
+) -> None:
+    template_providers: list[dict[str, Any]] = list(suite_data.get("providers") or [])
+
+    if model_id is not None:
+        if models_list is not None:
+            matched = [m for m in models_list if m.get("id") == model_id]
+            if not matched:
+                raise RegistryError(f"Model not found in models.yaml: {model_id}")
+            target_model = matched[0]
+        else:
+            target_model = load_model(model_id)
+        bound_entry = _build_bound_provider_for_model(target_model, template_providers, suite_name)
+        suite_data["providers"] = [bound_entry]
+        return
+
+    providers = [dict(p) for p in template_providers if isinstance(p, dict)]
+    by_id: dict[str, dict[str, Any]] = {
+        p["id"]: p for p in providers if isinstance(p.get("id"), str)
+    }
+    seen_registry_owners: dict[str, tuple[str, EndpointConfig]] = {}
+
+    if models_list is None:
+        try:
+            models = load_models()
+        except RegistryError:
+            models = []
+    else:
+        models = models_list
+
+    for model in models:
+        endpoint = resolve_endpoint(model, require_api_key=False)
+        if endpoint.provider_id in seen_registry_owners:
+            prev_id, prev_ep = seen_registry_owners[endpoint.provider_id]
+            if (
+                prev_ep.api_base_url != endpoint.api_base_url
+                or prev_ep.api_key != endpoint.api_key
+                or prev_ep.api_key_envar != endpoint.api_key_envar
+                or prev_ep.api_key_keychain_service != endpoint.api_key_keychain_service
+                or prev_ep.upstream_base_url != endpoint.upstream_base_url
+                or prev_ep.trust_tier != endpoint.trust_tier
+            ):
+                raise RegistryError(
+                    f"Conflicting registry entries '{prev_id}' and '{endpoint.model_id}' share "
+                    f"promptfoo_provider.id '{endpoint.provider_id}' with different endpoints or trust tiers. "
+                    f"Pass a specific model-id to scripts/render-suite (e.g. 'scripts/render-suite {suite_name} {prev_id}') "
+                    "or assign distinct promptfoo_provider.id values."
+                )
+        seen_registry_owners[endpoint.provider_id] = (endpoint.model_id, endpoint)
+
+        bound = _build_bound_provider_for_model(model, template_providers, suite_name)
+        if endpoint.provider_id in by_id:
+            existing = by_id[endpoint.provider_id]
+            existing["config"] = bound["config"]
+            existing["transform"] = bound["transform"]
+        else:
+            providers.append(bound)
+            by_id[endpoint.provider_id] = bound
+
+    suite_data["providers"] = providers
+
+
+def expand_needle_placeholders(suite_data: dict[str, Any]) -> int:
+    replaced = 0
+    document: str | None = None
+    for test in suite_data.get("tests") or []:
+        if not isinstance(test, dict):
+            continue
+        vars_map = test.get("vars")
+        if isinstance(vars_map, dict) and vars_map.get("document") == PLACEHOLDER:
+            if document is None:
+                document = build_document()
+            vars_map["document"] = document
+            replaced += 1
+    return replaced
+
+
+def render_suite(
+    suite_name: str,
+    model_id: str | None = None,
+    output_path: Path | None = None,
+) -> Path:
+    if suite_name not in SUITE_SOURCES:
+        raise ValueError(f"Unknown suite '{suite_name}'. Known suites: {sorted(SUITE_SOURCES)}")
+
+    source = SUITE_SOURCES[suite_name]
+    if output_path is not None:
+        output = output_path
+        output.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        out_dir = ROOT / "evals" / "suites" / ".generated"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        if model_id:
+            safe_model = "".join(
+                ch if ch.isalnum() or ch in ("-", "_", ".") else "-" for ch in model_id
+            )
+            digest = hashlib.sha256(model_id.encode("utf-8")).hexdigest()[:8]
+            output = out_dir / f"{suite_name}-{safe_model}-{digest}.yaml"
+        else:
+            output = out_dir / f"{suite_name}.yaml"
+
+    suite_data = safe_load(source.read_text())
+    if not isinstance(suite_data, dict):
+        raise RuntimeError(f"Expected mapping in {source}")
+
+    if suite_name == "v1":
+        replaced = expand_needle_placeholders(suite_data)
+        if replaced == 0:
+            raise RuntimeError(f"placeholder not found in {source}")
+
+    merge_registry_providers(suite_data, suite_name, model_id=model_id)
+    output.write_text(safe_dump(suite_data))
+    return output
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        description="Render a promptfoo eval suite configuration."
+    )
+    parser.add_argument(
+        "suite",
+        choices=sorted(SUITE_SOURCES),
+        help="Suite name to render (sanity, v1, tools).",
+    )
+    parser.add_argument(
+        "model_id",
+        nargs="?",
+        default=None,
+        help="Optional model id from models.yaml to bind the suite to.",
+    )
+    parser.add_argument(
+        "--output",
+        default=None,
+        help="Optional explicit output file path for the rendered suite YAML.",
+    )
+    args = parser.parse_args(argv[1:])
+
+    out_arg = Path(args.output) if args.output else None
+    try:
+        output = render_suite(args.suite, model_id=args.model_id, output_path=out_arg)
+    except Exception as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    print(output)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

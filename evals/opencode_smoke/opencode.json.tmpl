@@ -1,0 +1,70 @@
+{
+  "autoupdate": false,
+  "share": "disabled",
+  "snapshot": false,
+  "provider": {
+    "local_mlx": {
+      "name": "Local MLX",
+      "npm": "@opencode/ai/providers/openai-compatible",
+      "options": {
+        "baseURL": "__API_BASE_URL__",
+        "apiKey": "__API_KEY_VALUE__"
+      },
+      "models": {
+        "local_model": {
+          "id": "__SERVED_MODEL_ID__",
+          "name": "__MODEL_ID__",
+          "tool_call": true,
+          "limit": {
+            "context": 16384,
+            "output": 256
+          },
+          "options": {
+            "maxTokens": 256
+          }
+        }
+      }
+    }
+  },
+  "agent": {
+    "build": {
+      "steps": 3
+    }
+  },
+  "tools": {
+    "read": true,
+    "bash": false,
+    "edit": false,
+    "write": false,
+    "patch": false,
+    "webfetch": false,
+    "websearch": false,
+    "glob": false,
+    "grep": false,
+    "list": false,
+    "task": false,
+    "todowrite": false,
+    "todoread": false
+  },
+  "permission": {
+    "*": "deny",
+    "read": "allow",
+    "external_directory": "deny",
+    "doom_loop": "deny",
+    "bash": "deny",
+    "edit": "deny",
+    "write": "deny",
+    "patch": "deny",
+    "webfetch": "deny",
+    "websearch": "deny",
+    "glob": "deny",
+    "grep": "deny",
+    "list": "deny",
+    "codesearch": "deny",
+    "lsp": "deny",
+    "task": "deny",
+    "question": "deny",
+    "todowrite": "deny",
+    "todoread": "deny"
+  }
+}

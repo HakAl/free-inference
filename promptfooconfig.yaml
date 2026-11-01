@@ -1,0 +1,57 @@
+description: Local MLX Milestone 0 smoke eval
+
+prompts:
+  - "{{prompt}}"
+
+providers:
+  - id: openai:chat:Qwen/Qwen3-1.7B-MLX-4bit
+    # Strips trailing <|im_end|> left in raw output by an mlx_lm.server bug:
+    # stopping_criteria checks EOS before user stop_words and returns
+    # trim_text_length=0, so the EOS token text is never trimmed from the
+    # response. Affects every chat-tuned model whose EOS renders as visible
+    # text (Qwen <|im_end|>, Llama <|eot_id|>, Mistral </s>). Once upstream
+    # mlx-lm fixes the order of checks, this transform can be removed.
+    transform: "typeof output === 'string' ? output.replace(/<\\|im_end\\|>\\s*$/g, '').trim() : output"
+    config:
+      apiBaseUrl: http://127.0.0.1:8080/v1
+      apiKey: none
+      temperature: 0.2
+      max_tokens: 60
+  - id: openai:chat:mlx-community/phi-4-4bit
+    # Keep the same narrow EOS-residue transform across mlx-lm chat models.
+    # Phi-4 did not show this artifact in the timing smoke test, but the
+    # transform is harmless when the marker is absent.
+    transform: "typeof output === 'string' ? output.replace(/<\\|im_end\\|>\\s*$/g, '').trim() : output"
+    config:
+      apiBaseUrl: http://127.0.0.1:8080/v1
+      apiKey: none
+      temperature: 0.2
+      max_tokens: 60
+  - id: openai:chat:mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit
+    transform: "typeof output === 'string' ? output.replace(/<\\|im_end\\|>\\s*$/g, '').trim() : output"
+    config:
+      apiBaseUrl: http://127.0.0.1:8080/v1
+      apiKey: none
+      temperature: 0.2
+      max_tokens: 60
+  - id: openai:chat:mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit
+    transform: "typeof output === 'string' ? output.replace(/<\\|im_end\\|>\\s*$/g, '').trim() : output"
+    config:
+      apiBaseUrl: http://127.0.0.1:8080/v1
+      apiKey: none
+      temperature: 0.2
+      max_tokens: 60
+  - id: openai:chat:mlx-community/gpt-oss-20b-MXFP4-Q4
+    transform: file://evals/transforms/harmony.js
+    config:
+      apiBaseUrl: http://127.0.0.1:8080/v1
+      apiKey: none
+      temperature: 0.2
+      max_tokens: 200
+
+tests:
+  - vars:
+      prompt: "/no_think Write exactly one sentence about the ocean."
+    assert:
+      - type: javascript
+        value: "output.length > 20 && output.length < 500"

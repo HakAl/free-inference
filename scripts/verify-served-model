@@ -1,0 +1,384 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shlex
+import subprocess
+import sys
+import time
+from pathlib import Path
+from typing import Any
+from urllib.error import URLError
+from urllib.request import Request, urlopen
+
+ROOT = Path(__file__).resolve().parents[1]
+VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
+if VENV_PYTHON.exists() and Path(sys.executable) != VENV_PYTHON:
+    os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), __file__, *sys.argv[1:]])
+
+sys.path.insert(0, str(ROOT))
+
+from local_assist.registry import (
+    EndpointConfig,
+    RegistryError,
+    list_pid_records,
+    load_model,
+    read_pid_record_for_model,
+    resolve_endpoint,
+)
+
+
+EXIT_UNREACHABLE = 1
+EXIT_MODEL_MISMATCH = 3
+
+
+def _pid_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def extract_model_arg_from_command(cmd_text: str) -> str | None:
+    try:
+        tokens = shlex.split(cmd_text)
+    except ValueError:
+        tokens = cmd_text.split()
+    for idx, tok in enumerate(tokens):
+        if tok == "--model" and idx + 1 < len(tokens):
+            return tokens[idx + 1]
+        if tok.startswith("--model="):
+            return tok.split("=", 1)[1]
+    return None
+
+
+def inspect_port_listeners(port: int) -> list[tuple[int, str]]:
+    try:
+        cp = subprocess.run(
+            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-Fp"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+    except Exception:
+        return []
+    pids: list[int] = []
+    for raw in cp.stdout.splitlines():
+        line = raw.strip()
+        if line.startswith("p") and line[1:].isdigit():
+            pid = int(line[1:])
+            if pid not in pids:
+                pids.append(pid)
+    listeners: list[tuple[int, str]] = []
+    for pid in pids:
+        try:
+            ps_cp = subprocess.run(
+                ["ps", "-p", str(pid), "-o", "command="],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                check=False,
+            )
+            cmd_line = ps_cp.stdout.strip()
+        except Exception:
+            cmd_line = ""
+        listeners.append((pid, cmd_line))
+    return listeners
+
+
+def deduplicated_pid_records(
+    runs_dir: Path | None = None,
+) -> list[tuple[Path, dict[str, Any]]]:
+    raw_records = list_pid_records(runs_dir)
+    per_model: list[tuple[Path, dict[str, Any]]] = []
+    legacy: list[tuple[Path, dict[str, Any]]] = []
+    for path, rec in raw_records:
+        if path.name == ".serve.pid":
+            legacy.append((path, rec))
+        else:
+            per_model.append((path, rec))
+
+    seen_keys = {
+        (
+            rec.get("model_id"),
+            rec.get("startup_nonce"),
+            rec.get("pid"),
+            rec.get("port", 8080),
+        )
+        for _, rec in per_model
+    }
+    seen_model_ports = {
+        (rec.get("model_id"), rec.get("port", 8080))
+        for _, rec in per_model
+        if rec.get("model_id")
+    }
+    result = list(per_model)
+    for path, rec in legacy:
+        key = (
+            rec.get("model_id"),
+            rec.get("startup_nonce"),
+            rec.get("pid"),
+            rec.get("port", 8080),
+        )
+        model_port = (rec.get("model_id"), rec.get("port", 8080))
+        if key in seen_keys or model_port in seen_model_ports:
+            continue
+        result.append((path, rec))
+    return result
+
+
+def verify_pid_record_matches(
+    endpoint: EndpointConfig,
+    *,
+    runs_dir: Path | None = None,
+    require_offline: bool = False,
+) -> tuple[bool, str | None]:
+    if endpoint.port is None:
+        return True, None
+
+    for _, rec in deduplicated_pid_records(runs_dir):
+        rec_port = rec.get("port", 8080)
+        if rec_port != endpoint.port:
+            continue
+        rec_pid = rec.get("pid")
+        rec_up_pid = rec.get("upstream_pid")
+        rec_status = rec.get("status")
+        pid_live = isinstance(rec_pid, int) and _pid_is_alive(rec_pid)
+        up_pid_live = isinstance(rec_up_pid, int) and _pid_is_alive(rec_up_pid)
+        starting_active = rec_status == "starting" and (
+            rec_pid is None or pid_live or up_pid_live
+        )
+        if not (pid_live or up_pid_live or starting_active):
+            continue
+
+        rec_model_id = rec.get("model_id")
+        rec_repo = rec.get("repo")
+        if (rec_model_id and rec_model_id != endpoint.model_id) or (
+            rec_repo and rec_repo != endpoint.served_model_id
+        ):
+            return (
+                False,
+                f"served model mismatch on port {endpoint.port}: active PID record belongs to "
+                f"'{rec_model_id}' (status={rec_status or 'ready'}, pid={rec_pid}, "
+                f"upstream_pid={rec_up_pid}, repo={rec_repo}); expected "
+                f"'{endpoint.model_id}' ({endpoint.served_model_id})",
+            )
+        if require_offline and endpoint.trust_tier == "local" and rec.get("hf_offline") is False:
+            return (
+                False,
+                f"served model on port {endpoint.port} for '{endpoint.model_id}' (pid={rec_pid}) "
+                f"was started with --allow-hf-online (hf_offline=False); stop it with "
+                f"./scripts/stop-model {endpoint.model_id} so it can be started offline with HF_HUB_OFFLINE=1",
+            )
+    return True, None
+
+
+def verify_local_listener_matches(
+    endpoint: EndpointConfig,
+    *,
+    runs_dir: Path | None = None,
+    listener_inspector: Any = None,
+    require_offline: bool = False,
+) -> tuple[bool, str | None]:
+    pid_ok, pid_err = verify_pid_record_matches(
+        endpoint,
+        runs_dir=runs_dir,
+        require_offline=require_offline,
+    )
+    if not pid_ok:
+        return False, pid_err
+
+    if endpoint.trust_tier != "local" or endpoint.port is None:
+        return True, None
+
+    inspector = listener_inspector or inspect_port_listeners
+    listeners = inspector(endpoint.port)
+    if not listeners:
+        return (
+            False,
+            f"served model verification failed on port {endpoint.port}: could not identify any "
+            f"OS listener process via lsof/ps; refusing to trust /v1/models without verified "
+            f"listener --model {endpoint.served_model_id}",
+        )
+
+    matched_pids: list[int] = []
+    for lpid, cmd_text in listeners:
+        actual_model = extract_model_arg_from_command(cmd_text)
+        if actual_model is None:
+            return (
+                False,
+                f"served model verification failed on port {endpoint.port}: listener pid {lpid} "
+                f"has no verifiable --model flag in command line; expected --model {endpoint.served_model_id}",
+            )
+        if actual_model != endpoint.served_model_id:
+            return (
+                False,
+                f"served model mismatch on port {endpoint.port}: listener pid {lpid} was started "
+                f"with --model {actual_model}; expected {endpoint.served_model_id}",
+            )
+        matched_pids.append(lpid)
+
+    if not matched_pids:
+        return (
+            False,
+            f"served model verification failed on port {endpoint.port}: no listener matched "
+            f"--model {endpoint.served_model_id}",
+        )
+
+    return True, None
+
+
+def check_once_detailed(
+    endpoint: EndpointConfig,
+    timeout_seconds: float,
+    *,
+    runs_dir: Path | None = None,
+    listener_inspector: Any = None,
+    pid_record: dict[str, Any] | None = None,
+    require_offline: bool = False,
+) -> tuple[bool, str, bool]:
+    pid_ok, pid_err = verify_pid_record_matches(
+        endpoint,
+        runs_dir=runs_dir,
+        require_offline=require_offline,
+    )
+    if not pid_ok:
+        return False, str(pid_err), True
+
+    rec = pid_record if pid_record is not None else read_pid_record_for_model(endpoint.model_id, runs_dir)
+    if isinstance(rec, dict) and rec.get("model_id") == endpoint.model_id:
+        if rec.get("status") == "starting":
+            return (
+                False,
+                f"server for '{endpoint.model_id}' is still starting (awaiting readiness or Touch ID unlock)",
+                False,
+            )
+        rec_pid = rec.get("pid")
+        rec_up_pid = rec.get("upstream_pid")
+        if isinstance(rec_pid, int) and not _pid_is_alive(rec_pid):
+            return (
+                False,
+                f"server process pid={rec_pid} for '{endpoint.model_id}' is no longer running",
+                False,
+            )
+        if isinstance(rec_up_pid, int) and not _pid_is_alive(rec_up_pid):
+            return (
+                False,
+                f"upstream proxy process pid={rec_up_pid} for '{endpoint.model_id}' is no longer running",
+                False,
+            )
+
+    models_url = f"{endpoint.api_base_url}/models"
+    req = Request(
+        models_url,
+        headers={
+            "Accept": "application/json",
+            "Authorization": f"Bearer {endpoint.api_key}",
+        },
+        method="GET",
+    )
+    try:
+        with urlopen(req, timeout=timeout_seconds) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except (OSError, URLError, json.JSONDecodeError) as exc:
+        return False, f"could not read {models_url}: {exc}", False
+    served_ids = [item.get("id") for item in payload.get("data", []) if isinstance(item, dict)]
+    if endpoint.served_model_id not in served_ids:
+        return (
+            False,
+            f"served model mismatch at {models_url}: expected {endpoint.served_model_id}; got {served_ids}",
+            True,
+        )
+    listener_ok, listener_err = verify_local_listener_matches(
+        endpoint,
+        runs_dir=runs_dir,
+        listener_inspector=listener_inspector,
+        require_offline=require_offline,
+    )
+    if not listener_ok:
+        return False, str(listener_err), True
+    return True, endpoint.served_model_id, False
+
+
+def check_once(endpoint: EndpointConfig, timeout_seconds: float) -> tuple[bool, str]:
+    ok, message, _ = check_once_detailed(endpoint, timeout_seconds)
+    return ok, message
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        description="Verify the configured model endpoint is serving the expected model."
+    )
+    parser.add_argument("model_id", help="Model id from models.yaml.")
+    parser.add_argument(
+        "--wait",
+        type=float,
+        default=0.0,
+        help="Poll until the server is ready, up to this many seconds (default: 0, single check).",
+    )
+    parser.add_argument(
+        "--poll-interval",
+        type=float,
+        default=2.0,
+        help="Seconds between readiness polls when --wait > 0 (default: 2.0).",
+    )
+    parser.add_argument(
+        "--require-offline",
+        action="store_true",
+        help="Reject local model servers started with --allow-hf-online (hf_offline=False).",
+    )
+    args = parser.parse_args(argv[1:])
+
+    try:
+        model = load_model(args.model_id)
+        initial_pid_record = read_pid_record_for_model(args.model_id)
+        endpoint_meta = resolve_endpoint(model, pid_record=initial_pid_record, require_api_key=False)
+    except RegistryError as exc:
+        print(str(exc), file=sys.stderr)
+        return EXIT_UNREACHABLE
+
+    deadline = time.monotonic() + max(0.0, args.wait)
+    while True:
+        pid_ok, pid_err = verify_pid_record_matches(
+            endpoint_meta,
+            require_offline=args.require_offline,
+        )
+        if not pid_ok:
+            print(str(pid_err), file=sys.stderr)
+            return EXIT_MODEL_MISMATCH
+
+        pid_record = read_pid_record_for_model(args.model_id)
+        try:
+            endpoint = resolve_endpoint(model, pid_record=pid_record, require_api_key=True)
+        except RegistryError as exc:
+            if time.monotonic() >= deadline:
+                print(str(exc), file=sys.stderr)
+                return EXIT_UNREACHABLE
+            time.sleep(args.poll_interval)
+            continue
+
+        ok, message, is_mismatch = check_once_detailed(
+            endpoint,
+            timeout_seconds=5,
+            pid_record=pid_record,
+            require_offline=args.require_offline,
+        )
+        if ok:
+            print(message)
+            return 0
+        if is_mismatch or time.monotonic() >= deadline:
+            print(message, file=sys.stderr)
+            return EXIT_MODEL_MISMATCH if is_mismatch else EXIT_UNREACHABLE
+        time.sleep(args.poll_interval)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

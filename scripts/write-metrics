@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import importlib.metadata
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Optional
+
+ROOT = Path(__file__).resolve().parents[1]
+VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
+if VENV_PYTHON.exists() and Path(sys.executable) != VENV_PYTHON:
+    os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), __file__, *sys.argv[1:]])
+
+sys.path.insert(0, str(ROOT))
+
+from local_assist.registry import RegistryError, load_model
+from local_assist.se_key import scan_and_redact_directory_tokens
+
+
+def version(package: str) -> Optional[str]:
+    try:
+        return importlib.metadata.version(package)
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+
+def node_package_version(package: str) -> Optional[str]:
+    package_json = ROOT / "node_modules" / package / "package.json"
+    if not package_json.exists():
+        return None
+    try:
+        return json.loads(package_json.read_text()).get("version")
+    except json.JSONDecodeError:
+        return None
+
+
+def _load_optional_json(path: Path) -> tuple[Optional[dict], Optional[str]]:
+    if not path.exists():
+        return None, None
+    try:
+        raw = path.read_text(encoding="utf-8")
+        if not raw.strip():
+            return None, "empty_file"
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            return None, "expected_json_object"
+        return parsed, None
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return None, str(exc)
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 7:
+        print(
+            "usage: scripts/write-metrics <suite> <model-id> <provider-id> <config> <promptfoo-status> <out-dir>",
+            file=sys.stderr,
+        )
+        return 2
+
+    suite, model_id, provider_id, config, promptfoo_status, out_dir_arg = argv[1:]
+    out_dir = Path(out_dir_arg)
+
+    # Always scan and redact session tokens first before parsing any JSON artifacts
+    session_token_scan = scan_and_redact_directory_tokens(
+        [out_dir, ROOT / ".home" / ".promptfoo"]
+    )
+    session_token_redactions = int(session_token_scan.get("redactions_applied") or 0)
+    session_token_matches = int(session_token_scan.get("matches_found") or 0)
+
+    try:
+        model = load_model(model_id)
+    except RegistryError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    timing_path = out_dir / "timing.json"
+    timing_probe, timing_probe_error = _load_optional_json(timing_path)
+    tools_timing_path = out_dir / "tools_timing.json"
+    tools_timing_probe, tools_timing_probe_error = _load_optional_json(tools_timing_path)
+
+    output_path = out_dir / "output.json"
+    suite_requests = 0
+    suite_prompt_tokens = 0
+    suite_completion_tokens = 0
+    suite_total_tokens = 0
+    if output_path.exists():
+        try:
+            out_data = json.loads(output_path.read_text())
+            tu = ((out_data.get("results") or {}).get("stats") or {}).get("tokenUsage") or {}
+            suite_requests = int(tu.get("numRequests") or 0)
+            suite_prompt_tokens = int(tu.get("prompt") or 0)
+            suite_completion_tokens = int(tu.get("completion") or 0)
+            suite_total_tokens = int(
+                tu.get("total") or (suite_prompt_tokens + suite_completion_tokens)
+            )
+        except Exception:
+            pass
+
+    probe_requests = 0
+    probe_prompt_tokens = 0
+    probe_completion_tokens = 0
+    probe_total_tokens = 0
+    probe_used_fallback = False
+    for probe in (timing_probe, tools_timing_probe):
+        if not isinstance(probe, dict):
+            continue
+        probe_requests += 1
+        usage = probe.get("usage")
+        budget = probe.get("reserved_token_budget") or {}
+        if isinstance(usage, dict) and isinstance(usage.get("total_tokens"), int):
+            p_tok = int(usage.get("prompt_tokens") or 0)
+            c_tok = int(usage.get("completion_tokens") or 0)
+            t_tok = int(usage.get("total_tokens") or (p_tok + c_tok))
+        else:
+            probe_used_fallback = True
+            mode = probe.get("mode")
+            p_tok = int(budget.get("estimated_prompt_tokens") or (400 if mode == "tools" else 100))
+            c_tok = int(budget.get("max_completion_tokens") or (120 if mode == "tools" else 80))
+            t_tok = int(budget.get("reserved_total_tokens") or (p_tok + c_tok))
+        probe_prompt_tokens += p_tok
+        probe_completion_tokens += c_tok
+        probe_total_tokens += t_tok
+
+    token_accounting = {
+        "suite_requests": suite_requests,
+        "suite_tokens": {
+            "prompt": suite_prompt_tokens,
+            "completion": suite_completion_tokens,
+            "total": suite_total_tokens,
+        },
+        "timing_probe_requests": probe_requests,
+        "timing_probe_tokens": {
+            "prompt": probe_prompt_tokens,
+            "completion": probe_completion_tokens,
+            "total": probe_total_tokens,
+            "used_fallback_reservation": probe_used_fallback,
+        },
+        "total_eval_requests": suite_requests + probe_requests,
+        "total_eval_tokens": {
+            "prompt": suite_prompt_tokens + probe_prompt_tokens,
+            "completion": suite_completion_tokens + probe_completion_tokens,
+            "total": suite_total_tokens + probe_total_tokens,
+        },
+    }
+
+    metrics = {
+        "model_id": model_id,
+        "repo": model["repo"],
+        "suite": suite,
+        "provider_id": provider_id,
+        "config": config,
+        "promptfoo_status": int(promptfoo_status),
+        "promptfoo_output": str(out_dir / "output.json"),
+        "timing_probe": timing_probe,
+        "timing_probe_error": timing_probe_error,
+        "timing_probe_note": "Standalone streaming sanity prompt only; not per-suite prompt timing.",
+        "tools_timing_probe": tools_timing_probe,
+        "tools_timing_probe_error": tools_timing_probe_error,
+        "tools_timing_probe_note": (
+            "Standalone streaming single-tool (read_file) prompt timing."
+            if tools_timing_probe is not None
+            else None
+        ),
+        "token_accounting": token_accounting,
+        "session_token_redactions": session_token_redactions,
+        "session_token_scan": session_token_scan,
+        "per_suite_prompt_timings": None,
+        "model_load_time_seconds": None,
+        "memory": None,
+        "runtime_versions": {
+            "mlx": version("mlx"),
+            "mlx-lm": version("mlx-lm"),
+            "mlx-vlm": version("mlx-vlm"),
+            "promptfoo": node_package_version("promptfoo"),
+        },
+    }
+    (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
+    if session_token_redactions > 0 or session_token_matches > 0:
+        print(
+            f"ERROR: detected leaked se-session-* token(s) in {out_dir} or .home/.promptfoo "
+            f"(redactions_applied={session_token_redactions}, matches_found={session_token_matches})",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

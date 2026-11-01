@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+SUITE="${1:-sanity}"
+MODEL_ID="${2:-qwen3-1.7b-mlx-4bit}"
+STAMP="$(date +%Y-%m-%d-%H%M%S)"
+SAFE_MODEL="$(printf '%s' "$MODEL_ID" | tr -c 'A-Za-z0-9_.-' '-')"
+MODEL_HASH="$(printf '%s' "$MODEL_ID" | shasum -a 256 | cut -c1-8)"
+PROVIDER_ID="$(scripts/provider-id "$MODEL_ID")"
+
+mkdir -p runs .home/.promptfoo
+OUT_DIR="$(mktemp -d "runs/${STAMP}-${SUITE}-${SAFE_MODEL}-${MODEL_HASH}-XXXXXX")"
+
+export HOME="$PWD/.home"
+export PROMPTFOO_DISABLE_TELEMETRY=1
+
+case "$SUITE" in
+  sanity|v1|tools)
+    CONFIG="$(scripts/render-suite "$SUITE" "$MODEL_ID" --output "$OUT_DIR/suite.yaml")"
+    ;;
+  *)
+    echo "Unknown suite: $SUITE" >&2
+    echo "Known suites: sanity, v1, tools" >&2
+    exit 2
+    ;;
+esac
+
+scripts/verify-served-model "$MODEL_ID" > "$OUT_DIR/served-model.txt"
+
+set +e
+scripts/with-session-token "$MODEL_ID" -- npx --no-install promptfoo eval \
+  --config "$CONFIG" \
+  --filter-providers "^${PROVIDER_ID}$" \
+  --max-concurrency 1 \
+  --no-cache \
+  --output "$OUT_DIR/output.json" 2>&1 | tee "$OUT_DIR/promptfoo.log"
+PROMPTFOO_STATUS="${PIPESTATUS[0]}"
+
+TIMING_STATUS=0
+scripts/timing "$MODEL_ID" > "$OUT_DIR/timing.json"
+TIMING_RC=$?
+if [ "$TIMING_RC" -ne 0 ]; then
+  TIMING_STATUS="$TIMING_RC"
+fi
+if [ "$SUITE" = "tools" ]; then
+  scripts/timing "$MODEL_ID" --tools > "$OUT_DIR/tools_timing.json"
+  TOOLS_TIMING_RC=$?
+  if [ "$TOOLS_TIMING_RC" -ne 0 ] && [ "$TIMING_STATUS" -eq 0 ]; then
+    TIMING_STATUS="$TOOLS_TIMING_RC"
+  fi
+fi
+
+scripts/write-metrics "$SUITE" "$MODEL_ID" "$PROVIDER_ID" "$CONFIG" "$PROMPTFOO_STATUS" "$OUT_DIR"
+WRITE_METRICS_STATUS=$?
+set -e
+
+cat > "$OUT_DIR/notes.md" <<EOF
+# Run Notes
+
+- Suite: $SUITE
+- Model: $MODEL_ID
+- Created: $STAMP
+- Manual notes:
+EOF
+
+echo "Saved run to $OUT_DIR"
+if [ "$PROMPTFOO_STATUS" -ne 0 ]; then
+  exit "$PROMPTFOO_STATUS"
+fi
+if [ "$TIMING_STATUS" -ne 0 ]; then
+  exit "$TIMING_STATUS"
+fi
+exit "$WRITE_METRICS_STATUS"

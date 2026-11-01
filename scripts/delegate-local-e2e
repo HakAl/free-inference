@@ -1,0 +1,495 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import importlib.machinery
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
+if VENV_PYTHON.exists() and Path(sys.executable) != VENV_PYTHON:
+    os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), __file__, *sys.argv[1:]])
+
+sys.path.insert(0, str(ROOT))
+
+from local_assist.registry import (  # noqa: E402
+    legacy_pid_file,
+    list_pid_records,
+    pid_file_for_model,
+    read_pid_record_for_model,
+)
+
+
+def _load_smoke_module() -> Any:
+    path = ROOT / "scripts" / "opencode-smoke"
+    loader = importlib.machinery.SourceFileLoader("opencode_smoke", str(path))
+    spec = importlib.util.spec_from_loader("opencode_smoke", loader)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+smoke = _load_smoke_module()
+
+
+def find_served_model_pids() -> list[int]:
+    pids: list[int] = []
+    for _, rec in list_pid_records():
+        pid = rec.get("pid")
+        if isinstance(pid, int) and pid > 0:
+            pids.append(pid)
+    return pids
+
+
+def run_check_with_sampling(
+    cmd: list[str],
+    *,
+    cwd: Path,
+    run_dir: Path,
+    timeout_s: int,
+    label: str,
+) -> tuple[int, str, str, dict[str, Any]]:
+    network_samples: list[str] = []
+    non_localhost_lines: list[str] = []
+    unconnected_udp_lines: list[str] = []
+    observer_errors: list[str] = []
+    observer_warnings: list[str] = []
+
+    res = smoke.run_sampled_command(
+        cmd,
+        cwd=cwd,
+        env=dict(os.environ),
+        timeout_s=timeout_s,
+        label=label,
+        network_samples=network_samples,
+        non_localhost_lines=non_localhost_lines,
+        unconnected_udp_lines=unconnected_udp_lines,
+        observer_errors=observer_errors,
+        observer_warnings=observer_warnings,
+        extra_root_pids_fn=find_served_model_pids,
+        poll_interval_s=0.05,
+    )
+    (run_dir / f"{label}-network.txt").write_text("\n".join(network_samples))
+    poll_count = int(res["poll_count"])
+    positive_socket_samples = int(res["positive_socket_samples"])
+    parsed_socket_lines = int(res["parsed_socket_lines"])
+    network_observation_ok = (
+        len(observer_errors) == 0
+        and poll_count > 0
+        and positive_socket_samples > 0
+        and parsed_socket_lines > 0
+    )
+    net_summary = {
+        "elapsed": res["elapsed"],
+        "poll_count": poll_count,
+        "positive_socket_samples": positive_socket_samples,
+        "parsed_socket_lines": parsed_socket_lines,
+        "observer_errors": observer_errors,
+        "observer_warnings": observer_warnings,
+        "network_observation_ok": network_observation_ok,
+        "non_localhost_sockets": len(non_localhost_lines),
+        "unconnected_udp_sockets": len(unconnected_udp_lines),
+        "non_localhost_lines": non_localhost_lines,
+        "unconnected_udp_lines": unconnected_udp_lines,
+    }
+    return int(res["returncode"] or 0), res["stdout"], res["stderr"], net_summary
+
+
+def main() -> int:
+    run_id = (
+        f"{datetime.now().strftime('%Y-%m-%d-%H%M%S')}"
+        f"-delegate-local-e2e-{uuid.uuid4().hex[:8]}"
+    )
+    run_dir = ROOT / "runs" / run_id
+    scratch_ws = run_dir / "workspace"
+    scratch_ws.mkdir(parents=True, exist_ok=True)
+
+    serve_script = str(ROOT / "scripts" / "serve-model")
+    verify_script = str(ROOT / "scripts" / "verify-served-model")
+    stop_script = str(ROOT / "scripts" / "stop-model")
+    opencode_local = str(ROOT / "scripts" / "opencode-local")
+    delegate_local = str(ROOT / "scripts" / "delegate-local")
+
+    real_home = Path.home()
+    host_before = smoke.snapshot_host_opencode_dirs(real_home)
+
+    # Ensure port 8080 is clean before starting
+    subprocess.run([stop_script, "qwen3-30b-a3b-2507-mlx-4bit"], cwd=str(ROOT), check=False)
+    subprocess.run([stop_script, "qwen3-1.7b-mlx-4bit"], cwd=str(ROOT), check=False)
+
+    sentinel_secret = "CONTEXT_SENTINEL_DO_NOT_LOG_987654321"
+    context_file = scratch_ws / "clamp_spec.py"
+    context_file.write_text(
+        f"# Internal spec marker: {sentinel_secret}\n"
+        "def validate_bounds(lo: float, hi: float) -> None:\n"
+        "    if lo > hi:\n"
+        "        raise ValueError('lo must be <= hi')\n"
+    )
+    diff_file = scratch_ws / "sample.diff"
+    diff_file.write_text(
+        "diff --git a/src/clamp.py b/src/clamp.py\n"
+        "--- a/src/clamp.py\n"
+        "+++ b/src/clamp.py\n"
+        "@@ -1,2 +1,4 @@\n"
+        "-def clamp(x):\n"
+        "-    return x\n"
+        "+def clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:\n"
+        "+    if lo > hi:\n"
+        "+        raise ValueError('lo > hi')\n"
+        "+    return max(lo, min(hi, x))\n"
+    )
+
+    try:
+        # Check 1 (D1 live negative test): start qwen3-1.7b-mlx-4bit on :8080 and verify mismatch detection
+        subprocess.run([serve_script, "qwen3-1.7b-mlx-4bit"], cwd=str(ROOT), check=True)
+        subprocess.run(
+            [verify_script, "qwen3-1.7b-mlx-4bit", "--wait", "45"],
+            cwd=str(ROOT),
+            check=True,
+        )
+        serve_log_path = ROOT / "runs" / "serve.log"
+        serve_log_offset_before = serve_log_path.stat().st_size if serve_log_path.exists() else 0
+
+        v_mismatch = subprocess.run(
+            [verify_script, "qwen3-30b-a3b-2507-mlx-4bit"],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+        )
+        oc_mismatch = subprocess.run(
+            [opencode_local, "--no-serve", "--", "models"],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+        )
+        dl_mismatch = subprocess.run(
+            [
+                delegate_local,
+                "--auto-serve",
+                "delegate_task",
+                "--kind",
+                "focused_qa",
+                "--instruction",
+                "Say hello.",
+            ],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+        )
+        dl_mismatch_err = (
+            json.loads(dl_mismatch.stderr) if dl_mismatch.stderr.strip().startswith("{") else {}
+        )
+
+        # V2: Move PID files aside temporarily to live-test the lsof + ps listener --model branch directly
+        pid_1_7b = pid_file_for_model("qwen3-1.7b-mlx-4bit")
+        pid_legacy = legacy_pid_file()
+        saved_1_7b = pid_1_7b.read_text() if pid_1_7b.exists() else None
+        saved_legacy = pid_legacy.read_text() if pid_legacy.exists() else None
+        try:
+            pid_1_7b.unlink(missing_ok=True)
+            pid_legacy.unlink(missing_ok=True)
+            v_lsof_mismatch = subprocess.run(
+                [verify_script, "qwen3-30b-a3b-2507-mlx-4bit"],
+                cwd=str(ROOT),
+                capture_output=True,
+                text=True,
+            )
+        finally:
+            if saved_1_7b is not None:
+                pid_1_7b.write_text(saved_1_7b)
+            if saved_legacy is not None:
+                pid_legacy.write_text(saved_legacy)
+
+        still_1_7b = subprocess.run(
+            [verify_script, "qwen3-1.7b-mlx-4bit"],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+        )
+        serve_log_delta = ""
+        if serve_log_path.exists():
+            with serve_log_path.open("rb") as f:
+                f.seek(serve_log_offset_before)
+                serve_log_delta = f.read().decode("utf-8", errors="replace")
+        no_chat_or_hotswap_in_serve_log = (
+            "/v1/chat/completions" not in serve_log_delta
+            and "Qwen3-30B-A3B-Instruct-2507-4bit" not in serve_log_delta
+        )
+        subprocess.run([stop_script, "qwen3-1.7b-mlx-4bit"], cwd=str(ROOT), check=True)
+
+        check_1_d1_mismatch = {
+            "verify_30b_returncode": v_mismatch.returncode,
+            "verify_30b_stderr": v_mismatch.stderr.strip(),
+            "verify_30b_lsof_only_returncode": v_lsof_mismatch.returncode,
+            "verify_30b_lsof_only_stderr": v_lsof_mismatch.stderr.strip(),
+            "opencode_local_returncode": oc_mismatch.returncode,
+            "opencode_local_stderr": oc_mismatch.stderr.strip(),
+            "delegate_local_returncode": dl_mismatch.returncode,
+            "delegate_local_error_code": dl_mismatch_err.get("code"),
+            "starter_model_still_active_without_hotswap": still_1_7b.returncode == 0,
+            "no_chat_or_hotswap_in_serve_log": no_chat_or_hotswap_in_serve_log,
+            "serve_log_delta": serve_log_delta.strip(),
+            "passed": (
+                v_mismatch.returncode == 3
+                and v_lsof_mismatch.returncode == 3
+                and "listener pid" in v_lsof_mismatch.stderr
+                and "--model Qwen/Qwen3-1.7B-MLX-4bit" in v_lsof_mismatch.stderr
+                and oc_mismatch.returncode != 0
+                and "another model is already serving" in oc_mismatch.stderr
+                and dl_mismatch.returncode == 1
+                and dl_mismatch_err.get("code") == "model_mismatch"
+                and still_1_7b.returncode == 0
+                and no_chat_or_hotswap_in_serve_log
+            ),
+        }
+
+        # Check 2: Port 8080 stopped + no --auto-serve -> fails closed with model_unavailable,
+        # and outside-workspace context_path -> fails closed with invalid_arguments (V3)
+        dl_down = subprocess.run(
+            [
+                delegate_local,
+                "delegate_task",
+                "--kind",
+                "focused_qa",
+                "--instruction",
+                "Say hello.",
+            ],
+            cwd=str(scratch_ws),
+            capture_output=True,
+            text=True,
+        )
+        dl_down_err = json.loads(dl_down.stderr) if dl_down.stderr.strip().startswith("{") else {}
+
+        dl_outside = subprocess.run(
+            [
+                delegate_local,
+                "delegate_task",
+                "--kind",
+                "focused_qa",
+                "--instruction",
+                "Read outside file.",
+                "--context-file",
+                str(ROOT / "models.yaml"),
+            ],
+            cwd=str(scratch_ws),
+            capture_output=True,
+            text=True,
+        )
+        dl_outside_err = (
+            json.loads(dl_outside.stderr) if dl_outside.stderr.strip().startswith("{") else {}
+        )
+        check_2_fail_closed_when_down = {
+            "returncode": dl_down.returncode,
+            "error_code": dl_down_err.get("code"),
+            "remediation": (dl_down_err.get("details") or {}).get("remediation"),
+            "outside_workspace_returncode": dl_outside.returncode,
+            "outside_workspace_error_code": dl_outside_err.get("code"),
+            "outside_workspace_message": dl_outside_err.get("message"),
+            "passed": (
+                dl_down.returncode == 1
+                and dl_down_err.get("code") == "model_unavailable"
+                and "LOCAL_ASSIST_AUTO_SERVE=1"
+                in str((dl_down_err.get("details") or {}).get("remediation", ""))
+                and dl_outside.returncode == 1
+                and dl_outside_err.get("code") == "invalid_arguments"
+                and "allowed workspace root" in str(dl_outside_err.get("message", ""))
+            ),
+        }
+
+        # Check 3: Cold-start --auto-serve + delegate_task with --context-file (sampled by lsof)
+        cmd_3 = [
+            delegate_local,
+            "--auto-serve",
+            "delegate_task",
+            "--kind",
+            "draft_code",
+            "--instruction",
+            (
+                "Write a Python function clamp_score(val: float, lo: float = 0.0, hi: float = 1.0) -> float "
+                "that calls validate_bounds(lo, hi) from the context and returns val clamped to [lo, hi]."
+            ),
+            "--context-file",
+            "clamp_spec.py",
+            "--constraint",
+            "Use validate_bounds(lo, hi) from the provided context.",
+            "--max-tokens",
+            "768",
+        ]
+        rc3, out3, err3, net3 = run_check_with_sampling(
+            cmd_3,
+            cwd=scratch_ws,
+            run_dir=run_dir,
+            timeout_s=180,
+            label="3-delegate-task-cold-start",
+        )
+        (run_dir / "3-delegate-task-stdout.txt").write_text(out3)
+        (run_dir / "3-delegate-task-stderr.txt").write_text(err3)
+        parsed_3 = json.loads(out3) if rc3 == 0 and out3.strip().startswith("{") else {}
+        pid_rec_30b = read_pid_record_for_model("qwen3-30b-a3b-2507-mlx-4bit") or {}
+
+        # Verify context redaction in latest local-assist audit payload (D9 / V7) and record ready_seconds (V6)
+        local_assist_dir = ROOT / "runs" / "local-assist"
+        latest_payload_files = sorted(
+            local_assist_dir.rglob("*delegate-task*.json"),
+            key=lambda p: p.stat().st_mtime,
+        )
+        latest_payload_text = (
+            latest_payload_files[-1].read_text(encoding="utf-8") if latest_payload_files else ""
+        )
+        latest_payload_obj = json.loads(latest_payload_text) if latest_payload_text else {}
+        observed_3 = latest_payload_obj.get("observed") or {}
+        context_redacted_in_audit_log = (
+            bool(latest_payload_text)
+            and sentinel_secret not in json.dumps(latest_payload_obj.get("args", {}))
+            and sentinel_secret not in str(latest_payload_obj.get("prompt", ""))
+            and isinstance(latest_payload_obj.get("args", {}).get("context_sha256"), str)
+            and int(latest_payload_obj.get("args", {}).get("context_chars", 0)) > 0
+        )
+
+        check_3_delegate_task = {
+            "command": cmd_3,
+            "returncode": rc3,
+            "started_by": pid_rec_30b.get("started_by"),
+            "ready_seconds": observed_3.get("ready_seconds"),
+            "result_id": parsed_3.get("id"),
+            "result_kind": parsed_3.get("kind"),
+            "result_summary": parsed_3.get("summary"),
+            "output_has_clamp_score": "def clamp_score" in str(parsed_3.get("output", "")),
+            "ungrounded_identifiers": parsed_3.get("ungrounded_identifiers"),
+            "assumptions": parsed_3.get("assumptions"),
+            "unverified_claims": parsed_3.get("unverified_claims"),
+            "context_redacted_in_audit_log": context_redacted_in_audit_log,
+            "audit_payload_path": (
+                str(latest_payload_files[-1].relative_to(ROOT)) if latest_payload_files else None
+            ),
+            **net3,
+            "passed": (
+                rc3 == 0
+                and pid_rec_30b.get("started_by") == "auto-serve"
+                and isinstance(observed_3.get("ready_seconds"), (int, float))
+                and parsed_3.get("kind") == "draft_code"
+                and "def clamp_score" in str(parsed_3.get("output", ""))
+                and context_redacted_in_audit_log
+                and net3["network_observation_ok"]
+                and net3["non_localhost_sockets"] == 0
+                and net3["unconnected_udp_sockets"] == 0
+            ),
+        }
+
+        # Check 4: compress_context via delegate-local (sampled by lsof)
+        cmd_4 = [
+            delegate_local,
+            "compress_context",
+            "--kind",
+            "diff",
+            "--text-file",
+            str(diff_file),
+            "--max-items",
+            "5",
+        ]
+        rc4, out4, err4, net4 = run_check_with_sampling(
+            cmd_4,
+            cwd=ROOT,
+            run_dir=run_dir,
+            timeout_s=120,
+            label="4-compress-context",
+        )
+        (run_dir / "4-compress-context-stdout.txt").write_text(out4)
+        (run_dir / "4-compress-context-stderr.txt").write_text(err4)
+        parsed_4 = json.loads(out4) if rc4 == 0 and out4.strip().startswith("{") else {}
+        check_4_compress_context = {
+            "command": cmd_4,
+            "returncode": rc4,
+            "changed_files": parsed_4.get("changed_files"),
+            "summary": parsed_4.get("summary"),
+            **net4,
+            "passed": (
+                rc4 == 0
+                and parsed_4.get("changed_files") == ["src/clamp.py"]
+                and net4["network_observation_ok"]
+                and net4["non_localhost_sockets"] == 0
+                and net4["unconnected_udp_sockets"] == 0
+            ),
+        }
+
+        # Check 5: extract_fields via delegate-local (sampled by lsof)
+        cmd_5 = [
+            delegate_local,
+            "extract_fields",
+            "--text",
+            "Build 904 passed on port 8080 in 4.5 seconds.",
+            "--fields-json",
+            json.dumps(
+                {
+                    "build_id": {"type": "integer", "description": "Build ID", "required": True},
+                    "port": {"type": "integer", "description": "Port number", "required": True},
+                }
+            ),
+        ]
+        rc5, out5, err5, net5 = run_check_with_sampling(
+            cmd_5,
+            cwd=ROOT,
+            run_dir=run_dir,
+            timeout_s=120,
+            label="5-extract-fields",
+        )
+        (run_dir / "5-extract-fields-stdout.txt").write_text(out5)
+        (run_dir / "5-extract-fields-stderr.txt").write_text(err5)
+        parsed_5 = json.loads(out5) if rc5 == 0 and out5.strip().startswith("{") else {}
+        extracted_5 = parsed_5.get("extracted") or {}
+        check_5_extract_fields = {
+            "command": cmd_5,
+            "returncode": rc5,
+            "extracted": extracted_5,
+            "missing_required": parsed_5.get("missing_required"),
+            **net5,
+            "passed": (
+                rc5 == 0
+                and extracted_5.get("build_id") == 904
+                and extracted_5.get("port") == 8080
+                and parsed_5.get("missing_required") == []
+                and net5["network_observation_ok"]
+                and net5["non_localhost_sockets"] == 0
+                and net5["unconnected_udp_sockets"] == 0
+            ),
+        }
+    finally:
+        subprocess.run([stop_script, "qwen3-30b-a3b-2507-mlx-4bit"], cwd=str(ROOT), check=False)
+        subprocess.run([stop_script, "qwen3-1.7b-mlx-4bit"], cwd=str(ROOT), check=False)
+
+    host_after = smoke.snapshot_host_opencode_dirs(real_home)
+    host_unchanged = host_before == host_after
+
+    summary = {
+        "run_id": run_id,
+        "out_dir": str(run_dir.relative_to(ROOT)),
+        "opencode_host_dirs_unchanged": host_unchanged,
+        "check_1_d1_model_mismatch_negative_test": check_1_d1_mismatch,
+        "check_2_fail_closed_when_server_down": check_2_fail_closed_when_down,
+        "check_3_cold_start_delegate_task": check_3_delegate_task,
+        "check_4_compress_context": check_4_compress_context,
+        "check_5_extract_fields": check_5_extract_fields,
+    }
+    summary["all_passed"] = (
+        host_unchanged
+        and check_1_d1_mismatch["passed"]
+        and check_2_fail_closed_when_down["passed"]
+        and check_3_delegate_task["passed"]
+        and check_4_compress_context["passed"]
+        and check_5_extract_fields["passed"]
+    )
+    (run_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+    print(json.dumps(summary, indent=2))
+    return 0 if summary["all_passed"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

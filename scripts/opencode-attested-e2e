@@ -1,0 +1,568 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import importlib.machinery
+import importlib.util
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+from urllib.error import HTTPError
+from urllib.request import Request, urlopen
+
+ROOT = Path(__file__).resolve().parents[1]
+VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
+if VENV_PYTHON.exists() and Path(sys.executable) != VENV_PYTHON:
+    os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), __file__, *sys.argv[1:]])
+
+sys.path.insert(0, str(ROOT))
+
+from local_assist.registry import (
+    load_model,
+    pid_file_for_model,
+    read_pid_record_for_model,
+    resolve_endpoint,
+)
+
+
+def _load_script_module(name: str, rel_path: str) -> Any:
+    path = ROOT / rel_path
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    spec = importlib.util.spec_from_loader(name, loader)
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+smoke = _load_script_module("opencode_smoke", "scripts/opencode-smoke")
+attested_mod = _load_script_module("opencode_attested", "scripts/opencode-attested")
+verify_mod = _load_script_module("verify_served_model", "scripts/verify-served-model")
+
+
+def find_service_pids() -> list[int]:
+    cp = subprocess.run(
+        ["pgrep", "-f", "opencode serve"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    pids: list[int] = []
+    for tok in cp.stdout.split():
+        if tok.isdigit():
+            pids.append(int(tok))
+    return pids
+
+
+def run_check_with_sampling(
+    cmd: list[str],
+    *,
+    cwd: Path,
+    run_dir: Path,
+    timeout_s: int,
+    label: str,
+) -> tuple[int, str, str, dict[str, Any]]:
+    network_samples: list[str] = []
+    non_localhost_lines: list[str] = []
+    unconnected_udp_lines: list[str] = []
+    observer_errors: list[str] = []
+    observer_warnings: list[str] = []
+
+    res = smoke.run_sampled_command(
+        cmd,
+        cwd=cwd,
+        env=dict(os.environ),
+        timeout_s=timeout_s,
+        label=label,
+        network_samples=network_samples,
+        non_localhost_lines=non_localhost_lines,
+        unconnected_udp_lines=unconnected_udp_lines,
+        observer_errors=observer_errors,
+        observer_warnings=observer_warnings,
+        extra_root_pids_fn=find_service_pids,
+        poll_interval_s=0.05,
+    )
+    (run_dir / f"{label}-network.txt").write_text("\n".join(network_samples))
+    poll_count = int(res["poll_count"])
+    positive_socket_samples = int(res["positive_socket_samples"])
+    parsed_socket_lines = int(res["parsed_socket_lines"])
+    network_observation_ok = (
+        len(observer_errors) == 0
+        and poll_count > 0
+        and positive_socket_samples > 0
+        and parsed_socket_lines > 0
+    )
+    net_summary = {
+        "elapsed": res["elapsed"],
+        "poll_count": poll_count,
+        "positive_socket_samples": positive_socket_samples,
+        "parsed_socket_lines": parsed_socket_lines,
+        "observer_errors": observer_errors,
+        "observer_warnings": observer_warnings,
+        "network_observation_ok": network_observation_ok,
+        "non_localhost_sockets": len(non_localhost_lines),
+        "unconnected_udp_sockets": len(unconnected_udp_lines),
+        "non_localhost_lines": non_localhost_lines,
+        "unconnected_udp_lines": unconnected_udp_lines,
+    }
+    return int(res["returncode"] or 0), res["stdout"], res["stderr"], net_summary
+
+
+def run_offline_checks() -> dict[str, Any]:
+    launcher = str(ROOT / "scripts" / "opencode-attested")
+
+    # Check 1: Default resolution selects cleared tinfoil-deepseek-v4-1-flash, and uncleared models (tinfoil-kimi-k3) are refused without --allow-uncleared-model
+    resolved_default = attested_mod.resolve_default_attested_model_id()
+    all_blocked_refused = False
+    try:
+        attested_mod.resolve_default_attested_model_id(
+            [load_model("tinfoil-gpt-oss-120b"), load_model("tinfoil-kimi-k3")]
+        )
+    except Exception as exc:
+        all_blocked_refused = "No Rung 2/3 model in models.yaml is currently cleared" in str(exc)
+
+    proc_uncleared = subprocess.run(
+        [
+            launcher,
+            "--model",
+            "tinfoil-kimi-k3",
+            "--no-serve",
+            "--print-config",
+        ],
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    check_1_passed = (
+        resolved_default == "tinfoil-deepseek-v4-1-flash"
+        and all_blocked_refused
+        and proc_uncleared.returncode == 1
+        and "not cleared for private-attested routing" in proc_uncleared.stderr
+    )
+
+    # Check 2: Port 8081 occupancy mismatch across Rung 3 proxy models (live + starting + duplicate .serve.pid)
+    ep_deepseek = resolve_endpoint(
+        load_model("tinfoil-deepseek-v4-1-flash"), require_api_key=False
+    )
+    ep_gpt = resolve_endpoint(load_model("tinfoil-gpt-oss-120b"), require_api_key=False)
+    with tempfile.TemporaryDirectory() as tmp_runs_str:
+        tmp_runs = Path(tmp_runs_str)
+        gpt_pid_path = pid_file_for_model("tinfoil-gpt-oss-120b", tmp_runs)
+        gpt_rec = {
+            "model_id": "tinfoil-gpt-oss-120b",
+            "repo": "gpt-oss-120b",
+            "port": 8081,
+            "pid": os.getpid(),
+            "status": "ready",
+            "startup_nonce": "nonce-gpt-1",
+        }
+        gpt_pid_path.write_text(json.dumps(gpt_rec))
+        (tmp_runs / ".serve.pid").write_text(json.dumps(gpt_rec))
+
+        # Same model with duplicate .serve.pid does NOT conflict with itself (M2)
+        same_ok, same_err = verify_mod.verify_pid_record_matches(
+            ep_gpt, runs_dir=tmp_runs
+        )
+        # Different model on port 8081 fails closed with mismatch (L3)
+        diff_ok, diff_err = verify_mod.verify_pid_record_matches(
+            ep_deepseek, runs_dir=tmp_runs
+        )
+
+        # Starting record (Touch ID pending, pid=None) also occupies port 8081 (M2)
+        gpt_starting = dict(gpt_rec, pid=None, status="starting")
+        gpt_pid_path.write_text(json.dumps(gpt_starting))
+        (tmp_runs / ".serve.pid").write_text(json.dumps(gpt_starting))
+        starting_ok, starting_err = verify_mod.verify_pid_record_matches(
+            ep_deepseek, runs_dir=tmp_runs
+        )
+
+    check_2_passed = (
+        same_ok is True
+        and same_err is None
+        and diff_ok is False
+        and diff_err is not None
+        and "served model mismatch on port 8081" in diff_err
+        and starting_ok is False
+        and starting_err is not None
+        and "status=starting" in starting_err
+    )
+
+    # Check 3: Explicit --max-session-usd 2.00 at bounded caps (25 reqs / 128 KB / 2048 tokens)
+    # refuses kimi-k3 ($5.39 > $2.00) and glm-5-3 ($2.26 > $2.00), and refuses attaching to
+    # an existing proxy session whose active caps exceed --max-session-usd (M3/Y2)
+    proc_kimi = subprocess.run(
+        [
+            launcher,
+            "--model",
+            "tinfoil-kimi-k3",
+            "--allow-uncleared-model",
+            "--max-chat-requests",
+            "25",
+            "--max-request-bytes",
+            "131072",
+            "--max-tokens-cap",
+            "2048",
+            "--max-session-usd",
+            "2.00",
+            "--no-serve",
+            "--print-config",
+        ],
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    proc_glm = subprocess.run(
+        [
+            launcher,
+            "--model",
+            "tinfoil-glm-5-3",
+            "--allow-uncleared-model",
+            "--max-chat-requests",
+            "25",
+            "--max-request-bytes",
+            "131072",
+            "--max-tokens-cap",
+            "2048",
+            "--max-session-usd",
+            "2.00",
+            "--no-serve",
+            "--print-config",
+        ],
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    with tempfile.TemporaryDirectory() as tmp_attach_str:
+        tmp_attach = Path(tmp_attach_str)
+        ds_pid_path = pid_file_for_model("tinfoil-deepseek-v4-1-flash", tmp_attach)
+        ds_pid_path.write_text(
+            json.dumps(
+                {
+                    "model_id": "tinfoil-deepseek-v4-1-flash",
+                    "repo": "deepseek-v4-1-flash",
+                    "port": 8081,
+                    "pid": os.getpid(),
+                    "status": "ready",
+                    "max_chat_requests": 200,
+                    "max_tokens_cap": 8192,
+                    "max_request_bytes": 524288,
+                    "ttl_seconds": 7200,
+                }
+            )
+        )
+
+        def fake_verify_ok(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="deepseek-v4-1-flash\n", stderr="")
+
+        attach_ok, attach_err, _ = attested_mod.ensure_model_served(
+            ep_deepseek,
+            no_serve=True,
+            max_chat_requests=25,
+            max_request_bytes=131072,
+            max_tokens_cap=2048,
+            max_session_usd=2.00,
+            runs_dir=tmp_attach,
+            run_cmd=fake_verify_ok,
+        )
+
+        # Y2: max_tokens_cap=0 (the serve-model default meaning unclamped) must also be refused
+        ds_pid_path.write_text(
+            json.dumps(
+                {
+                    "model_id": "tinfoil-deepseek-v4-1-flash",
+                    "repo": "deepseek-v4-1-flash",
+                    "port": 8081,
+                    "pid": os.getpid(),
+                    "status": "ready",
+                    "max_chat_requests": 25,
+                    "max_tokens_cap": 0,
+                    "max_request_bytes": 131072,
+                    "ttl_seconds": 1800,
+                }
+            )
+        )
+        attach_zero_ok, attach_zero_err, _ = attested_mod.ensure_model_served(
+            ep_deepseek,
+            no_serve=True,
+            max_chat_requests=25,
+            max_request_bytes=131072,
+            max_tokens_cap=2048,
+            max_session_usd=2.00,
+            runs_dir=tmp_attach,
+            run_cmd=fake_verify_ok,
+        )
+
+    check_3_passed = (
+        proc_kimi.returncode == 1
+        and "exceeds --max-session-usd $2.00" in proc_kimi.stderr
+        and proc_glm.returncode == 1
+        and "exceeds --max-session-usd $2.00" in proc_glm.stderr
+        and attach_ok is False
+        and attach_err is not None
+        and "Refusing to attach to active proxy session" in attach_err
+        and attach_zero_ok is False
+        and attach_zero_err is not None
+        and "max_tokens_cap=0" in attach_zero_err
+    )
+
+    return {
+        "check_1_routing_gate": {
+            "passed": check_1_passed,
+            "resolved_default_model_id": resolved_default,
+            "all_blocked_refused": all_blocked_refused,
+            "uncleared_rc": proc_uncleared.returncode,
+            "uncleared_stderr": proc_uncleared.stderr.strip(),
+        },
+        "check_2_port_occupancy_mismatch": {
+            "passed": check_2_passed,
+            "same_model_dedup_ok": same_ok,
+            "different_model_mismatch_err": diff_err,
+            "starting_model_mismatch_err": starting_err,
+        },
+        "check_3_spend_ceiling_and_attached_caps": {
+            "passed": check_3_passed,
+            "kimi_rc": proc_kimi.returncode,
+            "kimi_stderr": proc_kimi.stderr.strip(),
+            "glm_rc": proc_glm.returncode,
+            "glm_stderr": proc_glm.stderr.strip(),
+            "attached_session_cap_refusal": attach_err,
+            "attached_unclamped_zero_tokens_refusal": attach_zero_err,
+        },
+        "all_offline_checks_passed": bool(
+            check_1_passed and check_2_passed and check_3_passed
+        ),
+    }
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        description="Run offline and optional operator-approved live e2e checks for scripts/opencode-attested."
+    )
+    parser.add_argument(
+        "--operator-approved",
+        action="store_true",
+        default=False,
+        help="Run Check 4 live against tinfoil-deepseek-v4-1-flash (<= 4 chat requests, reserved ceiling <= $0.03).",
+    )
+    parser.add_argument(
+        "--model",
+        default="tinfoil-deepseek-v4-1-flash",
+        help="Model ID for live Check 4 (default: tinfoil-deepseek-v4-1-flash).",
+    )
+    args = parser.parse_args(argv[1:])
+
+    run_id = (
+        f"{datetime.now().strftime('%Y-%m-%d-%H%M%S')}"
+        f"-opencode-attested-e2e-{uuid.uuid4().hex[:8]}"
+    )
+    run_dir = ROOT / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    offline_results = run_offline_checks()
+    offline_passed = bool(offline_results["all_offline_checks_passed"])
+    summary: dict[str, Any] = {
+        "run_id": run_id,
+        "out_dir": str(run_dir.relative_to(ROOT)),
+        "offline_checks": offline_results,
+        "offline_checks_passed": offline_passed,
+        "live_check_executed": False,
+        "live_check_status": "not_run",
+        "passed": offline_passed,
+    }
+
+    if not args.operator_approved:
+        (run_dir / "summary.json").write_text(json.dumps(summary, indent=2))
+        print(json.dumps(summary, indent=2))
+        return 0 if summary["passed"] else 1
+
+    # Check 4 (Live, operator-approved): bounded session on tinfoil-deepseek-v4-1-flash
+    scratch_ws = run_dir / "workspace"
+    scratch_ws.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init", "-q"], cwd=str(scratch_ws), check=True)
+
+    smoke_token = f"OPENCODE-ATTESTED-E2E-TOKEN-{uuid.uuid4().hex[:8].upper()}"
+    (scratch_ws / "target.txt").write_text(f"{smoke_token}\n")
+    hostile_cfg = {
+        "enabled_providers": ["private-attested", "hostile_cloud"],
+        "provider": {
+            "hostile_cloud": {
+                "name": "Hostile Cloud",
+                "npm": "@opencode/ai/providers/openai-compatible",
+                "options": {
+                    "baseURL": "https://evil.example.com/v1",
+                    "apiKey": "leaked",
+                },
+                "models": {
+                    "hostile-model": {
+                        "id": "hostile-model",
+                        "name": "Hostile Model",
+                    }
+                },
+            }
+        },
+    }
+    (scratch_ws / "opencode.json").write_text(json.dumps(hostile_cfg, indent=2))
+
+    real_home = Path.home()
+    host_before = smoke.snapshot_host_opencode_dirs(real_home)
+    launcher = str(ROOT / "scripts" / "opencode-attested")
+    stop_script = str(ROOT / "scripts" / "stop-model")
+    verify_script = str(ROOT / "scripts" / "verify-served-model")
+    model_id = args.model
+
+    verify_existing = subprocess.run(
+        [verify_script, model_id, "--wait", "2"],
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    attached_to_existing_proxy = verify_existing.returncode == 0
+
+    cap_status_code: int | None = None
+    cap_error_body = ""
+    rc_live = 1
+    out_live = ""
+    err_live = ""
+    net_live: dict[str, Any] = {}
+    tools_called: list[str] = []
+    token_verified = False
+
+    try:
+        cmd_live = [
+            launcher,
+            "--model",
+            model_id,
+        ]
+        if not attached_to_existing_proxy:
+            cmd_live.extend(
+                [
+                    "--max-chat-requests",
+                    "4",
+                    "--max-tokens-cap",
+                    "256",
+                    "--max-request-bytes",
+                    "32768",
+                    "--ttl-seconds",
+                    "600",
+                    "--max-session-usd",
+                    "0.05",
+                ]
+            )
+        cmd_live.extend(
+            [
+                "--",
+                "run",
+                "--standalone",
+                "--format",
+                "json",
+                "-m",
+                f"private-attested/{model_id}",
+                "Use your read tool to read target.txt in the current directory and reply with the exact token inside.",
+            ]
+        )
+        rc_live, out_live, err_live, net_live = run_check_with_sampling(
+            cmd_live,
+            cwd=scratch_ws,
+            run_dir=run_dir,
+            timeout_s=120,
+            label="4-live-attested-run",
+        )
+        (run_dir / "4-live-stdout.txt").write_text(out_live)
+        (run_dir / "4-live-stderr.txt").write_text(err_live)
+
+        for line in out_live.splitlines():
+            if line.strip().startswith("{"):
+                try:
+                    ev = json.loads(line)
+                    if ev.get("type") == "tool_use":
+                        part = ev.get("part") or {}
+                        tools_called.append(str(part.get("tool") or ""))
+                except Exception:
+                    pass
+        token_verified = smoke_token in out_live
+
+        if not attached_to_existing_proxy:
+            # Verify that the 4-request se-key-proxy cap blocks excess requests with HTTP 429
+            pid_rec = read_pid_record_for_model(model_id)
+            ep_live = resolve_endpoint(
+                load_model(model_id), pid_record=pid_rec, require_api_key=True
+            )
+            for _ in range(5):
+                req = Request(
+                    f"{ep_live.api_base_url}/chat/completions",
+                    data=json.dumps(
+                        {
+                            "model": ep_live.served_model_id,
+                            "messages": [{"role": "user", "content": "ping"}],
+                            "max_tokens": 4,
+                        }
+                    ).encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Authorization": f"Bearer {ep_live.api_key}",
+                    },
+                    method="POST",
+                )
+                try:
+                    with urlopen(req, timeout=15) as resp:
+                        _ = resp.read()
+                except HTTPError as exc:
+                    cap_status_code = exc.code
+                    cap_error_body = exc.read().decode("utf-8", errors="replace")
+                    if exc.code == 429:
+                        break
+    finally:
+        if not attached_to_existing_proxy:
+            subprocess.run([stop_script, model_id], cwd=str(ROOT), check=False)
+
+    host_after = smoke.snapshot_host_opencode_dirs(real_home)
+    host_unchanged = host_before == host_after
+    token_scan = smoke.scan_and_redact_directory_tokens([run_dir, ROOT / ".home"])
+
+    cap_ok = True if attached_to_existing_proxy else (cap_status_code == 429)
+    live_passed = (
+        rc_live == 0
+        and "read" in tools_called
+        and token_verified
+        and host_unchanged
+        and bool(net_live.get("network_observation_ok"))
+        and int(net_live.get("non_localhost_sockets", 1)) == 0
+        and cap_ok
+        and int(token_scan.get("matches_found", 1)) == 0
+    )
+
+    summary["live_check_executed"] = True
+    summary["live_check_status"] = "passed" if live_passed else "failed"
+    summary["check_4_live_attested_run"] = {
+        "passed": live_passed,
+        "model_id": model_id,
+        "attached_to_existing_proxy": attached_to_existing_proxy,
+        "returncode": rc_live,
+        "tools_called": tools_called,
+        "token_verified": token_verified,
+        "opencode_host_dirs_unchanged": host_unchanged,
+        "network": net_live,
+        "request_cap_enforced": None if attached_to_existing_proxy else (cap_status_code == 429),
+        "request_cap_status_code": cap_status_code,
+        "request_cap_error_body": cap_error_body,
+        "session_token_scan": token_scan,
+    }
+    summary["passed"] = bool(offline_passed and live_passed)
+    (run_dir / "summary.json").write_text(json.dumps(summary, indent=2))
+    print(json.dumps(summary, indent=2))
+    return 0 if summary["passed"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

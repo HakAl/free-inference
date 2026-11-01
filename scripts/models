@@ -1,0 +1,53 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
+if VENV_PYTHON.exists() and Path(sys.executable) != VENV_PYTHON:
+    os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), __file__, *sys.argv[1:]])
+
+sys.path.insert(0, str(ROOT))
+
+from local_assist.registry import RegistryError, load_models, resolve_endpoint
+
+
+def main() -> int:
+    try:
+        models = load_models()
+    except RegistryError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    if not models:
+        print("No models registered.")
+        return 0
+
+    for model in models:
+        quant = model.get("quantization") or {}
+        bits = quant.get("bits")
+        group_size = quant.get("group_size")
+        quant_label = f"{bits}-bit" if bits is not None else "unknown-quant"
+        if group_size is not None:
+            quant_label += f"/g{group_size}"
+
+        endpoint = resolve_endpoint(model, require_api_key=False)
+        print(
+            f"{model.get('id')}  "
+            f"status={model.get('status')}  "
+            f"runtime={endpoint.runtime}  "
+            f"repo={model.get('repo')}  "
+            f"quant={quant_label}  "
+            f"control=rung{endpoint.data_control_rung}:{endpoint.trust_tier}  "
+            f"policy={endpoint.usage_policy}  "
+            f"endpoint={endpoint.api_base_url}  "
+            f"disk_gb={model.get('disk_gb_estimate')}"
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

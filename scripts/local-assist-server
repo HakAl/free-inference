@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+export LOCAL_ASSIST_WORKSPACE_ROOT="${LOCAL_ASSIST_WORKSPACE_ROOT:-$(pwd -P)}"
+
+cd "$(dirname "$0")/.."
+
+if [ -x ".venv/bin/python" ]; then
+  exec .venv/bin/python -m local_assist.server "$@"
+fi
+
+exec python3 -m local_assist.server "$@"
+

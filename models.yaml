@@ -1,0 +1,572 @@
+# Model registry. See docs/plan.md "Model Registry" for the schema.
+# This file is the source of truth for model lifecycle and endpoint resolution.
+#
+# Status progression: candidate → reviewed → downloaded|attested → sanity_checked
+#                   → runnable → evaluated → default (or archived at any stage)
+#
+# Replace the example entry below with models reviewed for your environment.
+
+models:
+  - id: qwen3-1.7b-mlx-4bit
+    status: candidate
+    repo: Qwen/Qwen3-1.7B-MLX-4bit
+    upstream: Qwen/Qwen3-1.7B
+    converter: Qwen
+    conversion_runtime_version: null
+    runtime: mlx-lm
+    serve_command: mlx_lm.server --model "Qwen/Qwen3-1.7B-MLX-4bit" --chat-template "$(cat evals/chat_templates/qwen3.jinja)" --chat-template-args '{"enable_thinking":false}'
+    chat_template_file: evals/chat_templates/qwen3.jinja
+    chat_template_args:
+      enable_thinking: false
+    promptfoo_provider:
+      id: openai:chat:Qwen/Qwen3-1.7B-MLX-4bit
+      apiBaseUrl: http://127.0.0.1:8080/v1
+      apiKey: none
+      apiKeyEnvar: null
+    capabilities:
+      tool_calling: true
+    routing:
+      private_local: blocked
+    remote_trust: null
+    license: apache-2.0
+    release_date: null
+    verified_date: 2026-10-29
+    params_total: 1.7B
+    params_active: 1.7B
+    quantization:
+      bits: 4
+      group_size: null
+      tool: mlx-lm
+      tool_version: null
+    disk_gb_estimate: 0.914
+    ram_gb_estimate: null
+    context_window: 32768
+    modalities:
+      - text
+    chat_template:
+      source: evals/chat_templates/qwen3.jinja
+      roles_supported:
+        - system
+        - user
+        - assistant
+        - tool
+    source_links:
+      - https://huggingface.co/Qwen/Qwen3-1.7B-MLX-4bit
+      - https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/SERVER.md
+    fit_notes: |
+      Small enough to use as a Milestone 0 smoke target. The chat template
+      shipped inside the MLX conversion is a truncated copy that omits the
+      enable_thinking branch; override with the canonical upstream Qwen3
+      template at evals/chat_templates/qwen3.jinja so enable_thinking=false
+      actually works and the model does not waste budget on reasoning.
+    review_notes: |
+      Milestone 0 smoke target (kept at status: candidate intentionally as the
+      lightweight smoke fixture rather than a promoted everyday model).
+      Provenance verified 2026-05-14 in prior local lab; evaluated in this fork on
+      2026-10-29 across sanity (1/1), automated v1 (3/10, failing 7 practical coding
+      and long-context cells as expected for a 1.7B smoke model), and tools (4/4,
+      with buffered streaming tool_call_chunks=1 in tools_timing.json).
+    eval_summary: "2026-10-29 on mlx-lm 0.31.3: sanity 1/1 (runs/2026-10-29-214211-sanity-qwen3-1.7b-mlx-4bit-b671b350-7FBs62, text TTFT 0.2283s); automated v1 3/10 (runs/2026-10-29-214214-v1-qwen3-1.7b-mlx-4bit-b671b350-A3nVFB); tools 4/4 (runs/2026-10-29-214302-tools-qwen3-1.7b-mlx-4bit-b671b350-HV4k21, text TTFT 0.0966s, buffered complete tool-call TTFT 0.2792s, tool_call_chunks=1)."
+
+  - id: qwen3-30b-a3b-2507-mlx-4bit
+    status: runnable
+    repo: mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit
+    upstream: Qwen/Qwen3-30B-A3B-Instruct-2507
+    converter: mlx-community
+    conversion_runtime_version: mlx-lm 0.26.3
+    runtime: mlx-lm
+    serve_command: null
+    promptfoo_provider:
+      id: openai:chat:mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit
+      apiBaseUrl: http://127.0.0.1:8080/v1
+      apiKey: none
+      apiKeyEnvar: null
+    capabilities:
+      tool_calling: true
+    routing:
+      private_local: cleared
+    remote_trust: null
+    license: apache-2.0
+    release_date: null
+    verified_date: 2026-05-14
+    params_total: 30.5B
+    params_active: 3.3B
+    quantization:
+      bits: 4
+      group_size: null
+      tool: mlx-lm
+      tool_version: 0.26.3
+    disk_gb_estimate: 17.2
+    ram_gb_estimate: null
+    context_window: 262144
+    modalities:
+      - text
+    chat_template:
+      source: upstream tokenizer_config.json
+      roles_supported:
+        - system
+        - user
+        - assistant
+        - tool
+    source_links:
+      - https://huggingface.co/mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit
+      - https://huggingface.co/Qwen/Qwen3-30B-A3B-Instruct-2507
+    fit_notes: |
+      17.2 GB 4-bit MLX MoE with 30.5B total and 3.3B active parameters;
+      fits the 48 GB Mac budget comfortably. mlx-lm 0.31.3 auto-detects
+      the json_tools parser (<tool_call>...</tool_call>).
+    review_notes: |
+      Provenance verified 2026-05-14 in prior local lab (DefenseSector/local-llm,
+      where it received a 4.6 avg human rubric score on v1; human rubric not
+      re-scored in this fork). Evaluated in this fork on 2026-10-29 across sanity
+      (1/1), automated v1 assertions (10/10), tools (4/4, buffered streaming
+      tool_call_chunks=1), and locked-down opencode v2.0.32 standalone smoke test
+      (passed: true in 5.9577s on 2026-10-30 rerun 181950-...-eq188l2v, 5.5622s on
+      180432-...-5qc2x4ag, 7.3751s on 180258-...-yk54otik, and 6.3981s on 2026-10-29
+      run 214928-...-7qdjm2sc after two initial harness working-directory failures on
+      214530-...-b2_fkcxj and 214618-...-jza2dd7k fixed by initializing a local git
+      root and setting PWD in the isolated env). Only local model passing all five
+      Rung 1 gates; cleared as the primary backend for private-local.
+    eval_summary: "2026-10-29 on mlx-lm 0.31.3: sanity 1/1 (runs/2026-10-29-214329-sanity-qwen3-30b-a3b-2507-mlx-4bit-2aee4a3e-mS7YQ1, text TTFT 0.1127s); automated v1 10/10 (runs/2026-10-29-214337-v1-qwen3-30b-a3b-2507-mlx-4bit-2aee4a3e-WVXFms, text TTFT 0.2162s); tools 4/4 (runs/2026-10-29-214522-tools-qwen3-30b-a3b-2507-mlx-4bit-2aee4a3e-YoRV2d, text TTFT 0.1188s, buffered complete tool-call TTFT 0.6442s, tool_call_chunks=1); opencode-smoke PASS in 5.9577s (runs/2026-10-30-181950-opencode-smoke-qwen3-30b-a3b-2507-mlx-4bit-2aee4a3e-eq188l2v; also passed 180432-...-5qc2x4ag, 180258-...-yk54otik, and 2026-10-29 214928-...-7qdjm2sc, after harness fixes following 214530-...-b2_fkcxj and 214618-...-jza2dd7k)."
+
+  - id: qwen3-coder-30b-a3b-mlx-4bit
+    status: runnable
+    repo: mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit
+    upstream: Qwen/Qwen3-Coder-30B-A3B-Instruct
+    converter: mlx-community
+    conversion_runtime_version: mlx-lm 0.26.3
+    runtime: mlx-lm
+    serve_command: null
+    promptfoo_provider:
+      id: openai:chat:mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit
+      apiBaseUrl: http://127.0.0.1:8080/v1
+      apiKey: none
+      apiKeyEnvar: null
+    capabilities:
+      tool_calling: true
+    routing:
+      private_local: blocked
+    remote_trust: null
+    license: apache-2.0
+    release_date: null
+    verified_date: 2026-05-14
+    params_total: 30.5B
+    params_active: 3.3B
+    quantization:
+      bits: 4
+      group_size: null
+      tool: mlx-lm
+      tool_version: 0.26.3
+    disk_gb_estimate: 17.2
+    ram_gb_estimate: null
+    context_window: 262144
+    modalities:
+      - text
+    chat_template:
+      source: upstream tokenizer_config.json
+      roles_supported:
+        - system
+        - user
+        - assistant
+        - tool
+    source_links:
+      - https://huggingface.co/mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit
+      - https://huggingface.co/Qwen/Qwen3-Coder-30B-A3B-Instruct
+    fit_notes: |
+      17.2 GB 4-bit MLX MoE with 30.5B total and 3.3B active parameters.
+      mlx-lm 0.31.3 auto-detects the qwen3_coder XML tool parser
+      (<tool_call>\n<function=...).
+    review_notes: |
+      Provenance verified 2026-05-14 in prior local lab. Evaluated in this fork on
+      2026-10-29 across sanity (1/1), automated v1 (6/10, failing bug-fix-python-batching,
+      feature-plan-model-registry-status, structured-json-model-summary, and
+      patch-like-edit-gitignore), tools (4/4, buffered streaming tool_call_chunks=1), and
+      locked-down opencode v2.0.32 standalone smoke test (passed: true in 6.5498s on
+      2026-10-30 rerun 180443-...-1grk884d and 4.5953s on 2026-10-29 run 215133-...-ffbxwx0y).
+      Blocked from serving as primary private-local default because automated v1
+      scored 6/10 (< 10/10 gate).
+    eval_summary: "2026-10-29 on mlx-lm 0.31.3: sanity 1/1 (runs/2026-10-29-214951-sanity-qwen3-coder-30b-a3b-mlx-4bit-d16dd7c9-mjNuRW, text TTFT 0.1042s); automated v1 6/10 (runs/2026-10-29-214958-v1-qwen3-coder-30b-a3b-mlx-4bit-d16dd7c9-nzzpBR); tools 4/4 (runs/2026-10-29-215125-tools-qwen3-coder-30b-a3b-mlx-4bit-d16dd7c9-jdQ6iu, text TTFT 0.1026s, buffered complete tool-call TTFT 0.7648s, tool_call_chunks=1); opencode-smoke PASS in 6.5498s (runs/2026-10-30-180443-opencode-smoke-qwen3-coder-30b-a3b-mlx-4bit-d16dd7c9-1grk884d; also passed 2026-10-29 215133-...-ffbxwx0y in 4.5953s)."
+
+  - id: gemma-4-26b-a4b-it-optiq-mlx-4bit
+    status: runnable
+    repo: mlx-community/gemma-4-26B-A4B-it-OptiQ-4bit
+    upstream: google/gemma-4-26B-A4B-it
+    converter: mlx-optiq
+    conversion_runtime_version: null
+    runtime: mlx-lm
+    serve_command: null
+    chat_template_args:
+      enable_thinking: false
+    promptfoo_provider:
+      id: openai:chat:mlx-community/gemma-4-26B-A4B-it-OptiQ-4bit
+      apiBaseUrl: http://127.0.0.1:8080/v1
+      apiKey: none
+      apiKeyEnvar: null
+    capabilities:
+      tool_calling: true
+    routing:
+      private_local: blocked
+    remote_trust: null
+    license: apache-2.0
+    release_date: 2026-04-02
+    verified_date: 2026-05-23
+    params_total: 26B
+    params_active: ~4B
+    quantization:
+      bits: 4
+      group_size: 64
+      tool: mlx-optiq
+      tool_version: null
+    disk_gb_estimate: 16.4
+    ram_gb_estimate: 21
+    context_window: 262144
+    modalities:
+      - text
+    chat_template:
+      source: embedded
+      roles_supported:
+        - system
+        - user
+        - assistant
+        - tool
+    source_links:
+      - https://huggingface.co/mlx-community/gemma-4-26B-A4B-it-OptiQ-4bit
+      - https://huggingface.co/google/gemma-4-26B-A4B-it
+    fit_notes: |
+      16.4 GB 26B-A4B MoE on disk; observed 20-21 GB peak RAM in practice during
+      v1 and tools evaluation (16.4 GB weights + KV cache and Metal buffers).
+      mlx-lm 0.31.3 auto-detects the gemma4 tool parser (<|tool_call>...<tool_call|>).
+    review_notes: |
+      Provenance verified 2026-05-23 in prior local lab. Evaluated in this fork on
+      2026-10-29 across sanity (1/1), automated v1 (9/10, failing patch-like-edit-gitignore
+      due to omitting 'diff --git' header line), and tools (4/4, buffered streaming
+      tool_call_chunks=1; note: cell 3 emitted an empty reasoning channel prefixed as
+      'Thinking:' by promptfoo despite enable_thinking=false). Peak RAM observed by
+      operator during v1/tools run was 20-21 GB (ram_gb_estimate updated from 16 to 21).
+    eval_summary: "2026-10-29 on mlx-lm 0.31.3: sanity 1/1 (runs/2026-10-29-215151-sanity-gemma-4-26b-a4b-it-optiq-mlx-4bit-83c851c7-qteKWs, text TTFT 0.1945s); automated v1 9/10 (runs/2026-10-29-215158-v1-gemma-4-26b-a4b-it-optiq-mlx-4bit-83c851c7-dLH6Uo); tools 4/4 (runs/2026-10-29-215344-tools-gemma-4-26b-a4b-it-optiq-mlx-4bit-83c851c7-BGkGfr, text TTFT 0.1920s, buffered complete tool-call TTFT 0.7470s, tool_call_chunks=1)."
+
+  - id: tinfoil-gpt-oss-120b
+    status: candidate
+    repo: gpt-oss-120b
+    upstream: openai/gpt-oss-120b
+    converter: tinfoilsh
+    conversion_runtime_version: vllm
+    runtime: proxy
+    serve_command: "./bin/tinfoil-proxy --bind {host} --port {port} -e inference.tinfoil.sh --repo tinfoilsh/confidential-model-router"
+    promptfoo_provider:
+      id: openai:chat:gpt-oss-120b
+      apiBaseUrl: http://127.0.0.1:8081/v1
+      apiKeyKeychainService: free-inference.tinfoil
+      config:
+        showThinking: false
+        passthrough:
+          include_reasoning: false
+          reasoning_effort: low
+    capabilities:
+      tool_calling: true
+    routing:
+      private_local: blocked
+      private_attested: blocked
+    remote_trust:
+      tier: enclave_runtime_attested
+      attestation_method: tinfoil-proxy-sigstore
+      weights_hash: null
+      weights_source: null
+      provider_manifest_weights_hash: dmverity:sha256:db5daddec41a3be3b51d1f4d009fb0e9b1243c2765e2bc5121acac79ab070a72
+      provider_manifest_weights_source: openai/gpt-oss-120b@b5c939de8f754692c1647ca79fbf85e8c1e70f8a
+      usage_policy: provider_terms_apply
+      jurisdiction: US
+      pricing_per_m_tokens:
+        input: 0.15
+        output: 0.60
+    license: apache-2.0
+    release_date: null
+    verified_date: 2026-10-31
+    params_total: 120B
+    params_active: 5.1B
+    quantization:
+      bits: 4
+      group_size: null
+      tool: mxfp4
+      tool_version: null
+    disk_gb_estimate: 195.8
+    ram_gb_estimate: null
+    context_window: 131072
+    modalities:
+      - text
+    chat_template:
+      source: harmony
+      roles_supported:
+        - system
+        - user
+        - assistant
+        - tool
+    source_links:
+      - https://github.com/tinfoilsh/confidential-gpt-oss-120b
+      - https://github.com/tinfoilsh/confidential-model-router
+      - https://huggingface.co/openai/gpt-oss-120b
+    fit_notes: |
+      Served via Tinfoil two-hop enclave architecture (AMD SEV-SNP router enclave
+      inference.tinfoil.sh + Intel TDX H200 model enclaves gpt-oss-120b-inf12-{0,1,2}).
+      Kept at Rung 3 (enclave_runtime_attested) with weights_hash: null because the
+      195.8 GB modelwrap dm-verity image (recorded in provider_manifest_weights_hash)
+      has not been independently rebuilt via modelwrap --verify on this host.
+      usage_policy is set to provider_terms_apply (router source safeguards/capture.go
+      exempts Bearer API keys from the safeguards classifier, while Tinfoil terms apply).
+    review_notes: |
+      Attested and evaluated on 2026-10-31 via tinfoil-proxy v0.2.9 + se-key-proxy
+      (see docs/attestations/2026-10-31-tinfoil-rung3-trial.md). Passed Phase 1
+      fail-closed attestation, unauthenticated 401 header-passthrough gate, and live
+      libproc PCB verification. Kept at status: candidate and blocked from backing
+      private-attested because automated v1 scored 8/10 (< 10/10 gate) and tools scored
+      3/4 (< 4/4 gate) when evaluated with include_reasoning=false and reasoning_effort=low.
+      Sanity Run 2 (mn7fj3) used sanity's 1 retry after adding include_reasoning=false
+      and reasoning_effort=low; v1 and tools each retain 1 unused retry at default/medium
+      reasoning effort. Zero session token leaks across all runs.
+    eval_summary: "2026-10-31 via tinfoil-proxy v0.2.9 + se-key-proxy (at reasoning_effort=low, include_reasoning=false): opencode-smoke PASS in 1.5413s (runs/2026-10-31-205800-opencode-smoke-tinfoil-gpt-oss-120b-0f58d616-p45y_7pp, 2248 tokens); sanity 1/1 on initial run (runs/2026-10-31-205809-sanity-tinfoil-gpt-oss-120b-0f58d616-CtpYud) and 1/1 on retry #1 (runs/2026-10-31-210509-sanity-tinfoil-gpt-oss-120b-0f58d616-mn7fj3, text TTFT 0.3628s); automated v1 8/10 (runs/2026-10-31-210518-v1-tinfoil-gpt-oss-120b-0f58d616-RMnqCX, text TTFT 0.5395s); tools 3/4 (runs/2026-10-31-210614-tools-tinfoil-gpt-oss-120b-0f58d616-yaXq8R, text TTFT 0.4004s, incremental tool-call TTFT 0.4404s, tool_call_chunks=11)."
+
+  - id: tinfoil-deepseek-v4-1-flash
+    status: active
+    repo: deepseek-v4-1-flash
+    upstream: deepseek-ai/DeepSeek-V4.1-Flash-1017
+    converter: tinfoilsh
+    conversion_runtime_version: vllm
+    runtime: proxy
+    serve_command: "./bin/tinfoil-proxy --bind {host} --port {port} -e inference.tinfoil.sh --repo tinfoilsh/confidential-model-router"
+    promptfoo_provider:
+      id: openai:chat:deepseek-v4-1-flash
+      apiBaseUrl: http://127.0.0.1:8081/v1
+      apiKeyKeychainService: free-inference.tinfoil
+      config:
+        showThinking: false
+        passthrough:
+          include_reasoning: false
+          chat_template_kwargs:
+            thinking: false
+    capabilities:
+      tool_calling: true
+    routing:
+      private_local: blocked
+      private_attested: cleared
+    remote_trust:
+      tier: enclave_runtime_attested
+      attestation_method: tinfoil-proxy-sigstore
+      weights_hash: null
+      weights_source: null
+      provider_manifest_weights_hash: dmverity:sha256:6c4a2b637f7f45d9e48d1bdc38c12e0454584f48d3759851f7ee4471cd90b2e7
+      provider_manifest_weights_source: deepseek-ai/DeepSeek-V4.1-Flash-1017@1bae0e1088993b9b82de08f59de5be5a34e42170
+      usage_policy: provider_terms_apply
+      jurisdiction: US
+      pricing_per_m_tokens:
+        input: 0.65
+        output: 1.45
+    license: mit
+    release_date: 2026-10-17
+    verified_date: 2026-10-31
+    params_total: null
+    params_active: null
+    quantization:
+      bits: 8
+      group_size: null
+      tool: fp8
+      tool_version: null
+    disk_gb_estimate: 510.3
+    ram_gb_estimate: null
+    context_window: 1048576
+    modalities:
+      - text
+      - image
+    chat_template:
+      source: deepseek_v41
+      roles_supported:
+        - system
+        - user
+        - assistant
+        - tool
+    source_links:
+      - https://github.com/tinfoilsh/confidential-deepseek-v4-1-flash
+      - https://github.com/tinfoilsh/confidential-model-router
+      - https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017
+    fit_notes: |
+      DeepSeek V4.1 Flash served inside Tinfoil's Intel TDX + AMD SEV-SNP B200/B300
+      enclaves (tinfoilsh/confidential-deepseek-v4-1-flash v0.0.10+b200/b300) with
+      --tool-call-parser deepseek_v41, --reasoning-parser deepseek_v41, and 1M context
+      window. Pricing verified on 2026-10-31: $0.65/1M input ($0.13 cached) and $1.45/1M
+      output.
+    review_notes: |
+      Attested and evaluated on 2026-10-31 via tinfoil-proxy v0.2.9 + se-key-proxy
+      (see docs/attestations/2026-10-31-tinfoil-rung3-trial.md). Passed sanity
+      (1/1), tools (4/4, including parallel-tool-calls-diff-check), and opencode-smoke
+      (PASS in 2.2122s), and scored 9/10 on automated v1 (missing only the diff --git
+      header on a valid POSIX unified diff in patch-like-edit-gitignore). Approved by
+      the operator on 2026-11-01 as status: active and routing.private_attested: cleared
+      following full-day production use in opencode-attested across parallel coding and
+      review sessions. Sanity Run 1 (UrDQRn) used chat_template_kwargs
+      thinking_mode=chat which hit max_tokens=60 inside <think>; Sanity Run 2 (iXVep2,
+      retry #1) switched to chat_template_kwargs.thinking=false (0 reasoning tokens),
+      and v1 and tools were run once (0 retries used) with thinking=false. Zero session
+      token leaks across all runs.
+    eval_summary: "2026-10-31 via tinfoil-proxy v0.2.9 + se-key-proxy (chat_template_kwargs.thinking=false, include_reasoning=false): sanity 1/1 on retry #1 (runs/2026-10-31-213403-sanity-tinfoil-deepseek-v4-1-flash-b41fc330-iXVep2, 41 suite tokens; Run 1 runs/2026-10-31-213111-sanity-tinfoil-deepseek-v4-1-flash-b41fc330-UrDQRn hit max_tokens=60 under thinking_mode=chat); automated v1 9/10 in 14s (runs/2026-10-31-213433-v1-tinfoil-deepseek-v4-1-flash-b41fc330-HlnCge, text TTFT 0.2750s, 26483 tokens); tools 4/4 in 4s (runs/2026-10-31-213459-tools-tinfoil-deepseek-v4-1-flash-b41fc330-0QR0vt, text TTFT 0.5970s, incremental tool-call TTFT 0.4989s, tool_call_chunks=4, 2579 tokens); opencode-smoke PASS in 2.2122s (runs/2026-10-31-213515-opencode-smoke-tinfoil-deepseek-v4-1-flash-b41fc330-vf7313bc, 2744 tokens)."
+
+  - id: tinfoil-glm-5-3
+    status: candidate
+    repo: glm-5-3
+    upstream: Inferact/GLM-5.3-NVFP4
+    converter: tinfoilsh
+    conversion_runtime_version: vllm
+    runtime: proxy
+    serve_command: "./bin/tinfoil-proxy --bind {host} --port {port} -e inference.tinfoil.sh --repo tinfoilsh/confidential-model-router"
+    promptfoo_provider:
+      id: openai:chat:glm-5-3
+      apiBaseUrl: http://127.0.0.1:8081/v1
+      apiKeyKeychainService: free-inference.tinfoil
+      config:
+        showThinking: false
+        passthrough:
+          include_reasoning: false
+          reasoning_effort: low
+          chat_template_kwargs:
+            reasoning_effort: low
+    capabilities:
+      tool_calling: true
+    routing:
+      private_local: blocked
+      private_attested: blocked
+    remote_trust:
+      tier: enclave_runtime_attested
+      attestation_method: tinfoil-proxy-sigstore
+      weights_hash: null
+      weights_source: null
+      provider_manifest_weights_hash: dmverity:sha256:50f49b63a8139cf970d93e81978c7c21ab42e96b84e80c123f496ae33cb768a8
+      provider_manifest_weights_source: Inferact/GLM-5.3-NVFP4@ce67b36f3669192b5bb233819f0fda6c8a9837f8
+      usage_policy: provider_terms_apply
+      jurisdiction: US
+      pricing_per_m_tokens:
+        input: 1.80
+        output: 5.75
+    license: mit
+    release_date: null
+    verified_date: 2026-10-31
+    params_total: null
+    params_active: null
+    quantization:
+      bits: 4
+      group_size: null
+      tool: nvfp4
+      tool_version: null
+    disk_gb_estimate: 464.9
+    ram_gb_estimate: null
+    context_window: 1048576
+    modalities:
+      - text
+    chat_template:
+      source: glm45
+      roles_supported:
+        - system
+        - user
+        - assistant
+        - tool
+    source_links:
+      - https://github.com/tinfoilsh/confidential-glm5-3-nvfp4
+      - https://github.com/tinfoilsh/confidential-model-router
+      - https://huggingface.co/Inferact/GLM-5.3-NVFP4
+    fit_notes: |
+      GLM 5.3 NVFP4 served inside Tinfoil's Intel TDX / Blackwell enclaves
+      (tinfoilsh/confidential-glm5-3-nvfp4 v0.0.10) with --tool-call-parser glm47,
+      --reasoning-parser glm45, and 1M context window. Pricing verified on 2026-10-31:
+      $1.80/1M input ($0.45 cached) and $5.75/1M output.
+    review_notes: |
+      Attested and evaluated on 2026-10-31 via tinfoil-proxy v0.2.9 + se-key-proxy
+      (see docs/attestations/2026-10-31-tinfoil-rung3-trial.md). Passed sanity
+      (1/1 in 0s, text TTFT 0.2813s), tools (4/4 in 14s, including parallel-tool-calls-diff-check,
+      tool TTFT 0.2805s), and opencode-smoke (PASS in 1.4393s), and scored 8/10 on
+      automated v1 in 23s (text TTFT 0.3519s). The two v1 assertion misses were:
+      (1) shell-tool-reasoning-safe-commands, where the model's note "No destructive
+      commands included: no rm, git checkout --, git reset..." tripped the negative
+      substring regex /checkout\s+--/i, and (2) patch-like-edit-gitignore, where it
+      emitted a POSIX unified diff (--- a/.gitignore / +++ b/.gitignore) without a
+      diff --git header. Kept at status: candidate under the strict 10/10 automated v1
+      gate. Zero retries used across all suites; zero session token leaks across all runs.
+    eval_summary: "2026-10-31 via tinfoil-proxy v0.2.9 + se-key-proxy (reasoning_effort=low, include_reasoning=false): sanity 1/1 (runs/2026-10-31-214444-sanity-tinfoil-glm-5-3-6b0b2ccc-JCgzau, text TTFT 0.2813s, 90 tokens total); automated v1 8/10 in 23s (runs/2026-10-31-214455-v1-tinfoil-glm-5-3-6b0b2ccc-fQ0wwz, text TTFT 0.3519s, 26365 tokens); tools 4/4 in 14s (runs/2026-10-31-214528-tools-tinfoil-glm-5-3-6b0b2ccc-tFkinn, text TTFT 0.2864s, incremental tool-call TTFT 0.2805s, tool_call_chunks=2, 1857 tokens); opencode-smoke PASS in 1.4393s (runs/2026-10-31-214553-opencode-smoke-tinfoil-glm-5-3-6b0b2ccc-tdpkgjl1, 1685 tokens)."
+
+  - id: tinfoil-kimi-k3
+    status: candidate
+    repo: kimi-k3
+    upstream: moonshotai/Kimi-K3
+    converter: tinfoilsh
+    conversion_runtime_version: vllm
+    runtime: proxy
+    serve_command: "./bin/tinfoil-proxy --bind {host} --port {port} -e inference.tinfoil.sh --repo tinfoilsh/confidential-model-router"
+    promptfoo_provider:
+      id: openai:chat:kimi-k3
+      apiBaseUrl: http://127.0.0.1:8081/v1
+      apiKeyKeychainService: free-inference.tinfoil
+      config:
+        showThinking: false
+        passthrough:
+          include_reasoning: false
+          chat_template_kwargs:
+            thinking: false
+    capabilities:
+      tool_calling: true
+    routing:
+      private_local: blocked
+      private_attested: blocked
+    remote_trust:
+      tier: enclave_runtime_attested
+      attestation_method: tinfoil-proxy-sigstore
+      weights_hash: null
+      weights_source: null
+      provider_manifest_weights_hash: dmverity:sha256:58d5e74ba6c814d4cc4511df093ede786bfbc95f766eee7a96379687ce455792
+      provider_manifest_weights_source: moonshotai/Kimi-K3@a590ce090cb049c93a33dfe8c208ec652aa20503
+      usage_policy: provider_terms_apply
+      jurisdiction: US
+      pricing_per_m_tokens:
+        input: 4.00
+        output: 20.00
+    license: mit
+    release_date: null
+    verified_date: 2026-10-31
+    params_total: null
+    params_active: null
+    quantization:
+      bits: 8
+      group_size: null
+      tool: fp8
+      tool_version: null
+    disk_gb_estimate: 1561.0
+    ram_gb_estimate: null
+    context_window: 262144
+    modalities:
+      - text
+      - image
+    chat_template:
+      source: kimi_k3
+      roles_supported:
+        - system
+        - user
+        - assistant
+        - tool
+    source_links:
+      - https://github.com/tinfoilsh/confidential-kimi-k3
+      - https://github.com/tinfoilsh/confidential-model-router
+      - https://huggingface.co/moonshotai/Kimi-K3
+    fit_notes: |
+      Kimi K3 served inside Tinfoil's Intel TDX 8x GPU enclaves
+      (tinfoilsh/confidential-kimi-k3 v0.0.6) with --tool-call-parser kimi_k3,
+      --reasoning-parser kimi_k3, dspark speculative decoding, and 262k context
+      window. Pricing verified on 2026-10-31: $4.00/1M input ($0.80 cached) and
+      $20.00/1M output.
+    review_notes: |
+      Attested and evaluated on 2026-10-31 via tinfoil-proxy v0.2.9 + se-key-proxy
+      (see docs/attestations/2026-10-31-tinfoil-rung3-trial.md). Passed sanity
+      (1/1 in 1s, text TTFT 0.3661s), tools (4/4 in 5s, including parallel-tool-calls-diff-check,
+      tool TTFT 0.9319s), and opencode-smoke (PASS in 2.9050s), and scored 9/10 on
+      automated v1 in 35s (text TTFT 0.3388s), missing only the diff --git header on
+      patch-like-edit-gitignore (emitted a POSIX unified diff --- a/.gitignore / +++ b/.gitignore).
+      Kept at status: candidate under the strict 10/10 automated v1 gate. Zero retries
+      used across all suites; zero session token leaks across all runs.
+    eval_summary: "2026-10-31 via tinfoil-proxy v0.2.9 + se-key-proxy (chat_template_kwargs.thinking=false, include_reasoning=false): sanity 1/1 (runs/2026-10-31-215051-sanity-tinfoil-kimi-k3-65612a00-4kshda, text TTFT 0.3661s, 121 tokens total); automated v1 9/10 in 35s (runs/2026-10-31-215102-v1-tinfoil-kimi-k3-65612a00-D92nzB, text TTFT 0.3388s, 25809 tokens); tools 4/4 in 5s (runs/2026-10-31-215208-tools-tinfoil-kimi-k3-65612a00-jnpGS4, text TTFT 0.4203s, buffered tool-call TTFT 0.9319s, tool_call_chunks=1, 1649 tokens); opencode-smoke PASS in 2.9050s (runs/2026-10-31-215302-opencode-smoke-tinfoil-kimi-k3-65612a00-x86emkai, 1824 tokens)."
+
+
+

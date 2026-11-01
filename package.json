@@ -1,0 +1,11 @@
+{
+  "name": "free-inference",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "promptfoo": "promptfoo"
+  },
+  "devDependencies": {
+    "promptfoo": "0.121.11"
+  }
+}
