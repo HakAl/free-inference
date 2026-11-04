@@ -7,16 +7,23 @@ import json
 import os
 import signal
 import sys
+import time
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from local_assist.registry import (
     _legacy_unhashed_pid_file,
+    get_process_command,
+    get_process_lstart,
     legacy_pid_file,
     list_pid_records,
     pid_file_for_model,
+    pid_is_alive,
+    pid_is_zombie,
+    pid_matches_record,
     session_token_file_for_model,
 )
 
@@ -36,17 +43,112 @@ def _pid_lock(runs_dir: Path):
             fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
 
 
-def _kill_pid(pid: Any, label: str, stopped_pids: set[int]) -> None:
-    if not isinstance(pid, int) or pid <= 0:
-        return
-    if pid in stopped_pids:
-        return
-    stopped_pids.add(pid)
+def _terminate_verified_pid(pid: int, expected_lstart: str | None) -> bool:
     try:
         os.kill(pid, signal.SIGTERM)
-        print(f"Stopped server pid {pid} ({label}).")
     except ProcessLookupError:
+        return True
+    except PermissionError:
+        print(f"Permission denied when signaling pid {pid}.", file=sys.stderr)
+        return False
+    for _ in range(50):
+        if not pid_is_alive(pid) or pid_is_zombie(pid):
+            return True
+        time.sleep(0.1)
+    if not pid_is_alive(pid) or pid_is_zombie(pid):
+        return True
+
+    if expected_lstart is not None:
+        actual_lstart = get_process_lstart(pid)
+        if actual_lstart is None:
+            if not pid_is_alive(pid) or pid_is_zombie(pid):
+                return True
+            print(
+                f"Refusing to escalate SIGKILL to live pid {pid}: could not verify process start time (lstart) via ps.",
+                file=sys.stderr,
+            )
+            return False
+        if actual_lstart != expected_lstart.strip():
+            # Original process exited and PID was reused during the SIGTERM wait window
+            return True
+
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        print(f"Permission denied when escalating SIGKILL to pid {pid}.", file=sys.stderr)
+        return False
+
+    for _ in range(20):
+        if not pid_is_alive(pid) or pid_is_zombie(pid):
+            return True
+        time.sleep(0.05)
+    if not pid_is_alive(pid) or pid_is_zombie(pid):
+        return True
+    if expected_lstart is not None:
+        post_lstart = get_process_lstart(pid)
+        if post_lstart is not None and post_lstart != expected_lstart.strip():
+            return True
+    print(f"Process pid {pid} remained alive after SIGKILL.", file=sys.stderr)
+    return False
+
+
+def _kill_pid(
+    pid: Any,
+    expected_lstart: Any,
+    label: str,
+    stopped_pids: set[int],
+    *,
+    force_legacy: bool = False,
+) -> bool:
+    if not isinstance(pid, int) or pid <= 1:
+        return True
+    if pid in stopped_pids:
+        return True
+    if not pid_is_alive(pid):
+        stopped_pids.add(pid)
         print(f"Server pid {pid} ({label}) was not running.")
+        return True
+
+    if not isinstance(expected_lstart, str) or not expected_lstart.strip():
+        if not force_legacy:
+            cmd_str = get_process_command(pid) or "<unknown>"
+            print(
+                f"Refusing to signal live pid {pid} ({label}, command: {cmd_str}) without pid_lstart verification; "
+                "re-run with --force-legacy to force stop or --discard-legacy to remove the record without signaling.",
+                file=sys.stderr,
+            )
+            return False
+        if not _terminate_verified_pid(pid, None):
+            return False
+        stopped_pids.add(pid)
+        print(f"Stopped server pid {pid} ({label}).")
+        return True
+
+    clean_expected = expected_lstart.strip()
+    actual_lstart = get_process_lstart(pid)
+    if actual_lstart is None:
+        if not pid_is_alive(pid):
+            stopped_pids.add(pid)
+            print(f"Server pid {pid} ({label}) was not running.")
+            return True
+        print(
+            f"Refusing to signal live pid {pid} ({label}): could not read process start time (lstart) via ps.",
+            file=sys.stderr,
+        )
+        return False
+
+    if actual_lstart != clean_expected:
+        stopped_pids.add(pid)
+        print(f"Skipping pid {pid} ({label}): process start time mismatch (PID reused by another process).")
+        return True
+
+    if not _terminate_verified_pid(pid, clean_expected):
+        return False
+    stopped_pids.add(pid)
+    print(f"Stopped server pid {pid} ({label}).")
+    return True
 
 
 def _safe_unlink_token_file(candidate: Path, runs_dir: Path) -> None:
@@ -63,35 +165,105 @@ def _safe_unlink_token_file(candidate: Path, runs_dir: Path) -> None:
         pass
 
 
-def _stop_record(record: dict, stopped_pids: set[int]) -> None:
+def _has_live_bound_pid(pid: Any, expected_lstart: Any) -> bool:
+    if not isinstance(pid, int) or pid <= 1:
+        return False
+    if not isinstance(expected_lstart, str) or not expected_lstart.strip():
+        return False
+    if not pid_is_alive(pid):
+        return False
+    actual_lstart = get_process_lstart(pid)
+    if actual_lstart is None:
+        return pid_is_alive(pid)
+    return actual_lstart == expected_lstart.strip()
+
+
+def _stop_record(
+    record: dict,
+    stopped_pids: set[int],
+    *,
+    force_legacy: bool = False,
+    discard_legacy: bool = False,
+) -> bool:
     pid = record.get("pid")
     upstream_pid = record.get("upstream_pid")
     model_id = record.get("model_id", "unknown")
 
-    token_file = record.get("session_token_file")
-    if isinstance(token_file, str) and token_file.strip():
-        _safe_unlink_token_file(Path(token_file), RUNS)
-    if isinstance(model_id, str) and model_id and model_id != "unknown":
-        _safe_unlink_token_file(session_token_file_for_model(model_id, RUNS), RUNS)
+    if discard_legacy:
+        for cand_pid, cand_lstart, cand_label in (
+            (pid, record.get("pid_lstart"), model_id),
+            (upstream_pid, record.get("upstream_pid_lstart"), f"{model_id}:upstream"),
+        ):
+            if _has_live_bound_pid(cand_pid, cand_lstart):
+                print(
+                    f"Refusing --discard-legacy for {model_id}: record contains a live start-time-bound process "
+                    f"(pid={cand_pid}, {cand_label}); run './scripts/stop-model {model_id}' to stop verified processes.",
+                    file=sys.stderr,
+                )
+                return False
+        token_file = record.get("session_token_file")
+        if isinstance(token_file, str) and token_file.strip():
+            _safe_unlink_token_file(Path(token_file), RUNS)
+        if isinstance(model_id, str) and model_id and model_id != "unknown":
+            _safe_unlink_token_file(session_token_file_for_model(model_id, RUNS), RUNS)
+        print(f"Discarded legacy PID record for {model_id} without signaling.")
+        return True
 
+    ok = True
     if not isinstance(pid, int) and not isinstance(upstream_pid, int):
         if record.get("status") == "starting":
             print(f"Removed provisional starting PID record and session token for {model_id}.")
         else:
             print(f"PID file for {model_id} does not contain a valid pid.")
-        return
-    if isinstance(pid, int) and pid > 1:
-        _kill_pid(pid, model_id, stopped_pids)
-    if isinstance(upstream_pid, int) and upstream_pid > 1:
-        _kill_pid(upstream_pid, f"{model_id}:upstream", stopped_pids)
+    else:
+        if isinstance(pid, int) and pid > 1:
+            if not _kill_pid(
+                pid,
+                record.get("pid_lstart"),
+                model_id,
+                stopped_pids,
+                force_legacy=force_legacy,
+            ):
+                ok = False
+        if isinstance(upstream_pid, int) and upstream_pid > 1:
+            if not _kill_pid(
+                upstream_pid,
+                record.get("upstream_pid_lstart"),
+                f"{model_id}:upstream",
+                stopped_pids,
+                force_legacy=force_legacy,
+            ):
+                ok = False
+
+    if ok:
+        token_file = record.get("session_token_file")
+        if isinstance(token_file, str) and token_file.strip():
+            _safe_unlink_token_file(Path(token_file), RUNS)
+        if isinstance(model_id, str) and model_id and model_id != "unknown":
+            _safe_unlink_token_file(session_token_file_for_model(model_id, RUNS), RUNS)
+    return ok
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) > 2:
-        print("usage: scripts/stop-model [model-id | --all]", file=sys.stderr)
+    force_legacy = False
+    discard_legacy = False
+    pos_args: list[str] = []
+    for arg in argv[1:]:
+        if arg == "--force-legacy":
+            force_legacy = True
+        elif arg == "--discard-legacy":
+            discard_legacy = True
+        else:
+            pos_args.append(arg)
+
+    if len(pos_args) > 1 or (force_legacy and discard_legacy):
+        print(
+            "usage: scripts/stop-model [--force-legacy | --discard-legacy] [model-id | --all]",
+            file=sys.stderr,
+        )
         return 2
 
-    target = argv[1] if len(argv) == 2 else None
+    target = pos_args[0] if pos_args else None
     default_pid = legacy_pid_file(RUNS)
     stopped_pids: set[int] = set()
 
@@ -101,13 +273,22 @@ def main(argv: list[str]) -> int:
             if not records:
                 print("No active server PID file found.")
                 return 0
+            all_ok = True
             for path, record in records:
-                _stop_record(record, stopped_pids)
-                path.unlink(missing_ok=True)
-            return 0
+                if _stop_record(
+                    record,
+                    stopped_pids,
+                    force_legacy=force_legacy,
+                    discard_legacy=discard_legacy,
+                ):
+                    path.unlink(missing_ok=True)
+                else:
+                    all_ok = False
+            return 0 if all_ok else 1
 
         if target is not None:
             matched = False
+            all_ok = True
             candidates = [
                 pid_file_for_model(target, RUNS),
                 _legacy_unhashed_pid_file(target, RUNS),
@@ -124,40 +305,65 @@ def main(argv: list[str]) -> int:
                     continue
                 if not isinstance(record, dict) or record.get("model_id") != target:
                     continue
-                _stop_record(record, stopped_pids)
-                path.unlink(missing_ok=True)
                 matched = True
+                if _stop_record(
+                    record,
+                    stopped_pids,
+                    force_legacy=force_legacy,
+                    discard_legacy=discard_legacy,
+                ):
+                    path.unlink(missing_ok=True)
+                else:
+                    all_ok = False
 
             for path, record in list_pid_records(RUNS):
                 if path in seen_paths:
                     continue
                 if record.get("model_id") == target:
-                    _stop_record(record, stopped_pids)
-                    path.unlink(missing_ok=True)
                     matched = True
+                    if _stop_record(
+                        record,
+                        stopped_pids,
+                        force_legacy=force_legacy,
+                        discard_legacy=discard_legacy,
+                    ):
+                        path.unlink(missing_ok=True)
+                    else:
+                        all_ok = False
 
             if not matched:
                 print(f"No active server PID file found for {target}.")
-            return 0
+                return 0
+            return 0 if all_ok else 1
 
         if default_pid.exists():
-            record = json.loads(default_pid.read_text())
-            _stop_record(record, stopped_pids)
-            default_pid.unlink(missing_ok=True)
-            model_id = record.get("model_id")
-            if isinstance(model_id, str) and model_id:
-                for extra in (
-                    pid_file_for_model(model_id, RUNS),
-                    _legacy_unhashed_pid_file(model_id, RUNS),
+            try:
+                record = json.loads(default_pid.read_text())
+            except (OSError, json.JSONDecodeError):
+                record = None
+            if isinstance(record, dict):
+                if not _stop_record(
+                    record,
+                    stopped_pids,
+                    force_legacy=force_legacy,
+                    discard_legacy=discard_legacy,
                 ):
-                    if extra.exists():
-                        try:
-                            extra_rec = json.loads(extra.read_text())
-                            if isinstance(extra_rec, dict) and extra_rec.get("model_id") == model_id:
-                                extra.unlink(missing_ok=True)
-                        except (OSError, json.JSONDecodeError):
-                            pass
-            return 0
+                    return 1
+                default_pid.unlink(missing_ok=True)
+                model_id = record.get("model_id")
+                if isinstance(model_id, str) and model_id:
+                    for extra in (
+                        pid_file_for_model(model_id, RUNS),
+                        _legacy_unhashed_pid_file(model_id, RUNS),
+                    ):
+                        if extra.exists():
+                            try:
+                                extra_rec = json.loads(extra.read_text())
+                                if isinstance(extra_rec, dict) and extra_rec.get("model_id") == model_id:
+                                    extra.unlink(missing_ok=True)
+                            except (OSError, json.JSONDecodeError):
+                                pass
+                return 0
 
         records = list_pid_records(RUNS)
         if not records:
@@ -165,9 +371,15 @@ def main(argv: list[str]) -> int:
             return 0
 
         path, record = records[0]
-        _stop_record(record, stopped_pids)
-        path.unlink(missing_ok=True)
-        return 0
+        if _stop_record(
+            record,
+            stopped_pids,
+            force_legacy=force_legacy,
+            discard_legacy=discard_legacy,
+        ):
+            path.unlink(missing_ok=True)
+            return 0
+        return 1
 
 
 if __name__ == "__main__":

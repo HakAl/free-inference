@@ -6,15 +6,27 @@ cd "$(dirname "$0")/.."
 export UV_CACHE_DIR="$PWD/.uv-cache"
 export PYTHONPYCACHEPREFIX="$PWD/.pycache"
 
-echo "Checking base tools..."
+echo "Checking platform and base tools..."
+if [ "$(uname -s)" != "Darwin" ] || [ "$(uname -m)" != "arm64" ]; then
+  echo "ERROR: free-inference setup requires Apple Silicon macOS (Darwin arm64); got $(uname -s) $(uname -m)" >&2
+  exit 1
+fi
 mkdir -p .home/.cache .home/.promptfoo .home/huggingface
-command -v uv >/dev/null || { echo "uv is required"; exit 1; }
-command -v python3 >/dev/null || { echo "python3 is required"; exit 1; }
-command -v node >/dev/null || { echo "node is required"; exit 1; }
-command -v npm >/dev/null || { echo "npm is required"; exit 1; }
+for req_tool in uv python3 node npm swiftc codesign shasum curl unzip lsof ps pgrep; do
+  command -v "$req_tool" >/dev/null || { echo "ERROR: $req_tool is required on PATH" >&2; exit 1; }
+done
+if ! command -v opencode >/dev/null 2>&1; then
+  echo "Note: 'opencode' is not currently on PATH (install OpenCode v2.0+ before running ./scripts/opencode-local or ./scripts/opencode-attested)."
+fi
+python3 -c '
+import sys
+if sys.version_info < (3, 11):
+    sys.stderr.write(f"ERROR: Python {sys.version.split()[0]} is unsupported; Python >= 3.11 is required\n")
+    raise SystemExit(1)
+'
 node -e '
 const [maj, min] = process.versions.node.split(".").map(Number);
-const ok = (maj === 20 && min >= 20) || maj > 22 || (maj === 22 && min >= 22);
+const ok = (maj === 20 && min >= 20) || (maj >= 22 && (maj > 22 || min >= 22));
 if (!ok) {
   console.error("ERROR: Node.js v" + process.versions.node + " is unsupported; promptfoo requires ^20.20.0 || >=22.22.0");
   process.exit(1);
@@ -23,23 +35,17 @@ if (!ok) {
 
 echo "Creating Python environment..."
 if [ ! -d .venv ]; then
-  uv venv
+  uv venv --python ">=3.11" .venv
 else
   echo "Using existing .venv"
 fi
-uv pip install \
-  "pyyaml>=6.0.2" \
-  "huggingface_hub[hf_transfer]>=0.23.0" \
-  "hf-transfer>=0.1.8" \
-  "mlx>=0.24.0" \
-  "mlx-lm>=0.22.0" \
-  "mlx-vlm>=0.1.0"
+uv pip install --python .venv/bin/python -r requirements.txt
 
 echo "Installing Node dependencies..."
 npm ci
 
-echo "Building and verifying Secure Enclave key proxy (bin/se-key-proxy)..."
-./scripts/se-key build
+echo "Building and verifying Secure Enclave key proxy (bin/se-key-proxy and bin/se-key-proxy-test)..."
+./scripts/se-key build --include-test-binary
 se_rc=0
 ./scripts/se-key selftest || se_rc=$?
 if [ "$se_rc" -eq 77 ]; then
@@ -61,7 +67,10 @@ verify_tinfoil_proxy() {
     echo "ERROR: $bin_path SHA-256 mismatch (got $actual_sha, expected $TINFOIL_PROXY_SHA256)" >&2
     return 1
   fi
-  codesign -v --strict "$bin_path"
+  if ! codesign -v --strict "$bin_path"; then
+    echo "ERROR: $bin_path failed codesign -v --strict verification" >&2
+    return 1
+  fi
   local sign_info
   sign_info="$(codesign -dv --verbose=4 "$bin_path" 2>&1)"
   echo "$sign_info" | grep -q "TeamIdentifier=8KSH668LZT" || {
@@ -70,12 +79,15 @@ verify_tinfoil_proxy() {
   }
   if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
     gh attestation verify "$bin_path" --repo tinfoilsh/tinfoil-proxy
+  elif [ "${FREE_INFERENCE_REQUIRE_GH_ATTESTATION:-0}" = "1" ]; then
+    echo "ERROR: 'gh' CLI is missing or not authenticated, and FREE_INFERENCE_REQUIRE_GH_ATTESTATION=1 is set." >&2
+    return 1
   else
-    echo "Note: skipping 'gh attestation verify' (gh CLI not authenticated); verified pinned SHA-256 and Apple Developer ID signature."
+    echo "WARNING: 'gh' CLI is missing or not authenticated; skipping Sigstore SLSA attestation check (verified pinned SHA-256 and Apple Developer ID TeamIdentifier=8KSH668LZT). Authenticate with 'gh auth login' to enable SLSA verification." >&2
   fi
 }
 
-if [ -x bin/tinfoil-proxy ] && verify_tinfoil_proxy "bin/tinfoil-proxy" >/dev/null 2>&1; then
+if [ -x bin/tinfoil-proxy ] && verify_tinfoil_proxy "bin/tinfoil-proxy"; then
   echo "Verified existing bin/tinfoil-proxy (v${TINFOIL_PROXY_VERSION}, SHA-256 ${TINFOIL_PROXY_SHA256:0:16}...)."
 else
   echo "Downloading and verifying tinfoil-proxy v${TINFOIL_PROXY_VERSION} (darwin-arm64)..."
@@ -85,9 +97,9 @@ else
     "https://github.com/tinfoilsh/tinfoil-proxy/releases/download/v${TINFOIL_PROXY_VERSION}/tinfoil-proxy-darwin-arm64.zip" \
     -o "$tmp_dir/tinfoil-proxy.zip"
   unzip -q "$tmp_dir/tinfoil-proxy.zip" -d "$tmp_dir"
+  chmod 0755 "$tmp_dir/tinfoil-proxy-darwin-arm64"
+  verify_tinfoil_proxy "$tmp_dir/tinfoil-proxy-darwin-arm64"
   mv "$tmp_dir/tinfoil-proxy-darwin-arm64" "bin/tinfoil-proxy"
-  chmod 0755 "bin/tinfoil-proxy"
-  verify_tinfoil_proxy "bin/tinfoil-proxy"
 fi
 
 echo

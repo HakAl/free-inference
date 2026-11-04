@@ -6,6 +6,7 @@ import json
 import os
 import re
 import shlex
+import subprocess
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
@@ -22,6 +23,24 @@ DEFAULT_BASE_URL = "http://127.0.0.1:8080/v1"
 DEFAULT_API_KEY = "none"
 KEYCHAIN_PLACEHOLDER_KEY = "se-keychain-managed"
 SESSION_TOKEN_ENV_VAR = "LOCAL_ASSIST_SESSION_TOKEN"
+BASE_SAFE_ENV_ALLOWLIST = frozenset({
+    "PATH",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TMPDIR",
+    "TERM",
+    "SYSTEMROOT",
+})
+LAUNCHER_EXTRA_ENV_ALLOWLIST = frozenset({
+    "COLORTERM",
+    "SSH_AUTH_SOCK",
+    "EDITOR",
+    "VISUAL",
+})
 DEFAULT_EOS_TRANSFORM = (
     "typeof output === 'string' ? output.replace(/<\\|im_end\\|>\\s*$/g, '').trim() : output"
 )
@@ -90,6 +109,7 @@ class EndpointConfig:
     upstream_base_url: str | None = None
     pricing_per_m_tokens: dict[str, float] | None = None
     context_window: int | None = None
+    eval_evidence_artifact: str | None = None
 
     @property
     def data_control_rung(self) -> int:
@@ -114,7 +134,10 @@ def canonical_endpoint_key(url: str) -> tuple[str, str, int, str]:
     scheme = (parsed.scheme or "http").lower()
     raw_host = (parsed.hostname or "127.0.0.1").lower()
     host = "127.0.0.1" if raw_host in ("localhost", "127.0.0.1") else raw_host
-    port = parsed.port if parsed.port is not None else (443 if scheme == "https" else 80)
+    try:
+        port = parsed.port if parsed.port is not None else (443 if scheme == "https" else 80)
+    except ValueError as exc:
+        raise RegistryError(f"Invalid port in URL '{url}': {exc}") from exc
     path = parsed.path.rstrip("/") or "/v1"
     return (scheme, host, port, path)
 
@@ -122,7 +145,10 @@ def canonical_endpoint_key(url: str) -> tuple[str, str, int, str]:
 def _load_yaml(path: Path) -> dict[str, Any]:
     if not path.exists():
         raise RegistryError(f"models.yaml not found at {path}")
-    data = safe_load(path.read_text()) or {}
+    try:
+        data = safe_load(path.read_text()) or {}
+    except Exception as exc:
+        raise RegistryError(f"Invalid YAML in {path}: {exc}") from exc
     if not isinstance(data, dict):
         raise RegistryError(f"Expected mapping at top of {path}")
     return data
@@ -174,6 +200,37 @@ def _is_valid_committed_artifact_path(rel_path: str) -> bool:
         return False
     if parts[:2] != ["docs", "attestations"]:
         return False
+    return True
+
+
+def _is_valid_committed_eval_artifact_path(
+    rel_path: str,
+    *,
+    model_id: str | None = None,
+    require_exists: bool = True,
+) -> bool:
+    if not rel_path or rel_path.startswith(("/", "\\", "~")):
+        return False
+    norm = rel_path.replace("\\", "/")
+    parts = [p for p in norm.split("/") if p]
+    if len(parts) != 3 or any(p in (".", "..") or p.startswith(".") for p in parts):
+        return False
+    if parts[:2] != ["docs", "evals"] or not parts[2].endswith(".json"):
+        return False
+    if model_id is not None and parts[2] != f"{model_id}.json":
+        return False
+    if require_exists:
+        full_path = ROOT / norm
+        if not full_path.is_file():
+            return False
+        try:
+            manifest_obj = json.loads(full_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        if not isinstance(manifest_obj, dict):
+            return False
+        if model_id is not None and manifest_obj.get("model_id") != model_id:
+            return False
     return True
 
 
@@ -420,6 +477,7 @@ def resolve_endpoint(
     *,
     pid_record: dict[str, Any] | None = None,
     require_api_key: bool = True,
+    require_eval_evidence_file: bool = True,
 ) -> EndpointConfig:
     model_id = str(model.get("id") or "").strip()
     if not model_id:
@@ -444,7 +502,10 @@ def resolve_endpoint(
     parsed = urlparse(api_base_url)
     scheme = (parsed.scheme or "http").lower()
     host = parsed.hostname or "127.0.0.1"
-    port = parsed.port if parsed.port is not None else (443 if scheme == "https" else 80)
+    try:
+        port = parsed.port if parsed.port is not None else (443 if scheme == "https" else 80)
+    except ValueError as exc:
+        raise RegistryError(f"Model {model_id}: invalid port in apiBaseUrl '{api_base_url}': {exc}") from exc
     is_local_host = host in LOCAL_HOSTS
 
     (
@@ -580,6 +641,11 @@ def resolve_endpoint(
         capabilities = dict(raw_caps)
     else:
         raise RegistryError(f"Model {model_id}: capabilities must be a mapping")
+    if "tool_calling" in capabilities and not isinstance(capabilities["tool_calling"], bool):
+        raise RegistryError(
+            f"Model {model_id}: capabilities.tool_calling must be a boolean (true or false), "
+            f"got {capabilities['tool_calling']!r}."
+        )
 
     raw_routing = model.get("routing")
     routing_private_local: str | None = None
@@ -587,6 +653,13 @@ def resolve_endpoint(
     if raw_routing is not None:
         if not isinstance(raw_routing, dict):
             raise RegistryError(f"Model {model_id}: routing must be null or a mapping")
+        allowed_routing_keys = {"private_local", "private_attested", "eval_evidence_artifact"}
+        unknown_routing_keys = set(raw_routing.keys()) - allowed_routing_keys
+        if unknown_routing_keys:
+            raise RegistryError(
+                f"Model {model_id}: unknown keys in routing {sorted(str(k) for k in unknown_routing_keys)}; "
+                f"allowed keys are {sorted(allowed_routing_keys)}."
+            )
         raw_pl = raw_routing.get("private_local")
         if raw_pl is not None:
             if not isinstance(raw_pl, str) or raw_pl not in VALID_ROUTING_CLEARANCES:
@@ -613,11 +686,37 @@ def resolve_endpoint(
                         f"Model {model_id}: routing.private_attested='cleared' is only valid for "
                         f"attested enclave tiers ({sorted(ATTESTED_ENCLAVE_TIERS)})."
                     )
-                if not bool(capabilities.get("tool_calling")):
+                if capabilities.get("tool_calling") is not True:
                     raise RegistryError(
                         f"Model {model_id}: routing.private_attested='cleared' requires capabilities.tool_calling=true."
                     )
             routing_private_attested = raw_pa
+
+    raw_eval_artifact = model.get("eval_evidence_artifact")
+    if raw_eval_artifact is None and isinstance(raw_routing, dict):
+        raw_eval_artifact = raw_routing.get("eval_evidence_artifact")
+    eval_evidence_artifact = (
+        str(raw_eval_artifact).strip()
+        if isinstance(raw_eval_artifact, str) and raw_eval_artifact.strip()
+        else None
+    )
+    if eval_evidence_artifact is not None and not _is_valid_committed_eval_artifact_path(
+        eval_evidence_artifact,
+        model_id=model_id,
+        require_exists=require_eval_evidence_file,
+    ):
+        raise RegistryError(
+            f"Model {model_id}: eval_evidence_artifact must be a committed relative path "
+            f"under 'docs/evals/{model_id}.json' whose manifest model_id matches '{model_id}', "
+            f"got '{eval_evidence_artifact}'."
+        )
+    if (
+        routing_private_local == "cleared" or routing_private_attested == "cleared"
+    ) and not eval_evidence_artifact:
+        raise RegistryError(
+            f"Model {model_id}: routing clearance ('cleared') requires a committed "
+            "'eval_evidence_artifact' path under 'docs/evals/<model-id>.json'."
+        )
 
     raw_remote_trust = model.get("remote_trust")
     pricing_per_m_tokens: dict[str, float] | None = None
@@ -673,6 +772,7 @@ def resolve_endpoint(
         upstream_base_url=upstream_base_url,
         pricing_per_m_tokens=pricing_per_m_tokens,
         context_window=context_window,
+        eval_evidence_artifact=eval_evidence_artifact,
     )
 
 
@@ -873,7 +973,7 @@ def read_pid_record_for_model(
     if legacy.exists():
         try:
             record = json.loads(legacy.read_text())
-            if isinstance(record, dict) and record.get("model_id") in (model_id, None):
+            if isinstance(record, dict) and record.get("model_id") == model_id:
                 return record
         except (OSError, json.JSONDecodeError):
             pass
@@ -893,3 +993,79 @@ def list_pid_records(runs_dir: Path | None = None) -> list[tuple[Path, dict[str,
         except (OSError, json.JSONDecodeError):
             continue
     return records
+
+
+def pid_is_alive(pid: Any) -> bool:
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _run_ps_query(pid: int, column: str) -> str | None:
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            ["ps", "-p", str(pid), "-o", f"{column}="],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env={"PATH": "/bin:/usr/bin", "LC_ALL": "C", "TZ": "UTC"},
+        )
+        stdout, _ = proc.communicate(timeout=3)
+    except subprocess.TimeoutExpired:
+        if proc is not None:
+            try:
+                proc.kill()
+                proc.communicate()
+            except Exception:
+                pass
+        return None
+    except Exception:
+        return None
+    if proc.returncode != 0:
+        return None
+    out = (stdout or "").strip()
+    return out if out else None
+
+
+def get_process_lstart(pid: Any) -> str | None:
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return None
+    return _run_ps_query(pid, "lstart")
+
+
+def get_process_command(pid: Any) -> str | None:
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return None
+    return _run_ps_query(pid, "command")
+
+
+def pid_is_zombie(pid: Any) -> bool:
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False
+    stat_out = _run_ps_query(pid, "stat")
+    if stat_out is None:
+        return False
+    return stat_out.lstrip().upper().startswith("Z")
+
+
+def pid_matches_record(
+    pid: Any,
+    expected_lstart: Any,
+    *,
+    require_lstart: bool = True,
+) -> bool:
+    if not pid_is_alive(pid):
+        return False
+    if isinstance(expected_lstart, str) and expected_lstart.strip():
+        actual = get_process_lstart(pid)
+        return actual == expected_lstart.strip()
+    if require_lstart:
+        return False
+    return True

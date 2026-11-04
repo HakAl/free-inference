@@ -12,7 +12,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
-if VENV_PYTHON.exists() and Path(sys.executable) != VENV_PYTHON:
+if __name__ == "__main__" and VENV_PYTHON.exists() and Path(sys.executable) != VENV_PYTHON:
     os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), __file__, *sys.argv[1:]])
 
 sys.path.insert(0, str(ROOT))
@@ -20,6 +20,8 @@ sys.path.insert(0, str(ROOT))
 from local_assist.client import check_private_coding_admission
 from local_assist.errors import LocalAssistError
 from local_assist.registry import (
+    BASE_SAFE_ENV_ALLOWLIST,
+    LAUNCHER_EXTRA_ENV_ALLOWLIST,
     EndpointConfig,
     RegistryError,
     load_model,
@@ -36,22 +38,11 @@ EXIT_MODEL_MISMATCH = 3
 TEMPLATE_CONFIG = ROOT / "config" / "opencode-private-local.json.tmpl"
 DEFAULT_ISOLATED_HOME = ROOT / ".home" / "opencode-private-local"
 
-SAFE_ENV_ALLOWLIST = (
-    "PATH",
-    "LANG",
-    "LC_ALL",
-    "LC_CTYPE",
-    "TERM",
-    "COLORTERM",
-    "TMPDIR",
-    "USER",
-    "LOGNAME",
-    "SHELL",
-    "SYSTEMROOT",
-    "SSH_AUTH_SOCK",
-    "EDITOR",
-    "VISUAL",
-)
+SAFE_ENV_ALLOWLIST = tuple(sorted(BASE_SAFE_ENV_ALLOWLIST | LAUNCHER_EXTRA_ENV_ALLOWLIST))
+
+
+def _json_escape(val: Any) -> str:
+    return json.dumps(str(val))[1:-1]
 
 
 def validate_private_local_endpoint(
@@ -129,16 +120,16 @@ def render_private_local_config(
     effective_workspace = (workspace_dir or Path.cwd()).resolve()
 
     rendered = (
-        tmpl.replace("__API_BASE_URL__", effective_base_url)
-        .replace("__API_KEY_VALUE__", api_key_placeholder)
-        .replace("__SERVED_MODEL_ID__", endpoint.served_model_id)
-        .replace("__MODEL_ID__", endpoint.model_id)
+        tmpl.replace("__API_BASE_URL__", _json_escape(effective_base_url))
+        .replace("__API_KEY_VALUE__", _json_escape(api_key_placeholder))
+        .replace("__SERVED_MODEL_ID__", _json_escape(endpoint.served_model_id))
+        .replace("__MODEL_ID__", _json_escape(endpoint.model_id))
         .replace("__CONTEXT_LIMIT__", str(int(context_limit)))
         .replace("__OUTPUT_LIMIT__", str(int(output_limit)))
-        .replace("__EDIT_PERMISSION__", edit_permission)
-        .replace("__LAB_PYTHON__", str(effective_python))
-        .replace("__LAB_ROOT__", str(effective_root))
-        .replace("__WORKSPACE_DIR__", str(effective_workspace))
+        .replace("__EDIT_PERMISSION__", _json_escape(edit_permission))
+        .replace("__LAB_PYTHON__", _json_escape(effective_python))
+        .replace("__LAB_ROOT__", _json_escape(effective_root))
+        .replace("__WORKSPACE_DIR__", _json_escape(effective_workspace))
     )
     json.loads(rendered)
     return rendered
@@ -338,6 +329,10 @@ def main(argv: list[str]) -> int:
     caller_cwd = Path.cwd()
     args, opencode_args = parse_args(argv)
 
+    if args.context_limit <= 0 or args.output_limit <= 0 or args.wait < 0:
+        print("--context-limit and --output-limit must be > 0 and --wait must be >= 0", file=sys.stderr)
+        return 1
+
     try:
         model = load_model(args.model)
         pid_record = read_pid_record_for_model(args.model)
@@ -349,6 +344,13 @@ def main(argv: list[str]) -> int:
     except (RegistryError, LocalAssistError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
+
+    opencode_bin: str | None = None
+    if not args.print_config:
+        opencode_bin = shutil.which("opencode")
+        if not opencode_bin:
+            print("opencode binary not found on PATH", file=sys.stderr)
+            return 1
 
     ok, err_msg = ensure_model_served(
         endpoint,
@@ -398,10 +400,7 @@ def main(argv: list[str]) -> int:
         )
         return 0
 
-    opencode_bin = shutil.which("opencode")
-    if not opencode_bin:
-        print("opencode binary not found on PATH", file=sys.stderr)
-        return 1
+    assert opencode_bin is not None
 
     if "--standalone" not in opencode_args:
         sync_file = isolated_home / ".last-service-sync.json"

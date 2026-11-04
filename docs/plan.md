@@ -1,5 +1,7 @@
 # Local LLM Evaluation Workbench Plan
 
+> **Current Architecture & Lineage Note**: `free-inference` evolved from an earlier Apple Silicon MLX evaluation workbench (`local-llm-lab`, May 2026) and expanded in October-November 2026 to the 5-rung data-control architecture (`local`, `enclave_weights_attested`, `enclave_runtime_attested`, `zdr_contract`, `standard_api`), hardware-backed Secure Enclave key sealing (`se-key-proxy`), and locked-down OpenCode launchers (`opencode-local`, `opencode-attested`). This document records the evaluation workbench design and milestone criteria. See [`docs/proposal.md`](./proposal.md) for the 5-rung architecture and [`models.yaml`](../models.yaml) plus [`docs/evals/`](./evals/README.md) for current model clearance status and committed evaluation evidence.
+
 ## Purpose
 
 Build a durable local LLM lab for an Apple Silicon MacBook with 48 GB RAM. The workbench should make it easy to scout, verify, run, compare, and revisit local models as new Gemma, Qwen, Kimi, DeepSeek, and other releases appear.

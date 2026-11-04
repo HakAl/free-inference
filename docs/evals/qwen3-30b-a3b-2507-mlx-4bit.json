@@ -1,0 +1,228 @@
+{
+  "schema_version": 1,
+  "model_id": "qwen3-30b-a3b-2507-mlx-4bit",
+  "served_model_id": "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit",
+  "trust_tier": "local",
+  "data_control_rung": 1,
+  "usage_policy": "unrestricted_local",
+  "routing_status": {
+    "private_local": "cleared",
+    "private_attested": "blocked"
+  },
+  "clearance_basis": {
+    "mode": "automated_full_pass",
+    "approved_date": "2026-10-30",
+    "note": "Passed all five automated Rung 1 private-local gates: sanity 1/1, v1 10/10, tools 4/4, streaming tool-call probe (buffered complete tool-call TTFT 0.6442s, tool_call_chunks=1), and opencode-smoke (0 non-localhost sockets)."
+  },
+  "suites": {
+    "sanity": {
+      "run_dir_id": "2026-10-29-214329-sanity-qwen3-30b-a3b-2507-mlx-4bit-2aee4a3e-mS7YQ1",
+      "suite": "sanity",
+      "tests_sha256": "b194badae76a9cd0a04d02d027502027e169aff387edd6fb9d0e63368d529acb",
+      "suite_spec_sha256": "b185a1d7a08ba024e841e4d65c5b4ce85232111cd992490c446824f0cc213fc1",
+      "promptfoo_status": 0,
+      "passed": 1,
+      "total": 1,
+      "failed_tests": [],
+      "cases": [
+        {
+          "description": "sanity-case-1",
+          "pass": true,
+          "score": 1.0
+        }
+      ],
+      "ttft_seconds": 0.1127,
+      "total_seconds": 0.3534,
+      "runtime_versions": {
+        "mlx": "0.31.2",
+        "mlx-lm": "0.31.3",
+        "mlx-vlm": "0.5.0",
+        "promptfoo": "0.121.11"
+      },
+      "evaluated_provider_config": {
+        "id": "openai:chat:mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit",
+        "transform": "typeof output === 'string' ? output.replace(/<\\|im_end\\|>\\s*$/g, '').trim() : output",
+        "temperature": 0.2,
+        "max_tokens": 60
+      }
+    },
+    "v1": {
+      "run_dir_id": "2026-10-29-214337-v1-qwen3-30b-a3b-2507-mlx-4bit-2aee4a3e-WVXFms",
+      "suite": "v1",
+      "tests_sha256": "f8408019a004855533dc15a5931ed85a41f6723bf7c2d89081ceea1c0bce28a2",
+      "suite_spec_sha256": "9b61c813f97a0876c654a1e0d5e05129fc1aa37f2afb72ba8a4fa6d61a2b92d3",
+      "promptfoo_status": 0,
+      "passed": 10,
+      "total": 10,
+      "failed_tests": [],
+      "cases": [
+        {
+          "description": "code-explanation-cache-key",
+          "pass": true,
+          "score": 1.0
+        },
+        {
+          "description": "bug-fix-python-batching",
+          "pass": true,
+          "score": 1.0
+        },
+        {
+          "description": "feature-plan-model-registry-status",
+          "pass": true,
+          "score": 1.0
+        },
+        {
+          "description": "shell-tool-reasoning-safe-commands",
+          "pass": true,
+          "score": 1.0
+        },
+        {
+          "description": "structured-json-model-summary",
+          "pass": true,
+          "score": 1.0
+        },
+        {
+          "description": "needle-middle-delta-restore-token",
+          "pass": true,
+          "score": 1.0
+        },
+        {
+          "description": "long-context-summary-delta-indexer",
+          "pass": true,
+          "score": 1.0
+        },
+        {
+          "description": "general-reasoning-rate-limit",
+          "pass": true,
+          "score": 1.0
+        },
+        {
+          "description": "patch-like-edit-gitignore",
+          "pass": true,
+          "score": 1.0
+        },
+        {
+          "description": "tool-schema-readiness",
+          "pass": true,
+          "score": 1.0
+        }
+      ],
+      "ttft_seconds": 0.2162,
+      "total_seconds": 0.4676,
+      "runtime_versions": {
+        "mlx": "0.31.2",
+        "mlx-lm": "0.31.3",
+        "mlx-vlm": "0.5.0",
+        "promptfoo": "0.121.11"
+      },
+      "evaluated_provider_config": {
+        "id": "openai:chat:mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit",
+        "transform": "typeof output === 'string' ? output.replace(/<\\|im_end\\|>\\s*$/g, '').trim() : output",
+        "temperature": 0.2,
+        "max_tokens": 700
+      }
+    },
+    "tools": {
+      "run_dir_id": "2026-10-29-214522-tools-qwen3-30b-a3b-2507-mlx-4bit-2aee4a3e-YoRV2d",
+      "suite": "tools",
+      "tests_sha256": "ed7879ce291e34f373eb7c897932f0c572f8fe3644f1ed133af3871ff6209e69",
+      "suite_spec_sha256": "6ad599f932811a55d662af5ac208cf1e743a49d845d2d61a62433c59c521ea2f",
+      "promptfoo_status": 0,
+      "passed": 4,
+      "total": 4,
+      "failed_tests": [],
+      "cases": [
+        {
+          "description": "single-tool-read-file",
+          "pass": true,
+          "score": 1.0
+        },
+        {
+          "description": "parallel-tool-calls-diff-check",
+          "pass": true,
+          "score": 1.0
+        },
+        {
+          "description": "tool-result-followup",
+          "pass": true,
+          "score": 1.0
+        },
+        {
+          "description": "no-tool-when-unnecessary",
+          "pass": true,
+          "score": 1.0
+        }
+      ],
+      "ttft_seconds": 0.1188,
+      "total_seconds": 0.362,
+      "runtime_versions": {
+        "mlx": "0.31.2",
+        "mlx-lm": "0.31.3",
+        "mlx-vlm": "0.5.0",
+        "promptfoo": "0.121.11"
+      },
+      "evaluated_provider_config": {
+        "id": "openai:chat:mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit",
+        "transform": "typeof output === 'string' ? output.replace(/<\\|im_end\\|>\\s*$/g, '').trim() : output",
+        "temperature": 0.0,
+        "max_tokens": 500
+      },
+      "tools_timing_probe": {
+        "ttft_seconds": 0.6442,
+        "total_seconds": 0.6631,
+        "stream_chunks": 1,
+        "tool_call_chunks": 1,
+        "tool_calls_emitted": [
+          {
+            "id": "63b7368f-956a-4c23-8073-e93fbce78cc8",
+            "name": "read_file",
+            "arguments": "{\"path\": \"README.md\"}"
+          }
+        ]
+      }
+    },
+    "opencode_smoke": {
+      "run_dir_id": "2026-10-31-175655-opencode-smoke-qwen3-30b-a3b-2507-mlx-4bit-2aee4a3e-5x1_fu_n",
+      "passed": true,
+      "exit_code": 0,
+      "elapsed_seconds": 6.027,
+      "opencode_version": "v2.0.32",
+      "host_state_unchanged": true,
+      "network_observation_ok": true,
+      "non_localhost_sockets": 0,
+      "unconnected_udp_sockets": 0,
+      "request_budget_ok": true,
+      "only_read_tool_called": true,
+      "read_target_only": true,
+      "token_verified": true,
+      "token_accounting": {
+        "forwarded_chat_requests": 3,
+        "forwarded_chat_request_bytes": 9040,
+        "blocked_chat_requests": 0,
+        "max_chat_requests_allowed": 3,
+        "max_tokens_per_request_enforced": 256,
+        "max_request_bytes_enforced": 8000,
+        "max_total_request_bytes_enforced": 18000,
+        "observed_http_tokens": {
+          "prompt": 2289,
+          "completion": 41,
+          "total": 2330,
+          "requests_missing_usage": 0
+        },
+        "reserved_ceiling_tokens": {
+          "input": 4500,
+          "output": 768,
+          "total": 5268
+        }
+      },
+      "session_token_scan_summary": {
+        "files_scanned": 137,
+        "bytes_scanned": 8609216,
+        "matches_found": 0,
+        "redactions_applied": 0,
+        "remaining_unredacted_matches": 0
+      },
+      "notes": "Primary smoke run 2026-10-31-175655-opencode-smoke-qwen3-30b-a3b-2507-mlx-4bit-2aee4a3e-5x1_fu_n includes post-run session_token_scan (matches_found: 0); initial clearing smoke run 2026-10-30-181950-opencode-smoke-qwen3-30b-a3b-2507-mlx-4bit-2aee4a3e-eq188l2v also passed with 0 non-localhost sockets and token_verified=true."
+    }
+  }
+}

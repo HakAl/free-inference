@@ -1,0 +1,340 @@
+{
+  "schema_version": 1,
+  "model_id": "tinfoil-deepseek-v4-1-flash",
+  "served_model_id": "deepseek-v4-1-flash",
+  "trust_tier": "enclave_runtime_attested",
+  "data_control_rung": 3,
+  "usage_policy": "provider_terms_apply",
+  "routing_status": {
+    "private_local": "blocked",
+    "private_attested": "cleared"
+  },
+  "clearance_basis": {
+    "mode": "operator_exception",
+    "approved_date": "2026-11-01",
+    "note": "Passed sanity 1/1, tools 4/4 (incremental tool_call_chunks=4), and opencode-smoke (0 non-localhost sockets, 0 session token leaks). Scored 9/10 on automated v1 (missing only the git-extended 'diff --git' header on an otherwise valid POSIX unified diff in patch-like-edit-gitignore). Cleared by explicit operator decision on 2026-11-01 following full-day production coding and review sessions in opencode-attested.",
+    "operator_clearance_decision": {
+      "approved": true,
+      "date": "2026-11-01",
+      "suite": "v1",
+      "score": "9/10",
+      "failed_case": "patch-like-edit-gitignore",
+      "rationale": "Output was a minimal, valid POSIX unified diff omitting only the git-specific diff --git header line.",
+      "decision_artifact": "docs/attestations/2026-10-31-tinfoil-rung3-trial.md"
+    }
+  },
+  "suites": {
+    "sanity": {
+      "run_dir_id": "2026-10-31-213403-sanity-tinfoil-deepseek-v4-1-flash-b41fc330-iXVep2",
+      "suite": "sanity",
+      "tests_sha256": "b194badae76a9cd0a04d02d027502027e169aff387edd6fb9d0e63368d529acb",
+      "suite_spec_sha256": "b185a1d7a08ba024e841e4d65c5b4ce85232111cd992490c446824f0cc213fc1",
+      "promptfoo_status": 0,
+      "passed": 1,
+      "total": 1,
+      "failed_tests": [],
+      "cases": [
+        {
+          "description": "sanity-case-1",
+          "pass": true,
+          "score": 1.0
+        }
+      ],
+      "ttft_seconds": 0.4957,
+      "total_seconds": 0.5947,
+      "runtime_versions": {
+        "mlx": "0.31.2",
+        "mlx-lm": "0.31.3",
+        "mlx-vlm": "0.5.0",
+        "promptfoo": "0.121.11"
+      },
+      "evaluated_provider_config": {
+        "id": "openai:chat:deepseek-v4-1-flash",
+        "transform": "typeof output === 'string' ? output.replace(/<\\|im_end\\|>\\s*$/g, '').trim() : output",
+        "temperature": 0.2,
+        "max_tokens": 60,
+        "passthrough": {
+          "include_reasoning": false,
+          "chat_template_kwargs": {
+            "thinking": false
+          }
+        }
+      },
+      "token_accounting": {
+        "suite_requests": 1,
+        "suite_tokens": {
+          "prompt": 15,
+          "completion": 26,
+          "total": 41
+        },
+        "timing_probe_requests": 1,
+        "timing_probe_tokens": {
+          "prompt": 41,
+          "completion": 73,
+          "total": 114,
+          "used_fallback_reservation": false
+        },
+        "total_eval_requests": 2,
+        "total_eval_tokens": {
+          "prompt": 56,
+          "completion": 99,
+          "total": 155
+        }
+      },
+      "session_token_scan_summary": {
+        "files_scanned": 52,
+        "bytes_scanned": 5182966,
+        "matches_found": 0,
+        "redactions_applied": 0,
+        "remaining_unredacted_matches": 0
+      }
+    },
+    "v1": {
+      "run_dir_id": "2026-10-31-213433-v1-tinfoil-deepseek-v4-1-flash-b41fc330-HlnCge",
+      "suite": "v1",
+      "tests_sha256": "f8408019a004855533dc15a5931ed85a41f6723bf7c2d89081ceea1c0bce28a2",
+      "suite_spec_sha256": "9b61c813f97a0876c654a1e0d5e05129fc1aa37f2afb72ba8a4fa6d61a2b92d3",
+      "promptfoo_status": 100,
+      "passed": 9,
+      "total": 10,
+      "failed_tests": [
+        "patch-like-edit-gitignore"
+      ],
+      "cases": [
+        {
+          "description": "code-explanation-cache-key",
+          "pass": true,
+          "score": 1.0
+        },
+        {
+          "description": "bug-fix-python-batching",
+          "pass": true,
+          "score": 1.0
+        },
+        {
+          "description": "feature-plan-model-registry-status",
+          "pass": true,
+          "score": 1.0
+        },
+        {
+          "description": "shell-tool-reasoning-safe-commands",
+          "pass": true,
+          "score": 1.0
+        },
+        {
+          "description": "structured-json-model-summary",
+          "pass": true,
+          "score": 1.0
+        },
+        {
+          "description": "needle-middle-delta-restore-token",
+          "pass": true,
+          "score": 1.0
+        },
+        {
+          "description": "long-context-summary-delta-indexer",
+          "pass": true,
+          "score": 1.0
+        },
+        {
+          "description": "general-reasoning-rate-limit",
+          "pass": true,
+          "score": 1.0
+        },
+        {
+          "description": "patch-like-edit-gitignore",
+          "pass": false,
+          "score": 0.0
+        },
+        {
+          "description": "tool-schema-readiness",
+          "pass": true,
+          "score": 1.0
+        }
+      ],
+      "ttft_seconds": 0.275,
+      "total_seconds": 0.3616,
+      "runtime_versions": {
+        "mlx": "0.31.2",
+        "mlx-lm": "0.31.3",
+        "mlx-vlm": "0.5.0",
+        "promptfoo": "0.121.11"
+      },
+      "evaluated_provider_config": {
+        "id": "openai:chat:deepseek-v4-1-flash",
+        "transform": "typeof output === 'string' ? output.replace(/<\\|im_end\\|>\\s*$/g, '').trim() : output",
+        "temperature": 0.2,
+        "max_tokens": 700,
+        "passthrough": {
+          "include_reasoning": false,
+          "chat_template_kwargs": {
+            "thinking": false
+          }
+        }
+      },
+      "token_accounting": {
+        "suite_requests": 10,
+        "suite_tokens": {
+          "prompt": 23620,
+          "completion": 2824,
+          "total": 26444
+        },
+        "timing_probe_requests": 1,
+        "timing_probe_tokens": {
+          "prompt": 15,
+          "completion": 24,
+          "total": 39,
+          "used_fallback_reservation": false
+        },
+        "total_eval_requests": 11,
+        "total_eval_tokens": {
+          "prompt": 23635,
+          "completion": 2848,
+          "total": 26483
+        }
+      },
+      "session_token_scan_summary": {
+        "files_scanned": 54,
+        "bytes_scanned": 6693570,
+        "matches_found": 0,
+        "redactions_applied": 0,
+        "remaining_unredacted_matches": 0
+      }
+    },
+    "tools": {
+      "run_dir_id": "2026-10-31-213459-tools-tinfoil-deepseek-v4-1-flash-b41fc330-0QR0vt",
+      "suite": "tools",
+      "tests_sha256": "ed7879ce291e34f373eb7c897932f0c572f8fe3644f1ed133af3871ff6209e69",
+      "suite_spec_sha256": "6ad599f932811a55d662af5ac208cf1e743a49d845d2d61a62433c59c521ea2f",
+      "promptfoo_status": 0,
+      "passed": 4,
+      "total": 4,
+      "failed_tests": [],
+      "cases": [
+        {
+          "description": "single-tool-read-file",
+          "pass": true,
+          "score": 1.0
+        },
+        {
+          "description": "parallel-tool-calls-diff-check",
+          "pass": true,
+          "score": 1.0
+        },
+        {
+          "description": "tool-result-followup",
+          "pass": true,
+          "score": 1.0
+        },
+        {
+          "description": "no-tool-when-unnecessary",
+          "pass": true,
+          "score": 1.0
+        }
+      ],
+      "ttft_seconds": 0.597,
+      "total_seconds": 0.6857,
+      "runtime_versions": {
+        "mlx": "0.31.2",
+        "mlx-lm": "0.31.3",
+        "mlx-vlm": "0.5.0",
+        "promptfoo": "0.121.11"
+      },
+      "evaluated_provider_config": {
+        "id": "openai:chat:deepseek-v4-1-flash",
+        "transform": "typeof output === 'string' ? output.replace(/<\\|im_end\\|>\\s*$/g, '').trim() : output",
+        "temperature": 0.0,
+        "max_tokens": 500,
+        "passthrough": {
+          "include_reasoning": false,
+          "chat_template_kwargs": {
+            "thinking": false
+          }
+        }
+      },
+      "tools_timing_probe": {
+        "ttft_seconds": 0.4989,
+        "total_seconds": 0.5524,
+        "stream_chunks": 4,
+        "tool_call_chunks": 4,
+        "tool_calls_emitted": [
+          {
+            "id": "chatcmpl-tool-a16f604ab21469ca",
+            "name": "read_file",
+            "arguments": "{\"path\": \"README.md\"}"
+          }
+        ]
+      },
+      "token_accounting": {
+        "suite_requests": 4,
+        "suite_tokens": {
+          "prompt": 1909,
+          "completion": 287,
+          "total": 2196
+        },
+        "timing_probe_requests": 2,
+        "timing_probe_tokens": {
+          "prompt": 320,
+          "completion": 63,
+          "total": 383,
+          "used_fallback_reservation": false
+        },
+        "total_eval_requests": 6,
+        "total_eval_tokens": {
+          "prompt": 2229,
+          "completion": 350,
+          "total": 2579
+        }
+      },
+      "session_token_scan_summary": {
+        "files_scanned": 57,
+        "bytes_scanned": 6072318,
+        "matches_found": 0,
+        "redactions_applied": 0,
+        "remaining_unredacted_matches": 0
+      }
+    },
+    "opencode_smoke": {
+      "run_dir_id": "2026-10-31-213515-opencode-smoke-tinfoil-deepseek-v4-1-flash-b41fc330-vf7313bc",
+      "passed": true,
+      "exit_code": 0,
+      "elapsed_seconds": 2.2122,
+      "opencode_version": "v2.0.32",
+      "host_state_unchanged": true,
+      "network_observation_ok": true,
+      "non_localhost_sockets": 0,
+      "unconnected_udp_sockets": 0,
+      "request_budget_ok": true,
+      "only_read_tool_called": true,
+      "read_target_only": true,
+      "token_verified": true,
+      "token_accounting": {
+        "forwarded_chat_requests": 3,
+        "forwarded_chat_request_bytes": 8970,
+        "blocked_chat_requests": 0,
+        "max_chat_requests_allowed": 3,
+        "max_tokens_per_request_enforced": 256,
+        "max_request_bytes_enforced": 8000,
+        "max_total_request_bytes_enforced": 18000,
+        "observed_http_tokens": {
+          "prompt": 2542,
+          "completion": 202,
+          "total": 2744,
+          "requests_missing_usage": 0
+        },
+        "reserved_ceiling_tokens": {
+          "input": 4500,
+          "output": 768,
+          "total": 5268
+        }
+      },
+      "session_token_scan_summary": {
+        "files_scanned": 155,
+        "bytes_scanned": 10365365,
+        "matches_found": 0,
+        "redactions_applied": 0,
+        "remaining_unredacted_matches": 0
+      }
+    }
+  }
+}

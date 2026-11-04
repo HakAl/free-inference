@@ -15,7 +15,7 @@ from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parents[1]
 VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
-if VENV_PYTHON.exists() and Path(sys.executable) != VENV_PYTHON:
+if __name__ == "__main__" and VENV_PYTHON.exists() and Path(sys.executable) != VENV_PYTHON:
     os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), __file__, *sys.argv[1:]])
 
 sys.path.insert(0, str(ROOT))
@@ -25,6 +25,8 @@ from local_assist.registry import (
     RegistryError,
     list_pid_records,
     load_model,
+    pid_is_alive,
+    pid_matches_record,
     read_pid_record_for_model,
     resolve_endpoint,
 )
@@ -35,15 +37,7 @@ EXIT_MODEL_MISMATCH = 3
 
 
 def _pid_is_alive(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except PermissionError:
-        return True
-    except OSError:
-        return False
+    return pid_is_alive(pid)
 
 
 def extract_model_arg_from_command(cmd_text: str) -> str | None:
@@ -144,6 +138,7 @@ def verify_pid_record_matches(
     if endpoint.port is None:
         return True, None
 
+    matched_local_offline = False
     for _, rec in deduplicated_pid_records(runs_dir):
         rec_port = rec.get("port", 8080)
         if rec_port != endpoint.port:
@@ -151,8 +146,12 @@ def verify_pid_record_matches(
         rec_pid = rec.get("pid")
         rec_up_pid = rec.get("upstream_pid")
         rec_status = rec.get("status")
-        pid_live = isinstance(rec_pid, int) and _pid_is_alive(rec_pid)
-        up_pid_live = isinstance(rec_up_pid, int) and _pid_is_alive(rec_up_pid)
+        pid_live = isinstance(rec_pid, int) and (
+            _pid_is_alive(rec_pid) and pid_matches_record(rec_pid, rec.get("pid_lstart"))
+        )
+        up_pid_live = isinstance(rec_up_pid, int) and (
+            _pid_is_alive(rec_up_pid) and pid_matches_record(rec_up_pid, rec.get("upstream_pid_lstart"))
+        )
         starting_active = rec_status == "starting" and (
             rec_pid is None or pid_live or up_pid_live
         )
@@ -171,13 +170,25 @@ def verify_pid_record_matches(
                 f"upstream_pid={rec_up_pid}, repo={rec_repo}); expected "
                 f"'{endpoint.model_id}' ({endpoint.served_model_id})",
             )
-        if require_offline and endpoint.trust_tier == "local" and rec.get("hf_offline") is False:
-            return (
-                False,
-                f"served model on port {endpoint.port} for '{endpoint.model_id}' (pid={rec_pid}) "
-                f"was started with --allow-hf-online (hf_offline=False); stop it with "
-                f"./scripts/stop-model {endpoint.model_id} so it can be started offline with HF_HUB_OFFLINE=1",
-            )
+        if require_offline and endpoint.trust_tier == "local":
+            if not pid_live or (isinstance(rec_up_pid, int) and not up_pid_live):
+                continue
+            if rec.get("hf_offline") is not True:
+                return (
+                    False,
+                    f"served model on port {endpoint.port} for '{endpoint.model_id}' (pid={rec_pid}) "
+                    f"was started with --allow-hf-online or lacks verified offline state (hf_offline={rec.get('hf_offline')!r}); stop it with "
+                    f"./scripts/stop-model {endpoint.model_id} so it can be started offline with HF_HUB_OFFLINE=1",
+                )
+            matched_local_offline = True
+
+    if require_offline and endpoint.trust_tier == "local" and not matched_local_offline:
+        return (
+            False,
+            f"served model on port {endpoint.port} for '{endpoint.model_id}' has no active PID record "
+            f"confirming offline startup (hf_offline=True); stop any unmanaged server on port {endpoint.port} "
+            f"so it can be started offline via ./scripts/serve-model {endpoint.model_id}",
+        )
     return True, None
 
 
@@ -250,7 +261,7 @@ def check_once_detailed(
         runs_dir=runs_dir,
         require_offline=require_offline,
     )
-    if not pid_ok:
+    if not pid_ok and "has no active PID record" not in str(pid_err):
         return False, str(pid_err), True
 
     rec = pid_record if pid_record is not None else read_pid_record_for_model(endpoint.model_id, runs_dir)
@@ -263,18 +274,53 @@ def check_once_detailed(
             )
         rec_pid = rec.get("pid")
         rec_up_pid = rec.get("upstream_pid")
-        if isinstance(rec_pid, int) and not _pid_is_alive(rec_pid):
+        rec_lstart = rec.get("pid_lstart")
+        rec_up_lstart = rec.get("upstream_pid_lstart")
+        if not isinstance(rec_pid, int):
+            return (
+                False,
+                f"PID record for '{endpoint.model_id}' is missing a valid integer pid",
+                False,
+            )
+        if not _pid_is_alive(rec_pid):
             return (
                 False,
                 f"server process pid={rec_pid} for '{endpoint.model_id}' is no longer running",
                 False,
             )
-        if isinstance(rec_up_pid, int) and not _pid_is_alive(rec_up_pid):
+        if not isinstance(rec_lstart, str) or not rec_lstart.strip():
             return (
                 False,
-                f"upstream proxy process pid={rec_up_pid} for '{endpoint.model_id}' is no longer running",
+                f"server PID record for '{endpoint.model_id}' (pid={rec_pid}) is a legacy record lacking verified pid_lstart; "
+                f"inspect with './scripts/stop-model {endpoint.model_id}', then run './scripts/stop-model --force-legacy {endpoint.model_id}' or '--discard-legacy' and relaunch",
                 False,
             )
+        if not pid_matches_record(rec_pid, rec_lstart):
+            return (
+                False,
+                f"server process pid={rec_pid} for '{endpoint.model_id}' is no longer running (process start time mismatch)",
+                False,
+            )
+        if isinstance(rec_up_pid, int):
+            if not _pid_is_alive(rec_up_pid):
+                return (
+                    False,
+                    f"upstream proxy process pid={rec_up_pid} for '{endpoint.model_id}' is no longer running",
+                    False,
+                )
+            if not isinstance(rec_up_lstart, str) or not rec_up_lstart.strip():
+                return (
+                    False,
+                    f"upstream proxy PID record for '{endpoint.model_id}' (upstream_pid={rec_up_pid}) is a legacy record lacking verified upstream_pid_lstart; "
+                    f"inspect with './scripts/stop-model {endpoint.model_id}', then run './scripts/stop-model --force-legacy {endpoint.model_id}' or '--discard-legacy' and relaunch",
+                    False,
+                )
+            if not pid_matches_record(rec_up_pid, rec_up_lstart):
+                return (
+                    False,
+                    f"upstream proxy process pid={rec_up_pid} for '{endpoint.model_id}' is no longer running (process start time mismatch)",
+                    False,
+                )
 
     models_url = f"{endpoint.api_base_url}/models"
     req = Request(
@@ -351,7 +397,7 @@ def main(argv: list[str]) -> int:
             endpoint_meta,
             require_offline=args.require_offline,
         )
-        if not pid_ok:
+        if not pid_ok and "has no active PID record" not in str(pid_err):
             print(str(pid_err), file=sys.stderr)
             return EXIT_MODEL_MISMATCH
 

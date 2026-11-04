@@ -8,22 +8,26 @@ A small MCP server that exposes a locally-served model as a set of structured-ou
 - **Structured outputs.** Every tool returns a typed shape (JSON conforming to a TypedDict), not free text. The tool layer enforces parse/schema/enum validity; the caller decides whether the values are *useful*.
 - **No self-verification.** The local model never grades its own output. If you need verification, route it through a different model or an executable check.
 - **Mechanical IDs.** Tools assign stable IDs via content hashing (`sha256(text)[:10]`), not by asking the model. Duplicate IDs mechanically indicate model padding.
-- **Fail loudly.** Endpoint unreachable, model mismatch, parse failures, schema violations → all raise structured errors. The MCP SDK auto-wraps raised exceptions for the agent.
+- **Fail loudly.** Endpoint unreachable, model mismatch, parse failures, and schema violations all raise structured errors. `local_assist/mcp_server.py` (a zero-dependency Python stdlib JSON-RPC 2.0 server over stdio) wraps raised exceptions into structured JSON-RPC error responses for the calling agent.
 
 ## Layout
 
-```
+```text
 free-inference/
 ├── scripts/
 │   ├── local-assist-server          # MCP entry point (--auto-serve optional)
 │   ├── delegate-local               # CLI entry point for planner delegation
 │   └── delegate-local-e2e           # Live D1 negative test + lsof-sampled cold-start check
-├── local_assist/                    # Python package
-│   ├── server.py                    # MCP registration; dual framing (line + Content-Length)
-│   ├── client.py                    # HTTP client → mlx_lm.server
-│   ├── routing.py                   # job → model table
-│   ├── logging.py                   # JSONL writer (redacts delegate_task context)
-│   ├── lifecycle.py                 # listener verification + opt-in auto-serve + chat check
+├── local_assist/                    # Python package (stdlib-portable)
+│   ├── _miniyaml.py                 # Fail-closed zero-dependency YAML 1.2 subset parser
+│   ├── client.py                    # Loopback HTTP client + 5-rung data-control admission gates
+│   ├── lifecycle.py                 # Pre-chat listener verification + opt-in auto-serve + chat check
+│   ├── logging.py                   # JSONL writer (redacts delegate_task context and compress/extract text)
+│   ├── mcp_server.py                # Stdlib JSON-RPC 2.0 / MCP stdio framing (line + Content-Length)
+│   ├── registry.py                  # 5-rung models.yaml validator, endpoint resolver, pid_lstart helpers
+│   ├── routing.py                   # Job -> served OpenAI model ID table
+│   ├── se_key.py                    # Secure Enclave proxy verifier + serve_command / binary ownership checks
+│   ├── server.py                    # MCP tool registration and dispatch
 │   └── tools/
 │       ├── propose_eval_prompts.py
 │       ├── extract_fields.py
@@ -35,6 +39,18 @@ free-inference/
         └── YYYY-MM-DD/
             └── <HH-MM-SS>-<tool>-<id>.json
 ```
+
+## Environment Variables (`LOCAL_ASSIST_*`)
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `LOCAL_ASSIST_BASE_URL` | `http://127.0.0.1:8080/v1` | Loopback OpenAI-compatible `/v1` base URL used by `local_assist/client.py` |
+| `LOCAL_ASSIST_SESSION_TOKEN` | `"none"` | Ephemeral `se-session-<64-hex>` bearer token when authenticating to `se-key-proxy` (`127.0.0.1:8081`) |
+| `LOCAL_ASSIST_ALLOW_ATTESTED_TEE` | unset (`0`) | Set to `1` to allow `local_assist/client.py` to admit Rung 2 (`enclave_weights_attested`) and Rung 3 (`enclave_runtime_attested`) localhost proxy endpoints. Never exported into MCP child processes by `scripts/opencode-attested`. |
+| `LOCAL_ASSIST_ALLOW_UNCLEARED_TEE` | unset (`0`) | Set to `1` (with `LOCAL_ASSIST_ALLOW_ATTESTED_TEE=1`) to permit candidate Rung 2/3 endpoints whose `routing.private_attested` is not yet `"cleared"` during operator-initiated evaluation trials. |
+| `LOCAL_ASSIST_AUTO_SERVE` | unset (`0`) | Set to `1` (or pass `--auto-serve`) to let `ensure_local_model_served()` auto-start the cleared Rung 1 model (`qwen3-30b-a3b-2507-mlx-4bit`) on `127.0.0.1:8080`. |
+| `LOCAL_ASSIST_TIMEOUT_SECONDS` | `120` | Overall deadline in seconds (`1..3600`) shared across `ensure_local_model_served()`, `require_chat_succeeds()`, and `chat()`. |
+| `LOCAL_ASSIST_WORKSPACE_ROOT` | Caller `pwd -P` | Workspace directory confinement boundary enforced on `delegate_task` `context_path` reads. |
 
 ## Client responsibilities (`client.py`)
 
@@ -93,7 +109,7 @@ Delegates a bounded code/test/text/Q&A subtask (`draft_code`, `generate_test_cas
 Returns `id`, `kind`, `summary`, `output`, `ungrounded_identifiers`, `assumptions`, and `unverified_claims`:
 - **Mechanical fields**: `id` is `sha256(normalized_output)[:10]`; `ungrounded_identifiers` is computed deterministically by scanning `output` for URLs, Python/JS imports, and multi-word proper nouns absent as whole tokens/phrases from `instruction + context + constraints` (excluding `<pkg>-free` tokens from grounding).
 - **Advisory self-reports**: `assumptions` and `unverified_claims` are model-reported lists. Empty `assumptions` or `unverified_claims` (`[]`) does **not** mean the output is verified; the delegating planner must still verify code, citations, or domain claims against external reality.
-- **Audit redaction**: input `context` / `context_path` content is stored as length and SHA-256 hash (`context_chars`, `context_sha256`, and `context_path`) in `args` and `prompt` inside `runs/local-assist/`; model outputs (`raw_response`, `normalized_response`, `parsed_output`), which may quote or transform the context, are stored in full.
+- **Audit redaction**: input `context` / `context_path` content is stored as length and SHA-256 hash (`context_chars`, `context_sha256`, and `context_path`) in `args` and `prompt` inside `runs/local-assist/` (`compress_context` and `extract_fields` likewise redact raw `text` to `text_chars` and `text_sha256`); model outputs (`raw_response`, `normalized_response`, `parsed_output`), which may quote or transform the context, are stored in full.
 - **Data-control rung accounting**: when invoked by a planner running on a lower-control rung (for example Claude Code on Rung 5 `standard_api` or a frontier model on Rung 2/3), any context read by the planner or any tool output returned to the planner enters that planner's data-control rung. Passing `context_path` (or `--context-file` on `scripts/delegate-local`) lets the local tool read a workspace file directly without placing its full raw text into the planner's outbound prompt, though the returned summary/output still enters the planner session.
 
 ## Model routing (`routing.py`)
@@ -125,7 +141,7 @@ JSONL index for fast scan, full payload as a sibling JSON file:
 
 ```json
 {
-  "ts": "2026-05-15T14:30:00-04:00",
+  "ts": "2026-10-31T14:30:00-04:00",
   "tool": "propose_eval_prompts",
   "requested_model": "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit",
   "served_model": "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit",
@@ -134,7 +150,7 @@ JSONL index for fast scan, full payload as a sibling JSON file:
   "usage": {"prompt_tokens": 120, "completion_tokens": 480},
   "latency_ms": 4321,
   "finish_reason": "stop",
-  "payload_path": "runs/local-assist/2026-05-15/14-30-00-propose-eval-prompts-a4f3.json"
+  "payload_path": "runs/local-assist/2026-10-31/14-30-00-propose-eval-prompts-a4f3.json"
 }
 ```
 
@@ -142,11 +158,11 @@ JSONL index for fast scan, full payload as a sibling JSON file:
 
 ## Lifecycle expectations
 
-- **Default fail-closed; opt-in `--auto-serve`.** By default (`LOCAL_ASSIST_AUTO_SERVE` unset), `local_assist` does not auto-start models: if port `8080` is down, it raises `model_unavailable` with remediation (`Run: ./scripts/serve-model qwen3-30b-a3b-2507-mlx-4bit (or pass --auto-serve / set LOCAL_ASSIST_AUTO_SERVE=1)`). When `--auto-serve` (or `LOCAL_ASSIST_AUTO_SERVE=1`) is explicitly enabled on `scripts/local-assist-server` or `scripts/delegate-local`, `ensure_local_model_served()` auto-starts the model via `scripts/serve-model <id> --started-by auto-serve` (serialized with `fcntl.flock` on `runs/.serve.lock`), gated on `trust_tier == "local"` and `routing.private_local == "cleared"`. Because `qwen3-30b-a3b-2507-mlx-4bit` holds ~16 GB resident memory, stop it when finished via `./scripts/stop-model qwen3-30b-a3b-2507-mlx-4bit`.
-- **Pre-chat listener verification (no silent hot-swap).** `mlx_lm.server` (`0.31.3`) lists every cached Hugging Face model on `/v1/models` and hot-swaps whichever `model` a chat request names. Therefore `ensure_local_model_served()` always runs `scripts/verify-served-model <id>` **before** any chat call: `verify-served-model` checks both `runs/.serve*.pid` records and live OS listener `--model <repo>` flags on the port (`lsof` + `ps`, failing closed if no listener with a matching `--model` flag can be identified; note that any future `trust_tier == "local"` custom runtime must also expose `--model <served_model_id>` or extend `extract_model_arg_from_command`) and exits with code `3` (`EXIT_MODEL_MISMATCH`) if another model is occupying port `8080`, failing closed before any chat request can trigger a hot-swap.
+- **Default fail-closed; opt-in `--auto-serve`.** By default (`LOCAL_ASSIST_AUTO_SERVE` unset), `local_assist` does not auto-start models: if port `8080` is down, it raises `model_unavailable` with remediation (`Run: ./scripts/serve-model qwen3-30b-a3b-2507-mlx-4bit (or pass --auto-serve / set LOCAL_ASSIST_AUTO_SERVE=1)`). When `--auto-serve` (or `LOCAL_ASSIST_AUTO_SERVE=1`) is explicitly enabled on `scripts/local-assist-server` or `scripts/delegate-local`, `ensure_local_model_served()` auto-starts the model via `scripts/serve-model <id> --started-by auto-serve` (serialized with `fcntl.flock` on `runs/.serve.lock`), gated on `trust_tier == "local"` and `routing.private_local == "cleared"`. Because `qwen3-30b-a3b-2507-mlx-4bit` holds ~16-18 GB resident memory, stop it when finished via `./scripts/stop-model qwen3-30b-a3b-2507-mlx-4bit`.
+- **Pre-chat listener verification (no silent hot-swap).** `mlx_lm.server` (`0.31.3`) lists every cached Hugging Face model on `/v1/models` and hot-swaps whichever `model` a chat request names. Therefore `ensure_local_model_served()` always runs `scripts/verify-served-model <id> --require-offline` **before** any chat call: `verify-served-model` checks both `runs/.serve*.pid` records (`pid_lstart` + `hf_offline: true`) and live OS listener `--model <repo>` flags on the port (`lsof` + `ps`, failing closed if no listener with a matching `--model` flag can be identified; note that any future `trust_tier == "local"` custom runtime must also expose `--model <served_model_id>` or extend `extract_model_arg_from_command`) and exits with code `3` (`EXIT_MODEL_MISMATCH`) if another model is occupying port `8080`, failing closed before any chat request can trigger a hot-swap.
 - **Per-call check and shared deadline.** After `ensure_local_model_served()` succeeds, `require_chat_succeeds()` verifies `/v1/models` and runs a short health-check chat call confirming `served_model == model` (note: in `mlx_lm.server`, `/v1/models` answers as soon as the HTTP listener binds while weights load on the generation thread during the smoke chat, and `served_model` echoes `requested_model` rather than providing independent proof; the pre-chat OS listener `--model` check is the authoritative occupant check). Every tool (`delegate_task`, `compress_context`, `extract_fields`, `propose_eval_prompts`) shares a single overall `default_timeout_seconds()` (`120`s) deadline across `ensure_local_model_served`, `require_chat_succeeds`, and the tool's `chat()` request.
 - **Workspace root for `context_path`.** `scripts/local-assist-server` exports `LOCAL_ASSIST_WORKSPACE_ROOT="${LOCAL_ASSIST_WORKSPACE_ROOT:-$(pwd -P)}"` before changing directory to the repository root, and `scripts/opencode-local` sets `LOCAL_ASSIST_WORKSPACE_ROOT` to the caller's target workspace directory. Avoid launching from `$HOME` (`~`) so `context_path` and `opencode`'s file tools stay scoped to a specific project directory.
-- **Endpoint unreachable / wrong model / chat mismatch / timeout / malformed output** → structured error raised. No retry, no auto-repair. The caller decides what to do.
+- **Endpoint unreachable / wrong model / chat mismatch / timeout / malformed output** -> structured error raised. No retry, no auto-repair. The caller decides what to do.
 
 ## Explicit non-goals
 
@@ -169,7 +185,7 @@ If you find yourself wanting one of these, measure that you need it in JSONL log
 - **Structured outputs**: tools return shape, not free text, so a skill can verify each item against external signals.
 - **Audit trail with observed values**: every call logged with what was asked, what was returned, and which model actually answered.
 - **Failure transparency**: endpoint, model, timeout, malformed output all surface as structured errors instead of vague chat failures.
-- **Cross-family separation preserved**: orchestrator (e.g., a frontier API model) is a different family from local model (a Qwen/Phi/etc. that you've reviewed and served). Skills doing the verification work get the cross-family benefit for free, as long as the local model never grades its own output.
+- **Cross-family separation preserved**: orchestrator (e.g., a frontier API model) is a different family from local model (a Qwen/gpt-oss/etc. that you've reviewed and served). Skills doing the verification work get the cross-family benefit for free, as long as the local model never grades its own output.
 
 ## Installing as an MCP server
 

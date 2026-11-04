@@ -1,5 +1,7 @@
 # Harmony Output Transform Decision
 
+> **Historical Note**: This record dates from the May 2026 `local-llm-lab` evaluation phase. Note that `phi-4-mlx-4bit` (referenced below in the historical May 14 run set) was subsequently removed from `models.yaml`; the current Rung 1 local models are `qwen3-1.7b-mlx-4bit`, `qwen3-30b-a3b-2507-mlx-4bit`, `qwen3-coder-30b-a3b-mlx-4bit`, and `gpt-oss-20b-mxfp4-q4`.
+
 ## Outcome
 
 `gpt-oss-20b-mxfp4-q4` uses the promptfoo-level harmony output transform as its operational normalization path.

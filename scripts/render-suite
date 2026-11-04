@@ -10,7 +10,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
-if VENV_PYTHON.exists() and Path(sys.executable) != VENV_PYTHON:
+if __name__ == "__main__" and VENV_PYTHON.exists() and Path(sys.executable) != VENV_PYTHON:
     os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), __file__, *sys.argv[1:]])
 
 sys.path.insert(0, str(ROOT))
@@ -85,15 +85,53 @@ def build_document() -> str:
 def _extract_suite_defaults(
     providers: list[dict[str, Any]], suite_name: str
 ) -> tuple[int, float, list[dict[str, Any]] | None]:
-    default_max_tokens = 60 if suite_name == "sanity" else (500 if suite_name == "tools" else 700)
-    default_temp = 0.0 if suite_name == "tools" else 0.2
-    suite_tools = None
-    for p in providers:
-        cfg = p.get("config") if isinstance(p, dict) else None
-        if isinstance(cfg, dict) and cfg.get("tools"):
-            suite_tools = cfg["tools"]
-            break
-    return default_max_tokens, default_temp, suite_tools
+    fallback_max_tokens = 60 if suite_name == "sanity" else (500 if suite_name == "tools" else 700)
+    fallback_temp = 0.0 if suite_name == "tools" else 0.2
+    if not providers:
+        return fallback_max_tokens, fallback_temp, None
+    found_max_tokens: int | None = None
+    found_temp: float | None = None
+    suite_tools: list[dict[str, Any]] | None = None
+    tools_seen = False
+    for idx, p in enumerate(providers):
+        if not isinstance(p, dict) or not isinstance(p.get("config"), dict):
+            raise ValueError(
+                f"Provider entry #{idx + 1} in suite '{suite_name}' is missing a 'config' mapping"
+            )
+        cfg = p["config"]
+        raw_mt = cfg.get("max_tokens")
+        raw_temp = cfg.get("temperature")
+        if isinstance(raw_mt, bool) or not isinstance(raw_mt, int):
+            raise ValueError(
+                f"Provider entry #{idx + 1} in suite '{suite_name}' must specify integer config.max_tokens"
+            )
+        if isinstance(raw_temp, bool) or not isinstance(raw_temp, (int, float)):
+            raise ValueError(
+                f"Provider entry #{idx + 1} in suite '{suite_name}' must specify numeric config.temperature"
+            )
+        cur_mt = int(raw_mt)
+        cur_temp = float(raw_temp)
+        cur_tools = cfg.get("tools")
+        if found_max_tokens is None:
+            found_max_tokens = cur_mt
+            found_temp = cur_temp
+            suite_tools = cur_tools
+            tools_seen = True
+        else:
+            if cur_mt != found_max_tokens:
+                raise ValueError(
+                    f"Provider templates in suite '{suite_name}' disagree on config.max_tokens ({found_max_tokens} vs {cur_mt})"
+                )
+            if cur_temp != found_temp:
+                raise ValueError(
+                    f"Provider templates in suite '{suite_name}' disagree on config.temperature ({found_temp} vs {cur_temp})"
+                )
+            if tools_seen and cur_tools != suite_tools:
+                raise ValueError(
+                    f"Provider templates in suite '{suite_name}' disagree on config.tools"
+                )
+    assert found_max_tokens is not None and found_temp is not None
+    return found_max_tokens, found_temp, suite_tools
 
 
 def _build_bound_provider_for_model(

@@ -249,17 +249,18 @@ def verify_swift_source(source_path: Path | None = None) -> str:
     return actual
 
 
-def verify_root_owned_binary_and_ancestors(binary_path: Path) -> None:
-    if binary_path.is_symlink():
+def verify_root_owned_binary_and_ancestors(binary_path: Path | str) -> None:
+    raw_str = str(binary_path)
+    if not os.path.isabs(raw_str):
         raise SEKeyIntegrityError(
-            f"Refusing symlinked FREE_INFERENCE_SE_PROXY_BIN: {binary_path}"
+            f"FREE_INFERENCE_SE_PROXY_BIN must be an absolute path: {binary_path}"
         )
-    if not binary_path.is_file():
+    raw_segments = [seg for seg in raw_str.replace("\\", "/").split("/") if seg]
+    if any(seg in (".", "..") for seg in raw_segments):
         raise SEKeyIntegrityError(
-            f"FREE_INFERENCE_SE_PROXY_BIN does not exist or is not a regular file: {binary_path}"
+            f"Refusing dot-segment traversal in FREE_INFERENCE_SE_PROXY_BIN: {binary_path}"
         )
-
-    current = binary_path.resolve()
+    current = Path(os.path.normpath(raw_str))
     visited: list[Path] = []
     while True:
         visited.append(current)
@@ -267,13 +268,25 @@ def verify_root_owned_binary_and_ancestors(binary_path: Path) -> None:
             break
         current = current.parent
 
-    for path in visited:
+    for idx, path in enumerate(visited):
         try:
             st = os.lstat(path)
         except OSError as exc:
+            if idx == 0:
+                raise SEKeyIntegrityError(
+                    f"FREE_INFERENCE_SE_PROXY_BIN does not exist or is not a regular file: {binary_path}"
+                ) from exc
             raise SEKeyIntegrityError(f"Could not stat {path}: {exc}") from exc
         if stat.S_ISLNK(st.st_mode):
+            if idx == 0:
+                raise SEKeyIntegrityError(
+                    f"Refusing symlinked FREE_INFERENCE_SE_PROXY_BIN: {binary_path}"
+                )
             raise SEKeyIntegrityError(f"Path component {path} is a symlink")
+        if idx == 0 and not stat.S_ISREG(st.st_mode):
+            raise SEKeyIntegrityError(
+                f"FREE_INFERENCE_SE_PROXY_BIN does not exist or is not a regular file: {binary_path}"
+            )
         if st.st_uid != 0:
             raise SEKeyIntegrityError(
                 f"Path component {path} must be owned by root (uid=0), got uid={st.st_uid}"
@@ -282,6 +295,10 @@ def verify_root_owned_binary_and_ancestors(binary_path: Path) -> None:
             raise SEKeyIntegrityError(
                 f"Path component {path} must not be group- or world-writable (mode={oct(st.st_mode & 0o777)})"
             )
+    if Path(raw_str).resolve() != Path(os.path.normpath(raw_str)):
+        raise SEKeyIntegrityError(
+            f"Canonical path mismatch for FREE_INFERENCE_SE_PROXY_BIN: {binary_path}"
+        )
 
 
 def build_se_key_proxy(
@@ -289,6 +306,7 @@ def build_se_key_proxy(
     include_test_binary: bool = False,
     source_path: Path | None = None,
     bin_dir: Path | None = None,
+    force: bool = False,
 ) -> dict[str, Any]:
     src = source_path or SWIFT_SOURCE_PATH
     source_sha = verify_swift_source(src)
@@ -300,21 +318,37 @@ def build_se_key_proxy(
     test_bin = target_dir / "se-key-proxy-test"
     stamp_file = target_dir / ".se-key-proxy.stamp"
 
-    subprocess.run(
-        ["swiftc", "-O", str(src), "-o", str(release_bin)],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=120,
-    )
-    subprocess.run(
-        ["codesign", "-f", "-s", "-", "--options", "runtime", str(release_bin)],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    release_sha = sha256_file(release_bin)
+    reuse_existing_release = False
+    if not force and release_bin.is_file() and stamp_file.is_file():
+        try:
+            verify_se_key_proxy_binary(
+                source_path=src,
+                stamp_path=stamp_file,
+                binary_path=release_bin,
+                env={},
+            )
+            reuse_existing_release = True
+        except SEKeyIntegrityError:
+            reuse_existing_release = False
+
+    if reuse_existing_release:
+        release_sha = sha256_file(release_bin)
+    else:
+        subprocess.run(
+            ["swiftc", "-O", str(src), "-o", str(release_bin)],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        subprocess.run(
+            ["codesign", "-f", "-s", "-", "--options", "runtime", str(release_bin)],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        release_sha = sha256_file(release_bin)
 
     test_sha: str | None = None
     if include_test_binary:
@@ -339,7 +373,8 @@ def build_se_key_proxy(
         "swiftc_version": swiftc_ver,
         "binary_sha256": release_sha,
     }
-    stamp_file.write_text(json.dumps(stamp_data, indent=2, sort_keys=True) + "\n")
+    if not reuse_existing_release:
+        stamp_file.write_text(json.dumps(stamp_data, indent=2, sort_keys=True) + "\n")
     return {
         **stamp_data,
         "release_binary": str(release_bin),
@@ -392,10 +427,12 @@ def verify_se_key_proxy_binary(
     if binary_path is not None:
         target_bin = binary_path
         if override_bin:
+            verify_root_owned_binary_and_ancestors(override_bin)
             verify_root_owned_binary_and_ancestors(target_bin)
+            target_bin = target_bin.resolve()
     elif override_bin:
-        target_bin = Path(override_bin)
-        verify_root_owned_binary_and_ancestors(target_bin)
+        verify_root_owned_binary_and_ancestors(override_bin)
+        target_bin = Path(override_bin).resolve()
     else:
         target_bin = RELEASE_BINARY_PATH
 

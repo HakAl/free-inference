@@ -30,6 +30,7 @@ from local_assist.registry import (
     SESSION_TOKEN_ENV_VAR,
     RegistryError,
     build_promptfoo_provider_entry,
+    get_process_lstart,
     resolve_endpoint,
 )
 from local_assist.se_key import (
@@ -55,16 +56,49 @@ def _load_script_module(name: str, rel_path: str) -> ModuleType:
     return mod
 
 
+_USED_TEST_PORTS: set[int] = set()
+
+
 def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return int(s.getsockname()[1])
+    for _ in range(50):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 0))
+            port = int(s.getsockname()[1])
+        if port <= 60000 and port not in _USED_TEST_PORTS and (port + 1000) not in _USED_TEST_PORTS:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s2:
+                try:
+                    s2.bind(("127.0.0.1", port + 1000))
+                except OSError:
+                    continue
+            _USED_TEST_PORTS.add(port)
+            _USED_TEST_PORTS.add(port + 1000)
+            return port
+    for candidate in range(25000, 59000, 17):
+        if candidate in _USED_TEST_PORTS or (candidate + 1000) in _USED_TEST_PORTS:
+            continue
+        with (
+            socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s1,
+            socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s2,
+        ):
+            try:
+                s1.bind(("127.0.0.1", candidate))
+                s2.bind(("127.0.0.1", candidate + 1000))
+            except OSError:
+                continue
+        _USED_TEST_PORTS.add(candidate)
+        _USED_TEST_PORTS.add(candidate + 1000)
+        return candidate
+    raise RuntimeError("Could not allocate a free loopback port <= 60000")
 
 
 class _ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
 
 
+@unittest.skipUnless(
+    sys.platform == "darwin" and shutil.which("swiftc") is not None,
+    "requires macOS and swiftc",
+)
 class SEKeyTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -904,7 +938,11 @@ class SEKeyTests(unittest.TestCase):
                     "attestation_method": "tinfoil-proxy-sigstore",
                 },
             }
-            fake_pid_record = {"pid": os.getpid(), "session_token_file": str(tok_file)}
+            fake_pid_record = {
+                "pid": os.getpid(),
+                "pid_lstart": get_process_lstart(os.getpid()),
+                "session_token_file": str(tok_file),
+            }
 
             # Render suite.yaml and opencode.json into disk directories while session token is active
             run_dir = tmp_dir / "eval_run"
@@ -1005,7 +1043,12 @@ class SEKeyTests(unittest.TestCase):
             ok_dead_up, msg_dead_up, _ = verify_mod.check_once_detailed(
                 ep,
                 1.0,
-                pid_record={"model_id": "tinfoil-tok-test", "pid": os.getpid(), "upstream_pid": 999999},
+                pid_record={
+                    "model_id": "tinfoil-tok-test",
+                    "pid": os.getpid(),
+                    "pid_lstart": get_process_lstart(os.getpid()),
+                    "upstream_pid": 999999,
+                },
                 runs_dir=tmp_dir,
             )
             self.assertFalse(ok_dead_up)
@@ -1900,6 +1943,7 @@ class SEKeyTests(unittest.TestCase):
                     "port": port,
                     "pid": None,
                     "upstream_pid": orphan_up.pid,
+                    "upstream_pid_lstart": get_process_lstart(orphan_up.pid),
                     "session_token_file": str(prov_tok),
                     "status": "starting",
                     "startup_nonce": "deadbeef",
@@ -2458,6 +2502,15 @@ class SEKeyTests(unittest.TestCase):
                 ("shasum", "#!/usr/bin/env bash\necho '6b526fe32244bcccfcfde3c5d181618b4b06b48498e649cd944cc9b64acf994b  bin/tinfoil-proxy'\n"),
                 ("codesign", "#!/usr/bin/env bash\necho 'TeamIdentifier=8KSH668LZT'\nexit 0\n"),
                 ("gh", "#!/usr/bin/env bash\nexit 1\n"),
+                ("curl", "#!/usr/bin/env bash\nexit 0\n"),
+                (
+                    "unzip",
+                    "#!/usr/bin/env bash\n"
+                    "# args: -q <zip> -d <dest>\n"
+                    "dest=\"${4:-.}\"\n"
+                    "printf '#!/usr/bin/env bash\\nexit 0\\n' > \"$dest/tinfoil-proxy-darwin-arm64\"\n"
+                    "exit 0\n",
+                ),
             ]:
                 p = fake_bin / cmd_name
                 p.write_text(body, encoding="utf-8")
@@ -2467,7 +2520,6 @@ class SEKeyTests(unittest.TestCase):
             tp.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
             os.chmod(tp, 0o755)
 
-            # Case 1: se-key selftest exits 77 (no Touch ID hardware) -> setup skips and succeeds (rc=0)
             se_key_stub = fake_repo / "scripts" / "se-key"
             se_key_stub.write_text(
                 "#!/usr/bin/env bash\nif [ \"$1\" = \"selftest\" ]; then exit 77; fi\nexit 0\n",
@@ -2477,6 +2529,23 @@ class SEKeyTests(unittest.TestCase):
 
             env = dict(os.environ)
             env["PATH"] = f"{fake_bin}:{env.get('PATH', '')}"
+            env.pop("FREE_INFERENCE_REQUIRE_GH_ATTESTATION", None)
+
+            # Case 0: Strict mode FREE_INFERENCE_REQUIRE_GH_ATTESTATION=1 fails closed when gh is unauthenticated
+            env_strict = dict(env)
+            env_strict["FREE_INFERENCE_REQUIRE_GH_ATTESTATION"] = "1"
+            proc_strict = subprocess.run(
+                [str(fake_repo / "scripts" / "setup")],
+                cwd=str(fake_repo),
+                env=env_strict,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            self.assertEqual(proc_strict.returncode, 1)
+            self.assertIn("FREE_INFERENCE_REQUIRE_GH_ATTESTATION=1", proc_strict.stderr)
+
+            # Case 1: Default setup with se-key selftest exit 77 and unauthenticated gh -> warns on gh, skips selftest, succeeds (rc=0)
             proc77 = subprocess.run(
                 [str(fake_repo / "scripts" / "setup")],
                 cwd=str(fake_repo),
@@ -2487,10 +2556,67 @@ class SEKeyTests(unittest.TestCase):
             )
             self.assertEqual(proc77.returncode, 0, msg=proc77.stderr + "\n" + proc77.stdout)
             self.assertIn("selftest skipped (exit 77", proc77.stdout)
+            self.assertIn("WARNING: 'gh' CLI is missing or not authenticated", proc77.stderr)
             self.assertIn("Setup complete.", proc77.stdout)
             self.assertEqual(npm_log.read_text(encoding="utf-8").strip(), "ci")
 
-            # Case 2: se-key selftest exits 1 -> setup fails closed (rc=1)
+            # Case 2 (QA F6a): Wrong tinfoil-proxy SHA-256 -> setup fails closed with SHA-256 mismatch
+            (fake_bin / "shasum").write_text(
+                "#!/usr/bin/env bash\necho '0000000000000000000000000000000000000000000000000000000000000000  bin/tinfoil-proxy'\n",
+                encoding="utf-8",
+            )
+            proc_bad_sha = subprocess.run(
+                [str(fake_repo / "scripts" / "setup")],
+                cwd=str(fake_repo),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            self.assertEqual(proc_bad_sha.returncode, 1)
+            self.assertIn("SHA-256 mismatch", proc_bad_sha.stderr)
+            (fake_bin / "shasum").write_text(
+                "#!/usr/bin/env bash\necho '6b526fe32244bcccfcfde3c5d181618b4b06b48498e649cd944cc9b64acf994b  bin/tinfoil-proxy'\n",
+                encoding="utf-8",
+            )
+
+            # Case 3 (QA F6b): codesign -v --strict failure -> setup fails closed
+            (fake_bin / "codesign").write_text(
+                "#!/usr/bin/env bash\nif [ \"$1\" = \"-v\" ]; then exit 1; fi\necho 'TeamIdentifier=8KSH668LZT'\nexit 0\n",
+                encoding="utf-8",
+            )
+            proc_bad_cs = subprocess.run(
+                [str(fake_repo / "scripts" / "setup")],
+                cwd=str(fake_repo),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            self.assertEqual(proc_bad_cs.returncode, 1)
+            self.assertIn("failed codesign -v --strict verification", proc_bad_cs.stderr)
+
+            # Case 4 (QA F6c): Wrong TeamIdentifier -> setup fails closed
+            (fake_bin / "codesign").write_text(
+                "#!/usr/bin/env bash\necho 'TeamIdentifier=WRONGTEAM9'\nexit 0\n",
+                encoding="utf-8",
+            )
+            proc_bad_team = subprocess.run(
+                [str(fake_repo / "scripts" / "setup")],
+                cwd=str(fake_repo),
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            self.assertEqual(proc_bad_team.returncode, 1)
+            self.assertIn("TeamIdentifier=8KSH668LZT", proc_bad_team.stderr)
+            (fake_bin / "codesign").write_text(
+                "#!/usr/bin/env bash\necho 'TeamIdentifier=8KSH668LZT'\nexit 0\n",
+                encoding="utf-8",
+            )
+
+            # Case 5: se-key selftest exits 1 -> setup fails closed (rc=1)
             se_key_stub.write_text(
                 "#!/usr/bin/env bash\nif [ \"$1\" = \"selftest\" ]; then exit 1; fi\nexit 0\n",
                 encoding="utf-8",
@@ -2505,7 +2631,7 @@ class SEKeyTests(unittest.TestCase):
             )
             self.assertEqual(proc1.returncode, 1)
 
-            # Case 3: Unsupported Node version (e.g. 18.19.0) -> setup fails early with actionable message
+            # Case 6: Unsupported Node version (e.g. 18.19.0) -> setup fails early with actionable message
             node_stub = fake_bin / "node"
             node_stub.write_text(
                 "#!/usr/bin/env bash\n"
@@ -2524,6 +2650,183 @@ class SEKeyTests(unittest.TestCase):
             )
             self.assertEqual(proc_node.returncode, 1)
             self.assertIn("^20.20.0 || >=22.22.0", proc_node.stderr)
+
+    def test_lexical_ancestor_symlink_and_with_session_token_scrubbing(self) -> None:
+        from local_assist.registry import get_process_lstart
+        from local_assist.se_key import verify_root_owned_binary_and_ancestors
+
+        with_tok_mod = _load_script_module("with_tok_scrub_test", "scripts/with-session-token")
+        se_key_mod = _load_script_module("se_key_cli_test", "scripts/se-key")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_dir = Path(tmp)
+
+            # 1. Lexical ancestor symlink check (review-agy 1) & dot-segment traversal (F6, PLAN-MINOR-5):
+            # a symlinked parent dir is rejected even if target is root-owned /usr/bin, and '..' after a symlink is rejected before abspath
+            sym_dir = tmp_dir / "sym_usr_bin"
+            sym_dir.symlink_to("/usr/bin")
+            with self.assertRaises(SEKeyIntegrityError) as ctx_sym:
+                verify_root_owned_binary_and_ancestors(sym_dir / "true")
+            self.assertIn("symlink", str(ctx_sym.exception).lower())
+
+            for dot_path in (
+                Path(f"{sym_dir}/../true"),
+                "/usr/bin/./true",
+                Path("relative/se-key-proxy"),
+            ):
+                with self.assertRaises(SEKeyIntegrityError) as ctx_dot:
+                    verify_root_owned_binary_and_ancestors(dot_path)
+                self.assertTrue(
+                    "dot-segment" in str(ctx_dot.exception).lower()
+                    or "absolute path" in str(ctx_dot.exception).lower(),
+                    str(ctx_dot.exception),
+                )
+
+            # 2. with-session-token strips ambient LOCAL_ASSIST_SESSION_TOKEN on Rung 1 local models while preserving PROMPTFOO_DISABLE_TELEMETRY=1
+            out_env_file = tmp_dir / "rung1_env.txt"
+            with patch.dict(
+                os.environ,
+                {
+                    SESSION_TOKEN_ENV_VAR: "se-session-" + ("a" * 64),
+                    "PROMPTFOO_DISABLE_TELEMETRY": "1",
+                },
+                clear=False,
+            ):
+                rc_local = with_tok_mod.main(
+                    [
+                        "scripts/with-session-token",
+                        "qwen3-1.7b-mlx-4bit",
+                        "--",
+                        sys.executable,
+                        "-c",
+                        f"import json, os, pathlib; pathlib.Path({str(out_env_file)!r}).write_text(json.dumps({{'tok': {SESSION_TOKEN_ENV_VAR!r} in os.environ, 'pf': os.environ.get('PROMPTFOO_DISABLE_TELEMETRY')}}))",
+                    ]
+                )
+            self.assertEqual(rc_local, 0)
+            env_res = json.loads(out_env_file.read_text(encoding="utf-8"))
+            self.assertIs(env_res["tok"], False)
+            self.assertEqual(env_res["pf"], "1")
+
+            # 3. with-session-token rejects dead proxy PID OR mismatched upstream_pid_lstart on Rung 3 models (review-agy 5, WORK-MINOR-1)
+            tok_file = tmp_dir / ".se-session-dead.token"
+            tok_file.write_text("se-session-" + ("b" * 64) + "\n", encoding="utf-8")
+            dead_pid_rec = {
+                "model_id": "tinfoil-deepseek-v4-1-flash",
+                "pid": 999999,
+                "pid_lstart": "Thu Jan  1 00:00:00 1970",
+                "session_token_file": str(tok_file),
+            }
+            with patch.object(with_tok_mod, "read_pid_record_for_model", return_value=dead_pid_rec):
+                rc_dead = with_tok_mod.main(
+                    [
+                        "scripts/with-session-token",
+                        "tinfoil-deepseek-v4-1-flash",
+                        "--",
+                        sys.executable,
+                        "-c",
+                        "pass",
+                    ]
+                )
+            self.assertEqual(rc_dead, 1)
+
+            my_lstart = get_process_lstart(os.getpid())
+            bad_upstream_rec = {
+                "model_id": "tinfoil-deepseek-v4-1-flash",
+                "pid": os.getpid(),
+                "pid_lstart": my_lstart,
+                "upstream_pid": os.getpid(),
+                "upstream_pid_lstart": "Thu Jan  1 00:00:00 1970",
+                "session_token_file": str(tok_file),
+            }
+            with patch.object(with_tok_mod, "read_pid_record_for_model", return_value=bad_upstream_rec):
+                rc_bad_up = with_tok_mod.main(
+                    [
+                        "scripts/with-session-token",
+                        "tinfoil-deepseek-v4-1-flash",
+                        "--",
+                        sys.executable,
+                        "-c",
+                        "pass",
+                    ]
+                )
+            self.assertEqual(rc_bad_up, 1)
+
+            # Missing or blank pid_lstart / upstream_pid_lstart on live PIDs must also be rejected (F2)
+            for missing_rec in (
+                {
+                    "model_id": "tinfoil-deepseek-v4-1-flash",
+                    "pid": os.getpid(),
+                    "pid_lstart": None,
+                    "session_token_file": str(tok_file),
+                },
+                {
+                    "model_id": "tinfoil-deepseek-v4-1-flash",
+                    "pid": os.getpid(),
+                    "pid_lstart": "   ",
+                    "session_token_file": str(tok_file),
+                },
+                {
+                    "model_id": "tinfoil-deepseek-v4-1-flash",
+                    "pid": os.getpid(),
+                    "pid_lstart": my_lstart,
+                    "upstream_pid": os.getpid(),
+                    "upstream_pid_lstart": "",
+                    "session_token_file": str(tok_file),
+                },
+            ):
+                with patch.object(with_tok_mod, "read_pid_record_for_model", return_value=missing_rec):
+                    self.assertEqual(
+                        with_tok_mod.main(
+                            [
+                                "scripts/with-session-token",
+                                "tinfoil-deepseek-v4-1-flash",
+                                "--",
+                                sys.executable,
+                                "-c",
+                                "pass",
+                            ]
+                        ),
+                        1,
+                    )
+
+            # 4. se-key rejects invalid Keychain service names with exit code 2 (L27)
+            for bad_svc in ("../bad", "spaces not allowed", ""):
+                self.assertEqual(
+                    se_key_mod.main(["scripts/se-key", "status", bad_svc]),
+                    2,
+                )
+
+    def test_build_se_key_proxy_preserves_verified_release_binary_cdhash(self) -> None:
+        from local_assist.se_key import EXPECTED_SWIFT_SOURCE_SHA256, SWIFT_SOURCE_PATH, sha256_file
+
+        self.assertEqual(sha256_file(SWIFT_SOURCE_PATH), EXPECTED_SWIFT_SOURCE_SHA256)
+        verified_path = verify_se_key_proxy_binary()
+        self.assertEqual(verified_path, RELEASE_BINARY_PATH.resolve())
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp_bin_dir = Path(td)
+            shutil.copy2(RELEASE_BINARY_PATH, tmp_bin_dir / "se-key-proxy")
+            shutil.copy2(STAMP_PATH, tmp_bin_dir / ".se-key-proxy.stamp")
+            before_sha = sha256_file(tmp_bin_dir / "se-key-proxy")
+
+            real_run = subprocess.run
+            swiftc_targets: list[str] = []
+
+            def spy_run(cmd: Any, *args: Any, **kwargs: Any) -> Any:
+                if isinstance(cmd, list) and cmd and cmd[0] == "swiftc" and "-o" in cmd:
+                    out_idx = cmd.index("-o") + 1
+                    if out_idx < len(cmd):
+                        swiftc_targets.append(Path(cmd[out_idx]).name)
+                return real_run(cmd, *args, **kwargs)
+
+            with patch("local_assist.se_key.subprocess.run", side_effect=spy_run):
+                res = build_se_key_proxy(
+                    include_test_binary=False,
+                    bin_dir=tmp_bin_dir,
+                )
+            self.assertEqual(swiftc_targets, [])
+            self.assertEqual(res["binary_sha256"], before_sha)
+            self.assertEqual(sha256_file(tmp_bin_dir / "se-key-proxy"), before_sha)
 
 
 if __name__ == "__main__":

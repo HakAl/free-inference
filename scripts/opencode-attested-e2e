@@ -19,12 +19,13 @@ from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parents[1]
 VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
-if VENV_PYTHON.exists() and Path(sys.executable) != VENV_PYTHON:
+if __name__ == "__main__" and VENV_PYTHON.exists() and Path(sys.executable) != VENV_PYTHON:
     os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), __file__, *sys.argv[1:]])
 
 sys.path.insert(0, str(ROOT))
 
 from local_assist.registry import (
+    get_process_lstart,
     load_model,
     pid_file_for_model,
     read_pid_record_for_model,
@@ -161,6 +162,7 @@ def run_offline_checks() -> dict[str, Any]:
             "repo": "gpt-oss-120b",
             "port": 8081,
             "pid": os.getpid(),
+            "pid_lstart": get_process_lstart(os.getpid()),
             "status": "ready",
             "startup_nonce": "nonce-gpt-1",
         }
@@ -452,11 +454,11 @@ def main(argv: list[str]) -> int:
                     "--max-tokens-cap",
                     "256",
                     "--max-request-bytes",
-                    "32768",
+                    "65536",
                     "--ttl-seconds",
                     "600",
                     "--max-session-usd",
-                    "0.05",
+                    "0.10",
                 ]
             )
         cmd_live.extend(
@@ -492,7 +494,7 @@ def main(argv: list[str]) -> int:
                     pass
         token_verified = smoke_token in out_live
 
-        if not attached_to_existing_proxy:
+        if rc_live == 0 and not attached_to_existing_proxy:
             # Verify that the 4-request se-key-proxy cap blocks excess requests with HTTP 429
             pid_rec = read_pid_record_for_model(model_id)
             ep_live = resolve_endpoint(

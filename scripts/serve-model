@@ -20,19 +20,24 @@ from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parents[1]
 VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
-if VENV_PYTHON.exists() and Path(sys.executable) != VENV_PYTHON:
+if __name__ == "__main__" and VENV_PYTHON.exists() and Path(sys.executable) != VENV_PYTHON:
     os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), __file__, *sys.argv[1:]])
 
 sys.path.insert(0, str(ROOT))
 
 from local_assist.registry import (
+    BASE_SAFE_ENV_ALLOWLIST,
     LOCAL_HOSTS,
+    LOCAL_RUNTIMES,
     RegistryError,
     build_base_url,
+    get_process_lstart,
     legacy_pid_file,
     list_pid_records,
     load_model,
     pid_file_for_model,
+    pid_is_alive,
+    pid_matches_record,
     read_pid_record_for_model,
     resolve_endpoint,
     session_token_file_for_model,
@@ -46,19 +51,34 @@ from local_assist.se_key import (
 
 RUNS = ROOT / "runs"
 DEFAULT_PORT = 8080
+DEFAULT_MAX_TOKENS_CAP = 4096
 CUSTOM_COMMAND_RUNTIMES = {"proxy", "mlx-vlm", "vllm-mlx", "omlx", "llama.cpp"}
+SERVE_ENV_ALLOWLIST = BASE_SAFE_ENV_ALLOWLIST | frozenset({
+    "COLORTERM",
+    "HOME",
+    "MLX_METAL_BUFFER_CACHE_LIMIT_KB",
+})
+TINFOIL_CHILD_ENV_ALLOWLIST = BASE_SAFE_ENV_ALLOWLIST | frozenset({
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "NO_PROXY",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+})
+SE_KEY_PROXY_CHILD_ENV_ALLOWLIST = BASE_SAFE_ENV_ALLOWLIST | frozenset({
+    "HOME",
+})
 
 
 def _pid_is_alive(pid: int) -> bool:
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except PermissionError:
-        return True
-    except OSError:
-        return False
+    return pid_is_alive(pid)
+
+
+def _require_process_lstart(pid: int) -> str:
+    lstart = get_process_lstart(pid)
+    if not lstart:
+        raise RuntimeError(f"Could not determine process start time (lstart) for pid={pid}")
+    return lstart
 
 
 def _port_is_bound(host: str, port: int) -> bool:
@@ -156,22 +176,56 @@ def build_serve_env(
     base_env: dict[str, str] | None = None,
 ) -> dict[str, str]:
     src = base_env if base_env is not None else os.environ
-    env = {
-        **src,
-        "HF_HUB_ENABLE_HF_TRANSFER": src.get("HF_HUB_ENABLE_HF_TRANSFER", "1"),
-        "HF_HOME": str(ROOT / ".home" / "huggingface"),
-        "HF_HUB_CACHE": str(ROOT / ".home" / "huggingface" / "hub"),
+    env: dict[str, str] = {
+        k: v for k, v in src.items() if k in SERVE_ENV_ALLOWLIST and isinstance(v, str)
     }
-    if getattr(endpoint, "trust_tier", None) == "local" and not allow_hf_online:
-        # Force offline mode for local models so cached models never phone home to
-        # huggingface.co on server startup, even if HF_HUB_OFFLINE=0 is in the parent env.
-        env["HF_HUB_OFFLINE"] = "1"
+    env["HF_HOME"] = str(ROOT / ".home" / "huggingface")
+    env["HF_HUB_CACHE"] = str(ROOT / ".home" / "huggingface" / "hub")
+    env["HF_HUB_DISABLE_TELEMETRY"] = "1"
+    env["DO_NOT_TRACK"] = "1"
+    is_local = getattr(endpoint, "trust_tier", None) == "local"
+    if is_local and allow_hf_online:
+        env["HF_HUB_ENABLE_HF_TRANSFER"] = src.get("HF_HUB_ENABLE_HF_TRANSFER", "1")
+        for key in ("HF_TOKEN", "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
+            val = src.get(key)
+            if isinstance(val, str):
+                env[key] = val
+    else:
+        env["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+        if is_local:
+            # Force offline mode for local models so cached models never phone home to
+            # huggingface.co on server startup, even if HF_HUB_OFFLINE=0 is in the parent env.
+            env["HF_HUB_OFFLINE"] = "1"
+            env["TRANSFORMERS_OFFLINE"] = "1"
     return env
+
+
+def build_tinfoil_child_env(
+    base_env: dict[str, str] | None = None,
+    *,
+    isolated_home: Path | None = None,
+) -> dict[str, str]:
+    src = base_env if base_env is not None else os.environ
+    env: dict[str, str] = {
+        k: v for k, v in src.items() if k in TINFOIL_CHILD_ENV_ALLOWLIST and isinstance(v, str)
+    }
+    env["HOME"] = str(isolated_home if isolated_home is not None else (ROOT / ".home"))
+    return env
+
+
+def build_se_key_proxy_child_env(
+    base_env: dict[str, str] | None = None,
+) -> dict[str, str]:
+    src = base_env if base_env is not None else os.environ
+    return {
+        k: v for k, v in src.items() if k in SE_KEY_PROXY_CHILD_ENV_ALLOWLIST and isinstance(v, str)
+    }
 
 
 def _write_exclusive_session_token(path: Path, token: str) -> None:
     path.unlink(missing_ok=True)
-    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(str(path), flags, 0o600)
     try:
         os.fchmod(fd, 0o600)
         os.write(fd, (token + "\n").encode("utf-8"))
@@ -320,8 +374,8 @@ def main(argv: list[str]) -> int:
         "--max-tokens-cap",
         dest="max_tokens_cap",
         type=int,
-        default=0,
-        help="Maximum max_tokens cap enforced by se-key-proxy per chat request (0 = no proxy cap, default: 0).",
+        default=DEFAULT_MAX_TOKENS_CAP,
+        help=f"Maximum max_tokens cap enforced by se-key-proxy per chat request (0 = no proxy cap, default: {DEFAULT_MAX_TOKENS_CAP}).",
     )
     parser.add_argument(
         "--max-request-bytes",
@@ -359,12 +413,15 @@ def main(argv: list[str]) -> int:
         print(str(exc), file=sys.stderr)
         return 1
 
-    if endpoint.runtime == "remote":
+    if args.allow_hf_online and (
+        endpoint.trust_tier != "local" or endpoint.runtime not in LOCAL_RUNTIMES
+    ):
         print(
-            f"Model {endpoint.model_id} uses runtime=remote ({endpoint.api_base_url}); "
-            "no local server process to start. Run scripts/verify-served-model to check reachability."
+            f"--allow-hf-online is only supported for Rung 1 local models (runtime in {sorted(LOCAL_RUNTIMES)}), "
+            f"got model '{endpoint.model_id}' (tier={endpoint.trust_tier}, runtime={endpoint.runtime}).",
+            file=sys.stderr,
         )
-        return 0
+        return 2
 
     host = endpoint.host
     if host not in LOCAL_HOSTS:
@@ -397,6 +454,12 @@ def main(argv: list[str]) -> int:
         raw_serve_cmd = model.get("serve_command")
         if isinstance(raw_serve_cmd, str) and raw_serve_cmd.strip():
             upstream_port = port + 1000
+            if upstream_port > 65535:
+                print(
+                    f"Refusing to start '{endpoint.model_id}': upstream port {upstream_port} (port + 1000) exceeds 65535.",
+                    file=sys.stderr,
+                )
+                return 1
             upstream_cmd, err = build_command(
                 model,
                 runtime=endpoint.runtime,
@@ -437,14 +500,28 @@ def main(argv: list[str]) -> int:
     with lock_path.open("w") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         same_model_record: dict[str, Any] | None = None
+        legacy_port_record: dict[str, Any] | None = None
         for _, rec in list_pid_records(RUNS):
             rec_pid = rec.get("pid")
             rec_up_pid = rec.get("upstream_pid")
             rec_port = rec.get("port", DEFAULT_PORT)
             rec_model_id = rec.get("model_id")
             if isinstance(rec_pid, int) and rec_port == port and rec_pid > 0:
-                alive = _pid_is_alive(rec_pid)
-                if alive and isinstance(rec_up_pid, int) and not _pid_is_alive(rec_up_pid):
+                rec_lstart = rec.get("pid_lstart")
+                rec_up_lstart = rec.get("upstream_pid_lstart")
+                if _pid_is_alive(rec_pid) and (
+                    not (isinstance(rec_lstart, str) and rec_lstart.strip())
+                    or (
+                        isinstance(rec_up_pid, int)
+                        and _pid_is_alive(rec_up_pid)
+                        and not (isinstance(rec_up_lstart, str) and rec_up_lstart.strip())
+                    )
+                ):
+                    legacy_port_record = rec
+                alive = _pid_is_alive(rec_pid) and pid_matches_record(rec_pid, rec_lstart)
+                if alive and isinstance(rec_up_pid, int) and not (
+                    _pid_is_alive(rec_up_pid) and pid_matches_record(rec_up_pid, rec_up_lstart)
+                ):
                     alive = False
                 if alive and rec_model_id:
                     if rec_model_id != endpoint.model_id:
@@ -465,14 +542,25 @@ def main(argv: list[str]) -> int:
             print(json.dumps(same_model_record, indent=2))
             return 0
 
+        if legacy_port_record is not None:
+            leg_model = str(legacy_port_record.get("model_id") or endpoint.model_id)
+            print(
+                f"Refusing to reuse or overwrite server on port {port} ({api_base_url}): "
+                f"legacy PID record for '{leg_model}' (pid={legacy_port_record.get('pid')}) lacks process start-time metadata (pid_lstart). "
+                f"Inspect with './scripts/stop-model {leg_model}', then run './scripts/stop-model --force-legacy {leg_model}' (if it is your old server) "
+                f"or './scripts/stop-model --discard-legacy {leg_model}' (if the PID was reused by another process).",
+                file=sys.stderr,
+            )
+            return 1
+
         if health(api_base_url, endpoint.api_key):
-            print(f"A server is already responding on port {port} ({api_base_url}).")
-            existing = read_pid_record_for_model(endpoint.model_id, RUNS)
-            if existing:
-                print(json.dumps(existing, indent=2))
-            elif legacy_pid_file(RUNS).exists():
-                print(legacy_pid_file(RUNS).read_text().strip())
-            return 0
+            print(
+                f"Refusing to reuse server on port {port} ({api_base_url}): "
+                f"no matching active PID record found for '{endpoint.model_id}'. "
+                f"Stop the unmanaged process on port {port} first.",
+                file=sys.stderr,
+            )
+            return 1
 
         log = RUNS / "serve.log"
         serve_env = build_serve_env(endpoint, allow_hf_online=args.allow_hf_online)
@@ -523,7 +611,9 @@ def main(argv: list[str]) -> int:
                     "api_base_url": api_base_url,
                     "port": port,
                     "pid": None,
+                    "pid_lstart": None,
                     "upstream_pid": None,
+                    "upstream_pid_lstart": None,
                     "upstream_port": upstream_port,
                     "upstream_url": upstream_url,
                     "session_token_file": str(token_path),
@@ -554,7 +644,7 @@ def main(argv: list[str]) -> int:
                             print("Starting upstream proxy:", " ".join(shlex.quote(part) for part in upstream_cmd))
                             isolated_upstream_home = ROOT / ".home"
                             isolated_upstream_home.mkdir(parents=True, exist_ok=True)
-                            upstream_env = {**serve_env, "HOME": str(isolated_upstream_home)}
+                            upstream_env = build_tinfoil_child_env(isolated_home=isolated_upstream_home)
                             with log.open("a") as log_fh:
                                 upstream_proc = subprocess.Popen(
                                     upstream_cmd,
@@ -565,6 +655,7 @@ def main(argv: list[str]) -> int:
                                     start_new_session=True,
                                 )
                             provisional_record["upstream_pid"] = upstream_proc.pid
+                            provisional_record["upstream_pid_lstart"] = _require_process_lstart(upstream_proc.pid)
                             _write_pid_files(model_pid_file, default_pid_file, provisional_record)
 
                         assert upstream_port is not None
@@ -623,17 +714,19 @@ def main(argv: list[str]) -> int:
                         _assert_provisional_record_active(model_pid_file, startup_nonce)
                         provisional_record["command"] = se_cmd
                         print("Starting se-key-proxy (Touch ID required):", " ".join(shlex.quote(part) for part in se_cmd[:8]), "...")
+                        se_child_env = build_se_key_proxy_child_env()
                         with log.open("a") as log_fh:
                             se_proc = subprocess.Popen(
                                 se_cmd,
                                 cwd=ROOT,
                                 stdout=log_fh,
                                 stderr=subprocess.STDOUT,
-                                env=serve_env,
+                                env=se_child_env,
                                 pass_fds=(tok_r, ready_w),
                                 start_new_session=True,
                             )
                         provisional_record["pid"] = se_proc.pid
+                        provisional_record["pid_lstart"] = _require_process_lstart(se_proc.pid)
                         _write_pid_files(model_pid_file, default_pid_file, provisional_record)
 
                     os.close(tok_r)
@@ -718,6 +811,7 @@ def main(argv: list[str]) -> int:
                 "api_base_url": api_base_url,
                 "port": port,
                 "pid": None,
+                "pid_lstart": None,
                 "command": cmd,
                 "log": str(log),
                 "started_at": started_at_str,
@@ -744,6 +838,7 @@ def main(argv: list[str]) -> int:
                         )
                     ready_local = dict(provisional_local)
                     ready_local["pid"] = proc.pid
+                    ready_local["pid_lstart"] = _require_process_lstart(proc.pid)
                     ready_local["status"] = "ready"
                     _write_pid_files(model_pid_file, default_pid_file, ready_local)
             except BaseException as exc:

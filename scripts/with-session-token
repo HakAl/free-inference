@@ -8,7 +8,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
-if VENV_PYTHON.exists() and Path(sys.executable) != VENV_PYTHON:
+if __name__ == "__main__" and VENV_PYTHON.exists() and Path(sys.executable) != VENV_PYTHON:
     os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), __file__, *sys.argv[1:]])
 
 sys.path.insert(0, str(ROOT))
@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT))
 from local_assist.registry import (
     RegistryError,
     load_model,
+    pid_matches_record,
     read_pid_record_for_model,
     resolve_endpoint,
 )
@@ -49,6 +50,38 @@ def main(argv: list[str]) -> int:
 
     child_env = dict(os.environ)
     if endpoint.api_key_keychain_service:
+        rec_pid = pid_record.get("pid") if isinstance(pid_record, dict) else None
+        rec_lstart = pid_record.get("pid_lstart") if isinstance(pid_record, dict) else None
+        up_pid = pid_record.get("upstream_pid") if isinstance(pid_record, dict) else None
+        up_lstart = pid_record.get("upstream_pid_lstart") if isinstance(pid_record, dict) else None
+        if isinstance(rec_pid, int) and not (isinstance(rec_lstart, str) and rec_lstart.strip()):
+            print(
+                f"Model {model_id} has a legacy PID record (pid={rec_pid}) lacking verified pid_lstart. "
+                f"Inspect with './scripts/stop-model {model_id}', then run './scripts/stop-model --force-legacy {model_id}' (or '--discard-legacy') and relaunch via './scripts/serve-model {model_id}'.",
+                file=sys.stderr,
+            )
+            return 1
+        if not isinstance(rec_pid, int) or not pid_matches_record(rec_pid, rec_lstart):
+            print(
+                f"Model {model_id} uses apiKeyKeychainService='{endpoint.api_key_keychain_service}', "
+                "but no active se-key-proxy process is running. Run scripts/serve-model first.",
+                file=sys.stderr,
+            )
+            return 1
+        if isinstance(up_pid, int) and not (isinstance(up_lstart, str) and up_lstart.strip()):
+            print(
+                f"Model {model_id} has a legacy upstream PID record (upstream_pid={up_pid}) lacking verified upstream_pid_lstart. "
+                f"Inspect with './scripts/stop-model {model_id}', then run './scripts/stop-model --force-legacy {model_id}' (or '--discard-legacy') and relaunch via './scripts/serve-model {model_id}'.",
+                file=sys.stderr,
+            )
+            return 1
+        if isinstance(up_pid, int) and not pid_matches_record(up_pid, up_lstart):
+            print(
+                f"Model {model_id} uses apiKeyKeychainService='{endpoint.api_key_keychain_service}', "
+                f"but upstream proxy PID {up_pid} is not alive or start time mismatched. Run scripts/serve-model first.",
+                file=sys.stderr,
+            )
+            return 1
         if not endpoint.api_key.startswith("se-session-"):
             print(
                 f"Model {model_id} uses apiKeyKeychainService='{endpoint.api_key_keychain_service}', "
@@ -57,6 +90,8 @@ def main(argv: list[str]) -> int:
             )
             return 1
         child_env["LOCAL_ASSIST_SESSION_TOKEN"] = endpoint.api_key
+    else:
+        child_env.pop("LOCAL_ASSIST_SESSION_TOKEN", None)
 
     cp = subprocess.run(cmd, env=child_env, check=False)
     return cp.returncode

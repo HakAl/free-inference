@@ -5,11 +5,16 @@ import importlib.util
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from local_assist._miniyaml import safe_load
 from local_assist.client import base_url as client_base_url, check_private_coding_admission
@@ -534,7 +539,9 @@ class RegistryAndToolsTests(unittest.TestCase):
         }
         tee_model_cleared = {
             **tee_model,
+            "id": "tinfoil-deepseek-v4-1-flash",
             "routing": {"private_attested": "cleared"},
+            "eval_evidence_artifact": "docs/evals/tinfoil-deepseek-v4-1-flash.json",
         }
         registry_fixture = [local_model, tee_model_cleared, std_model]
         saved_base_url = os.environ.pop("LOCAL_ASSIST_BASE_URL", None)
@@ -610,8 +617,18 @@ class RegistryAndToolsTests(unittest.TestCase):
             p_dash = pid_file_for_model("org-model", runs)
             self.assertNotEqual(p_slash, p_dash)
 
-            rec_slash = {"model_id": "org/model", "port": 8080, "pid": 999991}
-            rec_dash = {"model_id": "org-model", "port": 8081, "pid": 999992}
+            rec_slash = {
+                "model_id": "org/model",
+                "port": 8080,
+                "pid": 999991,
+                "pid_lstart": "Mon Nov  2 00:00:00 2026",
+            }
+            rec_dash = {
+                "model_id": "org-model",
+                "port": 8081,
+                "pid": 999992,
+                "pid_lstart": "Mon Nov  2 00:00:00 2026",
+            }
             p_slash.write_text(json.dumps(rec_slash))
             p_dash.write_text(json.dumps(rec_dash))
             legacy_pid_file(runs).write_text(json.dumps(rec_dash))
@@ -629,7 +646,11 @@ class RegistryAndToolsTests(unittest.TestCase):
 
             stop_mod = _load_script_module("stop_model_script", "scripts/stop-model")
             stop_mod.RUNS = runs
-            with patch("os.kill") as mock_kill:
+            with (
+                patch("os.kill") as mock_kill,
+                patch.object(stop_mod, "pid_is_alive", side_effect=[True, False]),
+                patch.object(stop_mod, "get_process_lstart", return_value="Mon Nov  2 00:00:00 2026"),
+            ):
                 rc = stop_mod.main(["scripts/stop-model", "org/model"])
                 self.assertEqual(rc, 0)
                 mock_kill.assert_not_called()
@@ -2114,11 +2135,12 @@ class RegistryAndToolsTests(unittest.TestCase):
         # 4. Local model missing tool_calling capability is rejected
         no_tools_ep = resolve_endpoint(
             {
-                "id": "local-no-tools",
+                "id": "qwen3-30b-a3b-2507-mlx-4bit",
                 "repo": "org/no-tools",
                 "runtime": "mlx-lm",
                 "capabilities": {"tool_calling": False},
                 "routing": {"private_local": "cleared"},
+                "eval_evidence_artifact": "docs/evals/qwen3-30b-a3b-2507-mlx-4bit.json",
                 "promptfoo_provider": {"apiBaseUrl": "http://127.0.0.1:8080/v1"},
             }
         )
@@ -2278,16 +2300,22 @@ class RegistryAndToolsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp_runs:
             runs_dir = Path(tmp_runs)
             serve_mod.RUNS = runs_dir
+            orig_popen = subprocess.Popen
 
             class FakePopen:
                 def __init__(self, *args: object, **kwargs: object) -> None:
                     self.pid = os.getpid()
 
+                def poll(self) -> None:
+                    return None
+
             popen_calls: list[ tuple[object, ...] ] = []
 
-            def track_popen(*args: object, **kwargs: object) -> FakePopen:
-                popen_calls.append(args)
-                return FakePopen(*args, **kwargs)
+            def track_popen(cmd_arg: Any, *args: object, **kwargs: object) -> Any:
+                if isinstance(cmd_arg, list) and cmd_arg and cmd_arg[0] == "ps":
+                    return orig_popen(cmd_arg, *args, **kwargs)
+                popen_calls.append((cmd_arg, *args))
+                return FakePopen(cmd_arg, *args, **kwargs)
 
             with (
                 patch.object(serve_mod, "health", return_value=False),
@@ -2320,12 +2348,13 @@ class RegistryAndToolsTests(unittest.TestCase):
 
         cleared_rung3 = resolve_endpoint(
             {
-                "id": "tee-cleared",
+                "id": "tinfoil-deepseek-v4-1-flash",
                 "repo": "org/tee",
                 "runtime": "proxy",
                 "serve_command": "tinfoil-proxy --bind {host} --port {port}",
                 "capabilities": {"tool_calling": True},
                 "routing": {"private_local": "blocked", "private_attested": "cleared"},
+                "eval_evidence_artifact": "docs/evals/tinfoil-deepseek-v4-1-flash.json",
                 "promptfoo_provider": {
                     "apiBaseUrl": "http://127.0.0.1:8081/v1",
                     "apiKeyKeychainService": "free-inference.tinfoil",
@@ -2348,6 +2377,7 @@ class RegistryAndToolsTests(unittest.TestCase):
                 "runtime": "mlx-lm",
                 "capabilities": {"tool_calling": True},
                 "routing": {"private_attested": "cleared"},
+                "eval_evidence_artifact": "docs/evals/qwen3-30b-a3b-2507-mlx-4bit.json",
                 "promptfoo_provider": {"apiBaseUrl": "http://127.0.0.1:8080/v1"},
             },
             {
@@ -2356,6 +2386,7 @@ class RegistryAndToolsTests(unittest.TestCase):
                 "runtime": "proxy",
                 "capabilities": {"tool_calling": True},
                 "routing": {"private_attested": "cleared"},
+                "eval_evidence_artifact": "docs/evals/tinfoil-deepseek-v4-1-flash.json",
                 "promptfoo_provider": {
                     "apiBaseUrl": "http://127.0.0.1:8083/v1",
                     "apiKeyKeychainService": "free-inference.zdr",
@@ -2370,6 +2401,7 @@ class RegistryAndToolsTests(unittest.TestCase):
                 "serve_command": "tinfoil-proxy --bind {host} --port {port}",
                 "capabilities": {"tool_calling": False},
                 "routing": {"private_attested": "cleared"},
+                "eval_evidence_artifact": "docs/evals/tinfoil-deepseek-v4-1-flash.json",
                 "promptfoo_provider": {
                     "apiBaseUrl": "http://127.0.0.1:8081/v1",
                     "apiKeyKeychainService": "free-inference.tinfoil",
@@ -2462,6 +2494,8 @@ class RegistryAndToolsTests(unittest.TestCase):
             load_model("tinfoil-deepseek-v4-1-flash"), require_api_key=False
         )
 
+        from local_assist.registry import get_process_lstart
+
         with tempfile.TemporaryDirectory() as tmp_runs_str:
             tmp_runs = Path(tmp_runs_str)
             gpt_pid_file = pid_file_for_model("tinfoil-gpt-oss-120b", tmp_runs)
@@ -2470,6 +2504,7 @@ class RegistryAndToolsTests(unittest.TestCase):
                 "repo": "gpt-oss-120b",
                 "port": 8081,
                 "pid": os.getpid(),
+                "pid_lstart": get_process_lstart(os.getpid()),
                 "status": "ready",
                 "startup_nonce": "nonce-1",
             }
@@ -2715,6 +2750,9 @@ class RegistryAndToolsTests(unittest.TestCase):
             self.assertNotIn("TINFOIL_API_KEY", env)
 
     def test_online_bootstrap_handoff_refused_until_restarted_offline(self) -> None:
+        from local_assist.registry import get_process_lstart
+
+        real_self_lstart = get_process_lstart(os.getpid())
         serve_mod = _load_script_module("serve_model_handoff", "scripts/serve-model")
         verify_mod = _load_script_module("verify_served_handoff", "scripts/verify-served-model")
         oc_local = _load_script_module("opencode_local_handoff", "scripts/opencode-local")
@@ -2736,6 +2774,7 @@ class RegistryAndToolsTests(unittest.TestCase):
             # 1. Start local server with --allow-hf-online (simulating initial weight download)
             with (
                 patch.object(serve_mod, "health", return_value=False),
+                patch.object(serve_mod, "get_process_lstart", return_value=real_self_lstart),
                 patch.object(serve_mod.subprocess, "Popen", side_effect=FakePopen),
             ):
                 rc_online = serve_mod.main(["scripts/serve-model", model_id, "--allow-hf-online"])
@@ -2774,6 +2813,7 @@ class RegistryAndToolsTests(unittest.TestCase):
 
             with (
                 patch.object(serve_mod, "health", return_value=False),
+                patch.object(serve_mod, "get_process_lstart", return_value=real_self_lstart),
                 patch.object(serve_mod.subprocess, "Popen", side_effect=FakePopen),
             ):
                 rc_offline = serve_mod.main(["scripts/serve-model", model_id])
@@ -2784,6 +2824,919 @@ class RegistryAndToolsTests(unittest.TestCase):
 
             served_ok2, served_err2 = oc_local.ensure_model_served(ep, run_cmd=_run_verify_against_tmp)
             self.assertTrue(served_ok2, msg=served_err2)
+
+    def test_miniyaml_parity_and_fail_closed_grammar(self) -> None:
+        from local_assist._miniyaml import _MiniYamlParser
+
+        try:
+            import yaml as pyyaml  # type: ignore[import-untyped]
+        except ImportError:
+            pyyaml = None
+
+        if (
+            os.environ.get("FREE_INFERENCE_REQUIRE_PYYAML_PARITY") == "1"
+            or Path(sys.executable) == ROOT / ".venv" / "bin" / "python"
+        ):
+            self.assertIsNotNone(pyyaml, "PyYAML must be installed when running parity checks in .venv or CI parity step")
+
+        yaml_paths = [
+            ROOT / "models.yaml",
+            ROOT / "promptfooconfig.yaml",
+            ROOT / "evals" / "suites" / "v1.yaml",
+            ROOT / "evals" / "suites" / "tools.yaml",
+        ]
+        for yp in yaml_paths:
+            text = yp.read_text(encoding="utf-8")
+            mini_loaded = _MiniYamlParser(text).parse()
+            self.assertIsInstance(mini_loaded, dict)
+            if pyyaml is not None:
+                self.assertEqual(mini_loaded, pyyaml.safe_load(text), f"Parity mismatch on {yp}")
+
+        # Quoted mapping keys and quoted list scalars work identically to PyYAML (F4, PLAN-MINOR-4)
+        quoted_keys_sample = (
+            'routing:\n'
+            '  "private_attested": cleared\n'
+            "  'private_local': blocked\n"
+            "'key:with:colons': 42\n"
+            "items:\n"
+            '  - "a: b"\n'
+            "  - 'c: d'\n"
+            '  - "it\'s": "quoted_map_item"\n'
+        )
+        qk_parsed = _MiniYamlParser(quoted_keys_sample).parse()
+        self.assertEqual(
+            qk_parsed,
+            {
+                "routing": {"private_attested": "cleared", "private_local": "blocked"},
+                "key:with:colons": 42,
+                "items": ["a: b", "c: d", {"it's": "quoted_map_item"}],
+            },
+        )
+        if pyyaml is not None:
+            self.assertEqual(qk_parsed, pyyaml.safe_load(quoted_keys_sample))
+
+        # Apostrophes in plain scalars work identically to PyYAML (WORK-MINOR-4)
+        apostrophe_sample = "note: don't stop\nitems:\n  - it's fine # comment\n"
+        ap_parsed = _MiniYamlParser(apostrophe_sample).parse()
+        self.assertEqual(ap_parsed, {"note": "don't stop", "items": ["it's fine"]})
+        if pyyaml is not None:
+            self.assertEqual(ap_parsed, pyyaml.safe_load(apostrophe_sample))
+
+        # Folded block scalar (> and >-) parity
+        folded_sample = (
+            "summary: >\n"
+            "  first line\n"
+            "  second line\n"
+            "\n"
+            "  new paragraph\n"
+            "    indented line\n"
+            "  after indented\n"
+            "stripped: >-\n"
+            "  alpha\n"
+            "  beta\n"
+        )
+        folded_mini = _MiniYamlParser(folded_sample).parse()
+        self.assertEqual(
+            folded_mini["summary"],
+            "first line second line\nnew paragraph\n  indented line\nafter indented\n",
+        )
+        self.assertEqual(folded_mini["stripped"], "alpha beta")
+        if pyyaml is not None:
+            self.assertEqual(folded_mini, pyyaml.safe_load(folded_sample))
+
+        # Fail-closed grammar checks (M6, F4, PLAN-MINOR-4)
+        for bad_yaml in (
+            'key: "unterminated quote\nnext: 1\n',
+            "key: 'unterminated single\n",
+            "key: unquoted: nested: colon\n",
+            "key: {a: 1}\n",
+            "key: [1, 2]\n",
+            "key: &\n",
+            "key: *undefined_alias\n",
+            "key: !custom_tag value\n",
+            "key: yes\n",
+            "key: no\n",
+            "key: 0123\n",
+            "key: 0x10\n",
+            "key: 1e3\n",
+            "a: 1\nb\n",
+            "a: 1\n  b: 2\n",
+            "- a\nb: 1\n",
+            '"unterminated_key: 1\n',
+            "'unterminated_key: 1\n",
+            '"\\x41": 1\n',
+            "base: &b\n  private_attested: cleared\nm:\n  <<: *b\n",
+            "a:\n\tb: 1\n",
+            "a: x\ty\n",
+            "on: 1\n",
+            "true: 1\n",
+            "null: 1\n",
+            "1: 2\n",
+            "a: .5\n",
+            "a: +1\n",
+            "a: 1_000\n",
+            "a: 1.\n",
+            "a: .inf\n",
+            "a: 12:30:00\n",
+            "a: 2026-11-03 12:30:00\n",
+            "a: =\n",
+            "a: <<\n",
+        ):
+            with self.assertRaises(ValueError, msg=f"Expected ValueError for {bad_yaml!r}"):
+                _MiniYamlParser(bad_yaml).parse()
+
+        # Unquoted YYYY-MM-DD date scalar matches PyYAML datetime.date parity (WORK-MINOR-1)
+        import datetime as _dt
+
+        date_parsed = _MiniYamlParser("d: 2026-11-03\n").parse()
+        self.assertEqual(date_parsed, {"d": _dt.date(2026, 11, 3)})
+        if pyyaml is not None:
+            self.assertEqual(date_parsed, pyyaml.safe_load("d: 2026-11-03\n"))
+
+        # Unknown routing keys (including non-string keys and typo keys) must raise RegistryError (F4, PLAN-MINOR-4, WORK-MINOR-3)
+        qwen_base = dict(load_model("qwen3-30b-a3b-2507-mlx-4bit"))
+        for bad_routing in (
+            {"private_local": "cleared", '"private_attested"': "cleared"},
+            {"private_local": "cleared", "unknown_route": "cleared"},
+            {"private_local": "cleared", 123: "blocked"},
+        ):
+            with self.assertRaises(RegistryError):
+                resolve_endpoint(dict(qwen_base, routing=bad_routing), require_api_key=False)
+
+    def test_eval_evidence_artifact_enforcement_and_manifest_check(self) -> None:
+        import copy
+
+        try:
+            import yaml as pyyaml  # type: ignore[import-untyped]
+        except ImportError:
+            pyyaml = None
+        if (
+            os.environ.get("FREE_INFERENCE_REQUIRE_PYYAML_PARITY") == "1"
+            or Path(sys.executable) == ROOT / ".venv" / "bin" / "python"
+        ):
+            self.assertIsNotNone(pyyaml, "PyYAML must be installed when running parity checks in .venv or CI parity step")
+
+        gen_mod = _load_script_module("gen_eval_manifest", "scripts/generate-eval-manifest")
+        rc_check = gen_mod.main(["scripts/generate-eval-manifest", "--check", "--offline-ci"])
+        self.assertEqual(rc_check, 0)
+        if gen_mod.all_pinned_clearance_runs_present(ROOT / "runs"):
+            rc_full = gen_mod.main(["scripts/generate-eval-manifest", "--check"])
+            self.assertEqual(rc_full, 0)
+
+        # Public-clone simulation (F3): a non-empty runs/ directory containing only an unrelated run
+        # does not trigger full historical run prerequisite and passes --offline-ci
+        with tempfile.TemporaryDirectory() as pub_runs_str:
+            pub_runs = Path(pub_runs_str)
+            (pub_runs / "2026-11-03-000000-opencode-attested-e2e-deadbeef").mkdir()
+            self.assertFalse(gen_mod.all_pinned_clearance_runs_present(pub_runs))
+            ok_pub, errs_pub = gen_mod.check_all_cleared_models(
+                runs_dir=pub_runs, offline_ci=True
+            )
+            self.assertTrue(ok_pub, errs_pub)
+
+        # Verify suite tests_sha256 and suite_spec_sha256 digests are identical under both PyYAML and fallback _MiniYamlParser
+        for suite_name, rel_path in gen_mod.SUITE_REL_PATHS.items():
+            full_path = ROOT / rel_path
+            sha_default, count_default = gen_mod.compute_suite_tests_sha256(full_path)
+            spec_default = gen_mod.compute_suite_spec_sha256(full_path, suite_name)
+            with patch.dict(sys.modules, {"yaml": None}):
+                sha_mini, count_mini = gen_mod.compute_suite_tests_sha256(full_path)
+                spec_mini = gen_mod.compute_suite_spec_sha256(full_path, suite_name)
+            self.assertEqual(sha_default, sha_mini, f"Tests digest mismatch for {suite_name}")
+            self.assertEqual(spec_default, spec_mini, f"Suite spec digest mismatch for {suite_name}")
+            self.assertEqual(count_default, count_mini)
+
+        qwen_entry = load_model("qwen3-30b-a3b-2507-mlx-4bit")
+        ep_qwen = resolve_endpoint(qwen_entry, require_api_key=False)
+        self.assertEqual(
+            ep_qwen.eval_evidence_artifact,
+            "docs/evals/qwen3-30b-a3b-2507-mlx-4bit.json",
+        )
+        qwen_manifest = json.loads((ROOT / ep_qwen.eval_evidence_artifact).read_text(encoding="utf-8"))
+        self.assertEqual(
+            gen_mod.validate_manifest_dict(qwen_manifest, ep_qwen, offline_ci=True),
+            [],
+        )
+
+        # Negative manifest checks (WORK-BLOCKER-2, F8)
+        # 1. Tampered tests_sha256 or suite_spec_sha256
+        bad_sha_manifest = copy.deepcopy(qwen_manifest)
+        bad_sha_manifest["suites"]["v1"]["tests_sha256"] = "0" * 64
+        errs_sha = gen_mod.validate_manifest_dict(bad_sha_manifest, ep_qwen, offline_ci=True)
+        self.assertTrue(any("tests_sha256" in e for e in errs_sha), errs_sha)
+
+        bad_spec_manifest = copy.deepcopy(qwen_manifest)
+        bad_spec_manifest["suites"]["tools"]["suite_spec_sha256"] = "0" * 64
+        errs_spec = gen_mod.validate_manifest_dict(bad_spec_manifest, ep_qwen, offline_ci=True)
+        self.assertTrue(any("suite_spec_sha256" in e for e in errs_spec), errs_spec)
+
+        # 2. Tampered suite total (1/1 on v1)
+        bad_total_manifest = copy.deepcopy(qwen_manifest)
+        bad_total_manifest["suites"]["v1"]["passed"] = 1
+        bad_total_manifest["suites"]["v1"]["total"] = 1
+        bad_total_manifest["suites"]["v1"]["cases"] = bad_total_manifest["suites"]["v1"]["cases"][:1]
+        errs_total = gen_mod.validate_manifest_dict(bad_total_manifest, ep_qwen, offline_ci=True)
+        self.assertTrue(any("does not match suite definition count" in e for e in errs_total), errs_total)
+
+        # 3. Weak score under operator_exception (1/10 on v1)
+        ds_entry = load_model("tinfoil-deepseek-v4-1-flash")
+        ep_ds = resolve_endpoint(ds_entry, require_api_key=False)
+        ds_manifest = json.loads((ROOT / ep_ds.eval_evidence_artifact).read_text(encoding="utf-8"))
+        bad_exc_manifest = copy.deepcopy(ds_manifest)
+        bad_exc_manifest["suites"]["v1"]["passed"] = 1
+        for c in bad_exc_manifest["suites"]["v1"]["cases"][1:]:
+            c["pass"] = False
+        errs_exc = gen_mod.validate_manifest_dict(bad_exc_manifest, ep_ds, offline_ci=True)
+        self.assertTrue(any("operator_exception on v1 is only permitted for 9/10" in e for e in errs_exc), errs_exc)
+
+        # 4. opencode_smoke with token_verified=False
+        bad_smoke_manifest = copy.deepcopy(qwen_manifest)
+        bad_smoke_manifest["suites"]["opencode_smoke"]["token_verified"] = False
+        errs_smoke = gen_mod.validate_manifest_dict(bad_smoke_manifest, ep_qwen, offline_ci=True)
+        self.assertTrue(any("token_verified=true" in e for e in errs_smoke), errs_smoke)
+
+        # 4b. Forged automated_full_pass or fake run_dir_id rejected even in offline_ci=True (R2-MINOR-2)
+        forged_mode_manifest = copy.deepcopy(ds_manifest)
+        forged_mode_manifest["clearance_basis"]["mode"] = "automated_full_pass"
+        forged_mode_manifest["suites"]["v1"]["passed"] = 10
+        for c in forged_mode_manifest["suites"]["v1"]["cases"]:
+            c["pass"] = True
+        errs_forged_mode = gen_mod.validate_manifest_dict(forged_mode_manifest, ep_ds, offline_ci=True)
+        self.assertTrue(any("clearance_basis.mode for" in e for e in errs_forged_mode), errs_forged_mode)
+
+        forged_run_id_manifest = copy.deepcopy(qwen_manifest)
+        forged_run_id_manifest["suites"]["v1"]["run_dir_id"] = "2026-10-29-214337-v1-qwen3-30b-a3b-2507-mlx-4bit-2aee4a3e-FAKEID"
+        errs_forged_run_id = gen_mod.validate_manifest_dict(forged_run_id_manifest, ep_qwen, offline_ci=True)
+        self.assertTrue(any("does not match pinned clearance run" in e for e in errs_forged_run_id), errs_forged_run_id)
+
+        # 5. Missing local runs/ directory when offline_ci=False fails closed
+        with tempfile.TemporaryDirectory() as empty_runs_str:
+            errs_missing_runs = gen_mod.validate_manifest_dict(
+                qwen_manifest, ep_qwen, runs_dir=Path(empty_runs_str), offline_ci=False
+            )
+            self.assertTrue(any("references missing local run directory" in e for e in errs_missing_runs), errs_missing_runs)
+
+        # Verify suite_spec_sha256 binds provider max_tokens and temperature and rejects provider disagreement (WORK-MAJOR-1)
+        v1_src_path = ROOT / gen_mod.SUITE_REL_PATHS["v1"]
+        v1_orig_text = v1_src_path.read_text(encoding="utf-8")
+        v1_orig_spec = gen_mod.compute_suite_spec_sha256(v1_src_path, "v1")
+        with tempfile.TemporaryDirectory() as spec_tmp_str:
+            spec_tmp = Path(spec_tmp_str)
+            v1_max_tok_path = spec_tmp / "v1_max_tok.yaml"
+            v1_max_tok_path.write_text(
+                v1_orig_text.replace("max_tokens: 700", "max_tokens: 5"),
+                encoding="utf-8",
+            )
+            self.assertNotEqual(
+                gen_mod.compute_suite_spec_sha256(v1_max_tok_path, "v1"),
+                v1_orig_spec,
+            )
+            v1_temp_path = spec_tmp / "v1_temp.yaml"
+            v1_temp_path.write_text(
+                v1_orig_text.replace("temperature: 0.2", "temperature: 1.5"),
+                encoding="utf-8",
+            )
+            self.assertNotEqual(
+                gen_mod.compute_suite_spec_sha256(v1_temp_path, "v1"),
+                v1_orig_spec,
+            )
+            v1_disagree_path = spec_tmp / "v1_disagree.yaml"
+            v1_disagree_path.write_text(
+                v1_orig_text.replace("max_tokens: 700", "max_tokens: 5", 1),
+                encoding="utf-8",
+            )
+            with self.assertRaises(ValueError):
+                gen_mod.compute_suite_spec_sha256(v1_disagree_path, "v1")
+
+        # Missing eval_evidence_artifact on a cleared model must fail closed
+        missing_art = dict(qwen_entry)
+        missing_art.pop("eval_evidence_artifact", None)
+        with self.assertRaises(RegistryError) as ctx_missing:
+            resolve_endpoint(missing_art, require_api_key=False)
+        self.assertIn("eval_evidence_artifact", str(ctx_missing.exception))
+
+        # Nonexistent or traversal path in eval_evidence_artifact must fail closed (unless require_eval_evidence_file=False during bootstrap with matching <model-id>.json)
+        bootstrap_entry = dict(
+            qwen_entry,
+            id="does-not-exist",
+            eval_evidence_artifact="docs/evals/does-not-exist.json",
+        )
+        ep_boot = resolve_endpoint(bootstrap_entry, require_api_key=False, require_eval_evidence_file=False)
+        self.assertEqual(ep_boot.eval_evidence_artifact, "docs/evals/does-not-exist.json")
+
+        # Even with require_eval_evidence_file=False, mismatched filename (<other-id>.json) must fail closed (WORK-MINOR-3)
+        with self.assertRaises(RegistryError):
+            resolve_endpoint(
+                dict(qwen_entry, eval_evidence_artifact="docs/evals/does-not-exist.json"),
+                require_api_key=False,
+                require_eval_evidence_file=False,
+            )
+
+        for bad_art in (
+            "docs/evals/does-not-exist.json",
+            "docs/evals/tinfoil-deepseek-v4-1-flash.json",
+            "../outside.json",
+            "models.yaml",
+        ):
+            bad_entry = dict(qwen_entry, eval_evidence_artifact=bad_art)
+            with self.assertRaises(RegistryError, msg=f"Expected RegistryError for {bad_art}"):
+                resolve_endpoint(bad_entry, require_api_key=False)
+
+        # Pointing a synthetic model ID at another model's manifest file is rejected even if filename check were bypassed (F4, PLAN-MAJOR-2)
+        wrong_id_entry = dict(
+            ds_entry,
+            id="other-cleared-model",
+            eval_evidence_artifact="docs/evals/tinfoil-deepseek-v4-1-flash.json",
+        )
+        with self.assertRaises(RegistryError):
+            resolve_endpoint(wrong_id_entry, require_api_key=False)
+
+    def test_child_env_allowlisting_and_online_flag_gate(self) -> None:
+        from local_assist.registry import BASE_SAFE_ENV_ALLOWLIST, LAUNCHER_EXTRA_ENV_ALLOWLIST
+
+        serve_mod = _load_script_module("serve_env_test", "scripts/serve-model")
+        oc_local = _load_script_module("oc_local_env_test", "scripts/opencode-local")
+        oc_att = _load_script_module("oc_att_env_test", "scripts/opencode-attested")
+
+        self.assertEqual(serve_mod.DEFAULT_MAX_TOKENS_CAP, 4096)
+        self.assertEqual(
+            frozenset(oc_local.SAFE_ENV_ALLOWLIST),
+            BASE_SAFE_ENV_ALLOWLIST | LAUNCHER_EXTRA_ENV_ALLOWLIST,
+        )
+        self.assertEqual(
+            frozenset(oc_att.SAFE_ENV_ALLOWLIST),
+            BASE_SAFE_ENV_ALLOWLIST | LAUNCHER_EXTRA_ENV_ALLOWLIST,
+        )
+
+        ep_local = resolve_endpoint(load_model("qwen3-30b-a3b-2507-mlx-4bit"), require_api_key=False)
+        polluted_env = {
+            "PATH": "/usr/bin:/bin",
+            "HOME": "/nonexistent/test-home",
+            "LANG": "en_US.UTF-8",
+            "OPENAI_API_KEY": "sk-leak-1",
+            "ANTHROPIC_API_KEY": "sk-ant-leak-2",
+            "TINFOIL_API_KEY": "tf-leak-3",
+            "AWS_SECRET_ACCESS_KEY": "aws-leak-4",
+            "GITHUB_TOKEN": "ghp-leak-5",
+        }
+        s_env = serve_mod.build_serve_env(ep_local, allow_hf_online=False, base_env=polluted_env)
+        t_env = serve_mod.build_tinfoil_child_env(base_env=polluted_env)
+        p_env = serve_mod.build_se_key_proxy_child_env(base_env=polluted_env)
+
+        for env_map in (s_env, t_env, p_env):
+            for secret_key in (
+                "OPENAI_API_KEY",
+                "ANTHROPIC_API_KEY",
+                "TINFOIL_API_KEY",
+                "AWS_SECRET_ACCESS_KEY",
+                "GITHUB_TOKEN",
+            ):
+                self.assertNotIn(secret_key, env_map)
+        self.assertEqual(s_env["HF_HUB_OFFLINE"], "1")
+        self.assertEqual(s_env["TRANSFORMERS_OFFLINE"], "1")
+        self.assertEqual(s_env["HF_HUB_DISABLE_TELEMETRY"], "1")
+
+        # --allow-hf-online on a non-local (Rung 3) model must fail closed with exit code 2
+        rc_nonlocal = serve_mod.main(
+            ["scripts/serve-model", "tinfoil-deepseek-v4-1-flash", "--allow-hf-online"]
+        )
+        self.assertEqual(rc_nonlocal, 2)
+
+    def test_opencode_attested_session_cap_and_context_clamping(self) -> None:
+        oc_att = _load_script_module("oc_att_clamp_test", "scripts/opencode-attested")
+        ep_ds = resolve_endpoint(
+            load_model("tinfoil-deepseek-v4-1-flash"),
+            pid_record={"session_token_file": "/nonexistent"},
+            require_api_key=False,
+        )
+
+        # Clamping: max_tokens_cap=2048 clamps output (16384 -> 2048); max_request_bytes=131072 clamps context (1048576 -> 21845)
+        cfg_clamped = json.loads(
+            oc_att.render_private_attested_config(
+                ep_ds, max_tokens_cap=2048, max_request_bytes=131072
+            )
+        )
+        limits = cfg_clamped["provider"]["private-attested"]["models"][
+            "tinfoil-deepseek-v4-1-flash"
+        ]["limit"]
+        self.assertEqual(limits["output"], 2048)
+        self.assertEqual(limits["context"], 131072 // 6)
+
+        # Explicit context_limit (100000) is also clamped to max_request_bytes // 6 (21845) (F7)
+        cfg_explicit_clamped = json.loads(
+            oc_att.render_private_attested_config(
+                ep_ds,
+                context_limit=100000,
+                output_limit=8192,
+                max_tokens_cap=2048,
+                max_request_bytes=131072,
+            )
+        )
+        limits_exp = cfg_explicit_clamped["provider"]["private-attested"]["models"][
+            "tinfoil-deepseek-v4-1-flash"
+        ]["limit"]
+        self.assertEqual(limits_exp["output"], 2048)
+        self.assertEqual(limits_exp["context"], 131072 // 6)
+
+        # Attached session with caps exceeding CLI flags must be refused even when max_session_usd=None (M1),
+        # and cold-start path (initial verify -> 1, serve -> 0 writing PID record, wait verify -> 0) succeeds without TypeError (F1)
+        with tempfile.TemporaryDirectory() as tmp_runs_str:
+            tmp_runs = Path(tmp_runs_str)
+            ds_pid_path = pid_file_for_model("tinfoil-deepseek-v4-1-flash", tmp_runs)
+            ds_pid_path.write_text(
+                json.dumps(
+                    {
+                        "model_id": "tinfoil-deepseek-v4-1-flash",
+                        "repo": "deepseek-v4-1-flash",
+                        "port": 8081,
+                        "pid": os.getpid(),
+                        "status": "ready",
+                        "max_chat_requests": 200,
+                        "max_tokens_cap": 4096,
+                        "max_request_bytes": 262144,
+                        "ttl_seconds": 7200,
+                    }
+                )
+            )
+            ok_att, err_att, _ = oc_att.ensure_model_served(
+                ep_ds,
+                no_serve=True,
+                max_session_usd=None,
+                max_chat_requests=25,
+                max_tokens_cap=2048,
+                max_request_bytes=131072,
+                ttl_seconds=1800,
+                runs_dir=tmp_runs,
+                run_cmd=lambda cmd, **kw: subprocess.CompletedProcess(
+                    cmd, 0, stdout="deepseek-v4-1-flash\n", stderr=""
+                ),
+            )
+            self.assertFalse(ok_att)
+            self.assertIn("exceed the launcher's ceiling", str(err_att))
+
+            # Cold-start regression (F1): initial verify fails (1), serve-model writes ready record (0), wait verify succeeds (0)
+            ds_pid_path.unlink(missing_ok=True)
+            cold_calls: list[list[str]] = []
+
+            def _cold_start_run_cmd(cmd: list[str], **_kw: Any) -> subprocess.CompletedProcess[str]:
+                cold_calls.append(list(cmd))
+                if len(cold_calls) == 1:
+                    return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="not running")
+                if len(cold_calls) == 2:
+                    ds_pid_path.write_text(
+                        json.dumps(
+                            {
+                                "model_id": "tinfoil-deepseek-v4-1-flash",
+                                "repo": "deepseek-v4-1-flash",
+                                "port": 8081,
+                                "pid": os.getpid(),
+                                "status": "ready",
+                                "max_chat_requests": 25,
+                                "max_tokens_cap": 2048,
+                                "max_request_bytes": 131072,
+                                "ttl_seconds": 3600,
+                            }
+                        )
+                    )
+                    return subprocess.CompletedProcess(cmd, 0, stdout="started\n", stderr="")
+                return subprocess.CompletedProcess(cmd, 0, stdout="deepseek-v4-1-flash\n", stderr="")
+
+            ok_cold, err_cold, meta_cold = oc_att.ensure_model_served(
+                ep_ds,
+                no_serve=False,
+                max_session_usd=2.00,
+                max_chat_requests=25,
+                max_tokens_cap=2048,
+                max_request_bytes=131072,
+                ttl_seconds=3600,
+                runs_dir=tmp_runs,
+                run_cmd=_cold_start_run_cmd,
+            )
+            self.assertTrue(ok_cold, msg=err_cold)
+            self.assertIsNone(err_cold)
+            assert meta_cold is not None
+            self.assertIs(meta_cold["attached"], False)
+            self.assertEqual(meta_cold["ttl_seconds"], 3600)
+            self.assertEqual(meta_cold["max_tokens_cap"], 2048)
+            self.assertEqual(meta_cold["max_request_bytes"], 131072)
+
+        # Legacy tier alias resolution in resolve_default_attested_model_id (L6)
+        legacy_models = [
+            {
+                "id": "legacy-tee-model",
+                "status": "active",
+                "remote_trust": {"tier": "attested_tee"},
+                "routing": {"private_attested": "cleared"},
+            }
+        ]
+        self.assertEqual(
+            oc_att.resolve_default_attested_model_id(legacy_models),
+            "legacy-tee-model",
+        )
+
+        # CLI negative/zero flag validation (L4)
+        for bad_argv in (
+            ["scripts/opencode-attested", "--max-chat-requests", "0"],
+            ["scripts/opencode-attested", "--max-request-bytes", "0"],
+            ["scripts/opencode-attested", "--ttl-seconds", "-5"],
+            ["scripts/opencode-attested", "--max-tokens-cap", "-1"],
+            ["scripts/opencode-attested", "--max-session-usd", "0"],
+        ):
+            self.assertEqual(oc_att.main(bad_argv), 1)
+
+    def test_unregistered_model_lifecycle_and_strict_boolean_capabilities(self) -> None:
+        from local_assist.errors import ModelUnavailable
+        from local_assist.lifecycle import ensure_local_model_served
+
+        with patch("local_assist.lifecycle.find_model_by_id_or_repo", return_value=None):
+            with self.assertRaises(ModelUnavailable) as ctx_unreg:
+                ensure_local_model_served("unregistered/mystery-model")
+            self.assertEqual(ctx_unreg.exception.code, "model_unavailable")
+
+        # Strict boolean capabilities.tool_calling check (M6)
+        base_entry = dict(load_model("qwen3-1.7b-mlx-4bit"))
+        for non_bool in ("false", "true", 1, 0, "no"):
+            bad_cap_entry = dict(base_entry, capabilities={"tool_calling": non_bool})
+            with self.assertRaises(RegistryError):
+                resolve_endpoint(bad_cap_entry, require_api_key=False)
+
+        # Invalid URL port raises RegistryError instead of raw ValueError (L2)
+        bad_port_entry = dict(
+            base_entry,
+            promptfoo_provider={"apiBaseUrl": "http://127.0.0.1:99999/v1"},
+        )
+        with self.assertRaises(RegistryError):
+            resolve_endpoint(bad_port_entry, require_api_key=False)
+
+    def test_opencode_config_json_escaping_and_early_binary_check(self) -> None:
+        oc_local = _load_script_module("oc_local_esc_test", "scripts/opencode-local")
+        oc_att = _load_script_module("oc_att_esc_test", "scripts/opencode-attested")
+        ep_local = resolve_endpoint(load_model("qwen3-30b-a3b-2507-mlx-4bit"), require_api_key=False)
+
+        # Inject characters requiring JSON escaping into EndpointConfig fields (M5)
+        from dataclasses import replace
+
+        tricky_ep = replace(
+            ep_local,
+            model_id='model"with\\quotes',
+            served_model_id='repo/"quoted"',
+            api_base_url='http://127.0.0.1:8080/v1?x="1"\\2',
+        )
+        rendered_local = json.loads(
+            oc_local.render_private_local_config(
+                tricky_ep, api_base_url_override='http://127.0.0.1:8080/v1?y="a"'
+            )
+        )
+        self.assertEqual(rendered_local["model"], 'private-local/model"with\\quotes')
+        rendered_att = json.loads(
+            oc_att.render_private_attested_config(
+                tricky_ep, api_base_url_override='http://127.0.0.1:8080/v1?y="a"'
+            )
+        )
+        self.assertEqual(rendered_att["model"], 'private-attested/model"with\\quotes')
+
+        # Missing opencode binary fails early with exit code 1 before calling ensure_model_served (L5)
+        with (
+            patch.object(oc_local.shutil, "which", return_value=None),
+            patch.object(
+                oc_local,
+                "ensure_model_served",
+                side_effect=AssertionError("ensure_model_served should not be called"),
+            ),
+        ):
+            self.assertEqual(oc_local.main(["scripts/opencode-local"]), 1)
+
+        with (
+            patch.object(oc_att.shutil, "which", return_value=None),
+            patch.object(
+                oc_att,
+                "ensure_model_served",
+                side_effect=AssertionError("ensure_model_served should not be called"),
+            ),
+        ):
+            self.assertEqual(oc_att.main(["scripts/opencode-attested"]), 1)
+
+    def test_pid_lstart_verification_and_offline_require_gate(self) -> None:
+        import signal
+        from local_assist.registry import get_process_lstart
+
+        stop_mod = _load_script_module("stop_lstart_test", "scripts/stop-model")
+        verify_mod = _load_script_module("verify_lstart_test", "scripts/verify-served-model")
+        ep_local = resolve_endpoint(load_model("qwen3-30b-a3b-2507-mlx-4bit"), require_api_key=False)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runs_dir = Path(tmp)
+            stop_mod.RUNS = runs_dir
+            pid_path = pid_file_for_model(ep_local.model_id, runs_dir)
+
+            proc_a = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+            proc_b = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+            try:
+                lstart_a = get_process_lstart(proc_a.pid)
+                lstart_b = get_process_lstart(proc_b.pid)
+                self.assertTrue(lstart_a)
+                self.assertTrue(lstart_b)
+
+                # 1. Mismatched pid_lstart and upstream_pid_lstart are rejected by verify-served-model and stop-model (M4)
+                mismatched_rec = {
+                    "model_id": ep_local.model_id,
+                    "repo": ep_local.served_model_id,
+                    "port": ep_local.port,
+                    "pid": proc_a.pid,
+                    "pid_lstart": "Thu Jan  1 00:00:00 1970",
+                    "upstream_pid": proc_b.pid,
+                    "upstream_pid_lstart": "Thu Jan  1 00:00:00 1970",
+                    "hf_offline": True,
+                }
+                pid_path.write_text(json.dumps(mismatched_rec))
+                ok_v, err_v = verify_mod.verify_pid_record_matches(
+                    ep_local, runs_dir=runs_dir, require_offline=True
+                )
+                self.assertFalse(ok_v)
+                self.assertIn("no active PID record", str(err_v))
+
+                ok_det, msg_det, _ = verify_mod.check_once_detailed(
+                    ep_local, 1.0, pid_record=mismatched_rec, runs_dir=runs_dir
+                )
+                self.assertFalse(ok_det)
+                self.assertIn("is no longer running", str(msg_det))
+
+                rc_stop_mismatch = stop_mod.main(["scripts/stop-model", ep_local.model_id])
+                self.assertEqual(rc_stop_mismatch, 0)
+                self.assertIsNone(proc_a.poll())
+                self.assertIsNone(proc_b.poll())
+                self.assertFalse(pid_path.exists())
+
+                # 2. Mixed record (reused pid + legacy upstream_pid without upstream_pid_lstart) refuses to signal upstream_pid and keeps PID file on disk (R4-MINOR-3)
+                pid_path.write_text(
+                    json.dumps(
+                        {
+                            "model_id": ep_local.model_id,
+                            "repo": ep_local.served_model_id,
+                            "port": ep_local.port,
+                            "pid": proc_a.pid,
+                            "pid_lstart": "Thu Jan  1 00:00:00 1970",
+                            "upstream_pid": proc_b.pid,
+                            "hf_offline": True,
+                        }
+                    )
+                )
+                rc_stop_mixed = stop_mod.main(["scripts/stop-model", ep_local.model_id])
+                self.assertEqual(rc_stop_mixed, 1)
+                self.assertIsNone(proc_a.poll())
+                self.assertIsNone(proc_b.poll())
+                self.assertTrue(pid_path.exists())
+
+                # 3. Matching pid_lstart and upstream_pid_lstart terminates both real subprocesses and removes PID file
+                pid_path.write_text(
+                    json.dumps(
+                        {
+                            "model_id": ep_local.model_id,
+                            "repo": ep_local.served_model_id,
+                            "port": ep_local.port,
+                            "pid": proc_a.pid,
+                            "pid_lstart": lstart_a,
+                            "upstream_pid": proc_b.pid,
+                            "upstream_pid_lstart": lstart_b,
+                            "hf_offline": True,
+                        }
+                    )
+                )
+                rc_stop_real = stop_mod.main(["scripts/stop-model", ep_local.model_id])
+                self.assertEqual(rc_stop_real, 0)
+                self.assertIsNotNone(proc_a.poll())
+                self.assertIsNotNone(proc_b.poll())
+                self.assertFalse(pid_path.exists())
+            finally:
+                for p in (proc_a, proc_b):
+                    if p.poll() is None:
+                        p.kill()
+                        p.wait(timeout=3)
+
+            # 4. Legacy PID record without pid_lstart is refused by stop-model unless --force-legacy is passed
+            proc_legacy = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+            try:
+                pid_path.write_text(
+                    json.dumps(
+                        {
+                            "model_id": ep_local.model_id,
+                            "repo": ep_local.served_model_id,
+                            "port": ep_local.port,
+                            "pid": proc_legacy.pid,
+                            "hf_offline": True,
+                        }
+                    )
+                )
+                rc_stop_legacy = stop_mod.main(["scripts/stop-model", ep_local.model_id])
+                self.assertEqual(rc_stop_legacy, 1)
+                self.assertIsNone(proc_legacy.poll())
+                self.assertTrue(pid_path.exists())
+
+                # --discard-legacy removes the legacy PID record without signaling the live process (R2-MINOR-1)
+                real_os_kill = stop_mod.os.kill
+                sent_signals: list[tuple[int, int]] = []
+
+                def _spy_os_kill(target_pid: int, sig: int) -> None:
+                    if sig != 0:
+                        sent_signals.append((target_pid, int(sig)))
+                    real_os_kill(target_pid, sig)
+
+                with patch.object(stop_mod.os, "kill", side_effect=_spy_os_kill):
+                    rc_stop_discard = stop_mod.main(
+                        ["scripts/stop-model", ep_local.model_id, "--discard-legacy"]
+                    )
+                self.assertEqual(rc_stop_discard, 0)
+                self.assertEqual(sent_signals, [])
+                self.assertIsNone(proc_legacy.poll())
+                self.assertFalse(pid_path.exists())
+
+                # Mixed record (unbound primary pid + bound live upstream_pid) and wholly bound record:
+                # --discard-legacy must refuse before any effects and send zero signals (R2-F1)
+                lstart_legacy = get_process_lstart(proc_legacy.pid)
+                self.assertTrue(lstart_legacy)
+                tok_path = runs_dir / f".se-session-{ep_local.model_id}.token"
+                for bad_discard_rec in (
+                    {
+                        "model_id": ep_local.model_id,
+                        "repo": ep_local.served_model_id,
+                        "port": ep_local.port,
+                        "pid": os.getpid(),
+                        "upstream_pid": proc_legacy.pid,
+                        "upstream_pid_lstart": lstart_legacy,
+                        "session_token_file": str(tok_path),
+                        "hf_offline": True,
+                    },
+                    {
+                        "model_id": ep_local.model_id,
+                        "repo": ep_local.served_model_id,
+                        "port": ep_local.port,
+                        "pid": proc_legacy.pid,
+                        "pid_lstart": lstart_legacy,
+                        "session_token_file": str(tok_path),
+                        "hf_offline": True,
+                    },
+                ):
+                    pid_path.write_text(json.dumps(bad_discard_rec))
+                    tok_path.write_text("se-session-" + ("a" * 64))
+                    sent_signals.clear()
+                    with patch.object(stop_mod.os, "kill", side_effect=_spy_os_kill):
+                        rc_bad_discard = stop_mod.main(
+                            ["scripts/stop-model", ep_local.model_id, "--discard-legacy"]
+                        )
+                    self.assertEqual(rc_bad_discard, 1)
+                    self.assertEqual(sent_signals, [])
+                    self.assertIsNone(proc_legacy.poll())
+                    self.assertTrue(pid_path.exists())
+                    self.assertTrue(tok_path.exists())
+                tok_path.unlink(missing_ok=True)
+
+                # Re-write legacy record and verify --force-legacy terminates it
+                pid_path.write_text(
+                    json.dumps(
+                        {
+                            "model_id": ep_local.model_id,
+                            "repo": ep_local.served_model_id,
+                            "port": ep_local.port,
+                            "pid": proc_legacy.pid,
+                            "hf_offline": True,
+                        }
+                    )
+                )
+                rc_stop_force = stop_mod.main(
+                    ["scripts/stop-model", ep_local.model_id, "--force-legacy"]
+                )
+                self.assertEqual(rc_stop_force, 0)
+                self.assertIsNotNone(proc_legacy.poll())
+                self.assertFalse(pid_path.exists())
+            finally:
+                if proc_legacy.poll() is None:
+                    proc_legacy.kill()
+                    proc_legacy.wait(timeout=3)
+
+            # 5. Missing hf_offline key in PID record is rejected when require_offline=True (L7)
+            pid_path.write_text(
+                json.dumps(
+                    {
+                        "model_id": ep_local.model_id,
+                        "repo": ep_local.served_model_id,
+                        "port": ep_local.port,
+                        "pid": os.getpid(),
+                        "pid_lstart": get_process_lstart(os.getpid()),
+                    }
+                )
+            )
+            ok_no_hf, err_no_hf = verify_mod.verify_pid_record_matches(
+                ep_local, runs_dir=runs_dir, require_offline=True
+            )
+            self.assertFalse(ok_no_hf)
+            self.assertIn("hf_offline=None", str(err_no_hf))
+
+            # 6. Legacy PID record with missing or blank pid_lstart is rejected by verify-served-model and serve-model (F2, PLAN-MINOR-2)
+            serve_lstart_mod = _load_script_module("serve_lstart_test", "scripts/serve-model")
+            serve_lstart_mod.RUNS = runs_dir
+            for legacy_lstart in (None, "", "   "):
+                legacy_rec = {
+                    "model_id": "qwen3-1.7b-mlx-4bit",
+                    "repo": "Qwen/Qwen3-1.7B-MLX-4bit",
+                    "port": ep_local.port,
+                    "pid": os.getpid(),
+                    "pid_lstart": legacy_lstart,
+                    "hf_offline": True,
+                }
+                pid_path.write_text(json.dumps(legacy_rec))
+                ok_leg_v, err_leg_v = verify_mod.verify_pid_record_matches(
+                    ep_local, runs_dir=runs_dir, require_offline=True
+                )
+                self.assertFalse(ok_leg_v)
+                self.assertIn("no active PID record", str(err_leg_v))
+
+                same_legacy_rec = dict(legacy_rec, model_id=ep_local.model_id, repo=ep_local.served_model_id)
+                ok_leg_det, msg_leg_det, _ = verify_mod.check_once_detailed(
+                    ep_local, 1.0, pid_record=same_legacy_rec, runs_dir=runs_dir
+                )
+                self.assertFalse(ok_leg_det)
+                self.assertIn("stop-model --force-legacy", str(msg_leg_det))
+
+                # serve-model does NOT block on or reuse the legacy PID record lacking pid_lstart (instead reaches health check)
+                with patch.object(serve_lstart_mod, "health", return_value=True):
+                    rc_srv_leg = serve_lstart_mod.main(["scripts/serve-model", ep_local.model_id])
+                self.assertEqual(rc_srv_leg, 1)
+
+            # 7. stop-model escalation failure / PID replacement / surviving SIGKILL (F5, PLAN-MAJOR-3)
+            esc_rec = {
+                "model_id": ep_local.model_id,
+                "repo": ep_local.served_model_id,
+                "port": ep_local.port,
+                "pid": 424242,
+                "pid_lstart": "Mon Nov  2 12:00:00 2026",
+            }
+            # 7a. Escalation-time ps query returns None while process is still alive -> withholds SIGKILL, returns 1, preserves PID file
+            pid_path.write_text(json.dumps(esc_rec))
+            signals_sent_a: list[int] = []
+            with (
+                patch.object(stop_mod, "pid_is_alive", return_value=True),
+                patch.object(stop_mod, "pid_is_zombie", return_value=False),
+                patch.object(
+                    stop_mod,
+                    "get_process_lstart",
+                    side_effect=["Mon Nov  2 12:00:00 2026", None],
+                ),
+                patch.object(stop_mod.time, "sleep"),
+                patch.object(
+                    stop_mod.os,
+                    "kill",
+                    side_effect=lambda _p, sig: signals_sent_a.append(sig),
+                ),
+            ):
+                rc_esc_none = stop_mod.main(["scripts/stop-model", ep_local.model_id])
+            self.assertEqual(rc_esc_none, 1)
+            self.assertEqual(signals_sent_a, [signal.SIGTERM])
+            self.assertTrue(pid_path.exists())
+
+            # 7b. Escalation-time ps query shows PID was replaced during 5s wait -> withholds SIGKILL, returns 0, removes PID file
+            signals_sent_b: list[int] = []
+            with (
+                patch.object(stop_mod, "pid_is_alive", return_value=True),
+                patch.object(stop_mod, "pid_is_zombie", return_value=False),
+                patch.object(
+                    stop_mod,
+                    "get_process_lstart",
+                    side_effect=["Mon Nov  2 12:00:00 2026", "Mon Nov  2 12:00:05 2026"],
+                ),
+                patch.object(stop_mod.time, "sleep"),
+                patch.object(
+                    stop_mod.os,
+                    "kill",
+                    side_effect=lambda _p, sig: signals_sent_b.append(sig),
+                ),
+            ):
+                rc_esc_rep = stop_mod.main(["scripts/stop-model", ep_local.model_id])
+            self.assertEqual(rc_esc_rep, 0)
+            self.assertEqual(signals_sent_b, [signal.SIGTERM])
+            self.assertFalse(pid_path.exists())
+
+            # 7c. Process survives SIGKILL -> returns 1 and preserves PID file
+            pid_path.write_text(json.dumps(esc_rec))
+            signals_sent_c: list[int] = []
+            with (
+                patch.object(stop_mod, "pid_is_alive", return_value=True),
+                patch.object(stop_mod, "pid_is_zombie", return_value=False),
+                patch.object(
+                    stop_mod,
+                    "get_process_lstart",
+                    return_value="Mon Nov  2 12:00:00 2026",
+                ),
+                patch.object(stop_mod.time, "sleep"),
+                patch.object(
+                    stop_mod.os,
+                    "kill",
+                    side_effect=lambda _p, sig: signals_sent_c.append(sig),
+                ),
+            ):
+                rc_esc_survive = stop_mod.main(["scripts/stop-model", ep_local.model_id])
+            self.assertEqual(rc_esc_survive, 1)
+            self.assertEqual(signals_sent_c, [signal.SIGTERM, signal.SIGKILL])
+            self.assertTrue(pid_path.exists())
 
 
 if __name__ == "__main__":

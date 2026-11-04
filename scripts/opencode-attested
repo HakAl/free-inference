@@ -15,7 +15,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
-if VENV_PYTHON.exists() and Path(sys.executable) != VENV_PYTHON:
+if __name__ == "__main__" and VENV_PYTHON.exists() and Path(sys.executable) != VENV_PYTHON:
     os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), __file__, *sys.argv[1:]])
 
 sys.path.insert(0, str(ROOT))
@@ -24,6 +24,9 @@ from local_assist.client import check_private_coding_admission
 from local_assist.errors import LocalAssistError
 from local_assist.registry import (
     ATTESTED_ENCLAVE_TIERS,
+    BASE_SAFE_ENV_ALLOWLIST,
+    LAUNCHER_EXTRA_ENV_ALLOWLIST,
+    LEGACY_TIER_ALIASES,
     EndpointConfig,
     RegistryError,
     SESSION_TOKEN_ENV_VAR,
@@ -42,6 +45,7 @@ DEFAULT_MAX_REQUEST_BYTES = 8388608
 DEFAULT_TTL_SECONDS = 43200
 DEFAULT_STREAM_TIMEOUT_SECONDS = 300
 DEFAULT_MAX_SESSION_USD: float | None = None
+MIN_ATTACHED_REQUEST_BYTES = 65536
 WORST_CASE_BYTES_PER_TOKEN = 3.0
 RUNG1_LOCAL_ASSIST_BASE_URL = "http://127.0.0.1:8080/v1"
 EXIT_MODEL_MISMATCH = 3
@@ -49,22 +53,11 @@ EXIT_MODEL_MISMATCH = 3
 TEMPLATE_CONFIG = ROOT / "config" / "opencode-private-attested.json.tmpl"
 DEFAULT_ISOLATED_HOME = ROOT / ".home" / "opencode-private-attested"
 
-SAFE_ENV_ALLOWLIST = (
-    "PATH",
-    "LANG",
-    "LC_ALL",
-    "LC_CTYPE",
-    "TERM",
-    "COLORTERM",
-    "TMPDIR",
-    "USER",
-    "LOGNAME",
-    "SHELL",
-    "SYSTEMROOT",
-    "SSH_AUTH_SOCK",
-    "EDITOR",
-    "VISUAL",
-)
+SAFE_ENV_ALLOWLIST = tuple(sorted(BASE_SAFE_ENV_ALLOWLIST | LAUNCHER_EXTRA_ENV_ALLOWLIST))
+
+
+def _json_escape(val: Any) -> str:
+    return json.dumps(str(val))[1:-1]
 
 
 @contextlib.contextmanager
@@ -99,7 +92,8 @@ def resolve_default_attested_model_id(
         rt = entry.get("remote_trust")
         if not isinstance(rt, dict):
             continue
-        tier = rt.get("tier")
+        raw_tier = rt.get("tier")
+        tier = LEGACY_TIER_ALIASES.get(str(raw_tier), raw_tier) if isinstance(raw_tier, str) else raw_tier
         if tier not in ATTESTED_ENCLAVE_TIERS:
             continue
         mid = str(entry.get("id") or "").strip()
@@ -291,8 +285,6 @@ def check_session_spend_ceiling(
 def _extract_attached_session_caps(
     endpoint: EndpointConfig,
     active_rec: dict[str, Any] | None,
-    *,
-    default_ttl_seconds: int = DEFAULT_TTL_SECONDS,
 ) -> tuple[int, int, int, int]:
     if not isinstance(active_rec, dict):
         raise LocalAssistError(
@@ -315,13 +307,16 @@ def _extract_attached_session_caps(
         or not isinstance(raw_tokens, int)
         or isinstance(raw_tokens, bool)
         or raw_tokens <= 0
+        or not isinstance(raw_ttl, int)
+        or isinstance(raw_ttl, bool)
+        or raw_ttl <= 0
     ):
         raise LocalAssistError(
             "spend_ceiling_exceeded",
             f"Refusing to attach to active proxy session for '{endpoint.model_id}': "
             f"the running session has unbounded or missing spend caps in its PID record "
             f"(max_chat_requests={raw_reqs!r}, max_request_bytes={raw_bytes!r}, "
-            f"max_tokens_cap={raw_tokens!r}; max_tokens_cap=0 means unclamped output tokens "
+            f"max_tokens_cap={raw_tokens!r}, ttl_seconds={raw_ttl!r}; max_tokens_cap=0 means unclamped output tokens "
             f"in se-key-proxy). Run './scripts/stop-model {endpoint.model_id}' and relaunch "
             "so opencode-attested starts a proxy with bounded caps.",
             details={
@@ -330,14 +325,10 @@ def _extract_attached_session_caps(
                 "max_chat_requests": raw_reqs,
                 "max_request_bytes": raw_bytes,
                 "max_tokens_cap": raw_tokens,
+                "ttl_seconds": raw_ttl,
             },
         )
-    ttl = (
-        int(raw_ttl)
-        if isinstance(raw_ttl, int) and not isinstance(raw_ttl, bool) and raw_ttl > 0
-        else default_ttl_seconds
-    )
-    return int(raw_reqs), int(raw_bytes), int(raw_tokens), ttl
+    return int(raw_reqs), int(raw_bytes), int(raw_tokens), int(raw_ttl)
 
 
 def format_session_banner(
@@ -368,6 +359,8 @@ def render_private_attested_config(
     *,
     context_limit: int | None = None,
     output_limit: int = DEFAULT_OUTPUT_LIMIT,
+    max_tokens_cap: int | None = None,
+    max_request_bytes: int | None = None,
     edit_permission: str = "ask",
     lab_python: Path | None = None,
     lab_root: Path | None = None,
@@ -381,7 +374,12 @@ def render_private_attested_config(
         if context_limit is not None
         else default_context_limit_for_endpoint(endpoint)
     )
-    if effective_context_limit <= 0 or output_limit <= 0:
+    effective_output_limit = output_limit
+    if max_tokens_cap is not None and max_tokens_cap > 0:
+        effective_output_limit = min(effective_output_limit, int(max_tokens_cap))
+    if max_request_bytes is not None and max_request_bytes > 0:
+        effective_context_limit = min(effective_context_limit, max(1, int(max_request_bytes) // 6))
+    if effective_context_limit <= 0 or effective_output_limit <= 0:
         raise ValueError("context_limit and output_limit must be positive integers")
 
     tmpl = template_text if template_text is not None else TEMPLATE_CONFIG.read_text()
@@ -395,17 +393,17 @@ def render_private_attested_config(
     trust_label = f"Rung {endpoint.data_control_rung} {endpoint.trust_tier}"
 
     rendered = (
-        tmpl.replace("__API_BASE_URL__", effective_base_url)
-        .replace("__API_KEY_VALUE__", api_key_placeholder)
-        .replace("__SERVED_MODEL_ID__", endpoint.served_model_id)
-        .replace("__MODEL_ID__", endpoint.model_id)
-        .replace("__TRUST_TIER__", trust_label)
+        tmpl.replace("__API_BASE_URL__", _json_escape(effective_base_url))
+        .replace("__API_KEY_VALUE__", _json_escape(api_key_placeholder))
+        .replace("__SERVED_MODEL_ID__", _json_escape(endpoint.served_model_id))
+        .replace("__MODEL_ID__", _json_escape(endpoint.model_id))
+        .replace("__TRUST_TIER__", _json_escape(trust_label))
         .replace("__CONTEXT_LIMIT__", str(int(effective_context_limit)))
-        .replace("__OUTPUT_LIMIT__", str(int(output_limit)))
-        .replace("__EDIT_PERMISSION__", edit_permission)
-        .replace("__LAB_PYTHON__", str(effective_python))
-        .replace("__LAB_ROOT__", str(effective_root))
-        .replace("__WORKSPACE_DIR__", str(effective_workspace))
+        .replace("__OUTPUT_LIMIT__", str(int(effective_output_limit)))
+        .replace("__EDIT_PERMISSION__", _json_escape(edit_permission))
+        .replace("__LAB_PYTHON__", _json_escape(effective_python))
+        .replace("__LAB_ROOT__", _json_escape(effective_root))
+        .replace("__WORKSPACE_DIR__", _json_escape(effective_workspace))
     )
     json.loads(rendered)
     return rendered
@@ -507,9 +505,45 @@ def ensure_model_served(
                 _extract_attached_session_caps(
                     endpoint,
                     active_rec,
-                    default_ttl_seconds=ttl_seconds,
                 )
             )
+            if rec_max_bytes < MIN_ATTACHED_REQUEST_BYTES:
+                raise LocalAssistError(
+                    "spend_ceiling_exceeded",
+                    f"Refusing to attach to active proxy session for '{endpoint.model_id}': "
+                    f"max_request_bytes={rec_max_bytes} is below the {MIN_ATTACHED_REQUEST_BYTES}-byte minimum "
+                    f"required for OpenCode tool schemas and conversation state. "
+                    f"Run './scripts/stop-model {endpoint.model_id}' and relaunch.",
+                    details={
+                        "model_id": endpoint.model_id,
+                        "attached": True,
+                        "max_request_bytes": rec_max_bytes,
+                    },
+                )
+            if (
+                rec_max_reqs > max_chat_requests
+                or rec_max_tokens > max_tokens_cap
+                or rec_max_bytes > max_request_bytes
+                or rec_ttl > ttl_seconds
+            ):
+                raise LocalAssistError(
+                    "spend_ceiling_exceeded",
+                    f"Refusing to attach to active proxy session for '{endpoint.model_id}': "
+                    f"the running session's caps (max_chat_requests={rec_max_reqs}, "
+                    f"max_tokens_cap={rec_max_tokens}, max_request_bytes={rec_max_bytes}, "
+                    f"ttl_seconds={rec_ttl}) exceed the launcher's ceiling "
+                    f"(max_chat_requests={max_chat_requests}, max_tokens_cap={max_tokens_cap}, "
+                    f"max_request_bytes={max_request_bytes}, ttl_seconds={ttl_seconds}). "
+                    f"Run './scripts/stop-model {endpoint.model_id}' and relaunch.",
+                    details={
+                        "model_id": endpoint.model_id,
+                        "attached": True,
+                        "max_chat_requests": rec_max_reqs,
+                        "max_tokens_cap": rec_max_tokens,
+                        "max_request_bytes": rec_max_bytes,
+                        "ttl_seconds": rec_ttl,
+                    },
+                )
             attached_est = check_session_spend_ceiling(
                 endpoint,
                 max_chat_requests=rec_max_reqs,
@@ -588,7 +622,6 @@ def ensure_model_served(
                     _extract_attached_session_caps(
                         endpoint,
                         active_rec,
-                        default_ttl_seconds=ttl_seconds,
                     )
                 )
             except LocalAssistError as exc:
@@ -670,8 +703,8 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
         type=int,
         default=None,
         help=(
-            f"Context window limit in opencode config (default: min(model.context_window, {DEFAULT_CONTEXT_LIMIT}) "
-            f"so requests stay within --max-request-bytes {DEFAULT_MAX_REQUEST_BYTES})."
+            f"Context window limit in opencode config (default: model.context_window from models.yaml, "
+            f"or {DEFAULT_CONTEXT_LIMIT} if unset; clamped when attaching to a tighter proxy session)."
         ),
     )
     parser.add_argument(
@@ -683,25 +716,25 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     parser.add_argument(
         "--max-chat-requests",
         type=int,
-        default=DEFAULT_MAX_CHAT_REQUESTS,
+        default=None,
         help=f"se-key-proxy chat request cap per session, including title-agent requests (default: {DEFAULT_MAX_CHAT_REQUESTS}).",
     )
     parser.add_argument(
         "--max-tokens-cap",
         type=int,
-        default=DEFAULT_MAX_TOKENS_CAP,
+        default=None,
         help=f"se-key-proxy max_tokens cap per request (default: {DEFAULT_MAX_TOKENS_CAP}).",
     )
     parser.add_argument(
         "--max-request-bytes",
         type=int,
-        default=DEFAULT_MAX_REQUEST_BYTES,
+        default=None,
         help=f"se-key-proxy max HTTP request body bytes (default: {DEFAULT_MAX_REQUEST_BYTES}).",
     )
     parser.add_argument(
         "--ttl-seconds",
         type=int,
-        default=DEFAULT_TTL_SECONDS,
+        default=None,
         help=f"se-key-proxy session TTL in seconds (default: {DEFAULT_TTL_SECONDS}).",
     )
     parser.add_argument(
@@ -761,6 +794,45 @@ def main(argv: list[str]) -> int:
     caller_cwd = Path.cwd()
     args, opencode_args = parse_args(argv)
 
+    eff_max_reqs = (
+        args.max_chat_requests
+        if args.max_chat_requests is not None
+        else DEFAULT_MAX_CHAT_REQUESTS
+    )
+    eff_max_tokens = (
+        args.max_tokens_cap
+        if args.max_tokens_cap is not None
+        else DEFAULT_MAX_TOKENS_CAP
+    )
+    eff_max_bytes = (
+        args.max_request_bytes
+        if args.max_request_bytes is not None
+        else DEFAULT_MAX_REQUEST_BYTES
+    )
+    eff_ttl = (
+        args.ttl_seconds
+        if args.ttl_seconds is not None
+        else DEFAULT_TTL_SECONDS
+    )
+
+    if (
+        eff_max_reqs <= 0
+        or eff_max_tokens <= 0
+        or eff_max_bytes <= 0
+        or eff_ttl <= 0
+        or args.stream_timeout_seconds <= 0
+        or args.output_limit <= 0
+        or args.wait < 0
+        or (args.context_limit is not None and args.context_limit <= 0)
+        or (args.max_session_usd is not None and args.max_session_usd <= 0)
+    ):
+        print(
+            "All cap/limit flags (--max-chat-requests, --max-tokens-cap, --max-request-bytes, "
+            "--ttl-seconds, --stream-timeout-seconds, --output-limit, --context-limit, --max-session-usd) must be > 0 and --wait >= 0.",
+            file=sys.stderr,
+        )
+        return 1
+
     try:
         model_id = args.model or resolve_default_attested_model_id()
         model = load_model(model_id)
@@ -776,14 +848,21 @@ def main(argv: list[str]) -> int:
         print(str(exc), file=sys.stderr)
         return 1
 
+    opencode_bin: str | None = None
+    if not args.print_config:
+        opencode_bin = shutil.which("opencode")
+        if not opencode_bin:
+            print("opencode binary not found on PATH", file=sys.stderr)
+            return 1
+
     ok, err_msg, session_meta = ensure_model_served(
         endpoint_pre,
         no_serve=args.no_serve,
         wait_seconds=args.wait,
-        max_chat_requests=args.max_chat_requests,
-        max_tokens_cap=args.max_tokens_cap,
-        max_request_bytes=args.max_request_bytes,
-        ttl_seconds=args.ttl_seconds,
+        max_chat_requests=eff_max_reqs,
+        max_tokens_cap=eff_max_tokens,
+        max_request_bytes=eff_max_bytes,
+        ttl_seconds=eff_ttl,
         stream_timeout_seconds=args.stream_timeout_seconds,
         max_session_usd=args.max_session_usd,
     )
@@ -816,15 +895,26 @@ def main(argv: list[str]) -> int:
         (isolated_home / subdir).mkdir(parents=True, exist_ok=True)
 
     edit_permission = "allow" if args.allow_edit else "ask"
-    effective_context_limit = (
-        args.context_limit
-        if args.context_limit is not None
-        else default_context_limit_for_endpoint(endpoint)
-    )
+    sess_tokens_cap = int(session_meta["max_tokens_cap"])
+    sess_bytes_cap = int(session_meta["max_request_bytes"])
+    if args.context_limit is not None and sess_bytes_cap > 0 and args.context_limit > max(1, sess_bytes_cap // 6):
+        print(
+            f"[private-attested] Notice: clamping requested --context-limit {args.context_limit} "
+            f"to {max(1, sess_bytes_cap // 6)} tokens to fit session max_request_bytes={sess_bytes_cap}.",
+            file=sys.stderr,
+        )
+    if args.output_limit > sess_tokens_cap > 0:
+        print(
+            f"[private-attested] Notice: clamping requested --output-limit {args.output_limit} "
+            f"to {sess_tokens_cap} tokens to fit session max_tokens_cap={sess_tokens_cap}.",
+            file=sys.stderr,
+        )
     config_text = render_private_attested_config(
         endpoint,
-        context_limit=effective_context_limit,
+        context_limit=args.context_limit,
         output_limit=args.output_limit,
+        max_tokens_cap=sess_tokens_cap,
+        max_request_bytes=sess_bytes_cap,
         edit_permission=edit_permission,
         workspace_dir=caller_cwd,
     )
@@ -860,10 +950,7 @@ def main(argv: list[str]) -> int:
         )
         return 0
 
-    opencode_bin = shutil.which("opencode")
-    if not opencode_bin:
-        print("opencode binary not found on PATH", file=sys.stderr)
-        return 1
+    assert opencode_bin is not None
 
     # Restart opencode's persistent background service (`opencode serve --service`)
     # whenever the active session token, proxy startup_nonce, or model_id changed,

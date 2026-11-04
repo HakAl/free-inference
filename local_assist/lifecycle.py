@@ -55,9 +55,11 @@ def ensure_local_model_served(
     try:
         entry = find_model_by_id_or_repo(registry_id) or find_model_by_id_or_repo(model)
         if entry is None:
-            if effective_auto_serve:
-                load_model(registry_id)
-            return
+            raise ModelUnavailable(
+                "model_unavailable",
+                f"Model '{model}' (registry_id='{registry_id}') is not present in models.yaml.",
+                details={"required_model": model, "registry_id": registry_id},
+            )
         real_id = str(entry["id"])
         pid_record = read_pid_record_for_model(real_id)
         endpoint = resolve_endpoint(entry, pid_record=pid_record, require_api_key=False)

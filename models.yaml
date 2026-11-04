@@ -4,7 +4,11 @@
 # Status progression: candidate → reviewed → downloaded|attested → sanity_checked
 #                   → runnable → evaluated → default (or archived at any stage)
 #
-# Replace the example entry below with models reviewed for your environment.
+# Note on version fields: `conversion_runtime_version` and `quantization.tool_version`
+# record the upstream converter version from the Hugging Face model card (for example
+# `mlx-lm 0.26.3`), whereas local evaluation scores in `eval_summary` and `docs/evals/*.json`
+# were recorded under `mlx==0.31.2`, `mlx-lm==0.31.3`, and `mlx-vlm==0.5.0` on Python 3.14.5
+# (pinned in `requirements.txt`).
 
 models:
   - id: qwen3-1.7b-mlx-4bit
@@ -14,7 +18,7 @@ models:
     converter: Qwen
     conversion_runtime_version: null
     runtime: mlx-lm
-    serve_command: mlx_lm.server --model "Qwen/Qwen3-1.7B-MLX-4bit" --chat-template "$(cat evals/chat_templates/qwen3.jinja)" --chat-template-args '{"enable_thinking":false}'
+    serve_command: null
     chat_template_file: evals/chat_templates/qwen3.jinja
     chat_template_args:
       enable_thinking: false
@@ -30,7 +34,7 @@ models:
     remote_trust: null
     license: apache-2.0
     release_date: null
-    verified_date: 2026-10-29
+    verified_date: "2026-10-29"
     params_total: 1.7B
     params_active: 1.7B
     quantization:
@@ -85,10 +89,11 @@ models:
       tool_calling: true
     routing:
       private_local: cleared
+    eval_evidence_artifact: docs/evals/qwen3-30b-a3b-2507-mlx-4bit.json
     remote_trust: null
     license: apache-2.0
     release_date: null
-    verified_date: 2026-05-14
+    verified_date: "2026-05-14"
     params_total: 30.5B
     params_active: 3.3B
     quantization:
@@ -149,7 +154,7 @@ models:
     remote_trust: null
     license: apache-2.0
     release_date: null
-    verified_date: 2026-05-14
+    verified_date: "2026-05-14"
     params_total: 30.5B
     params_active: 3.3B
     quantization:
@@ -208,8 +213,8 @@ models:
       private_local: blocked
     remote_trust: null
     license: apache-2.0
-    release_date: 2026-04-02
-    verified_date: 2026-05-23
+    release_date: "2026-04-02"
+    verified_date: "2026-05-23"
     params_total: 26B
     params_active: ~4B
     quantization:
@@ -281,7 +286,7 @@ models:
         output: 0.60
     license: apache-2.0
     release_date: null
-    verified_date: 2026-10-31
+    verified_date: "2026-10-31"
     params_total: 120B
     params_active: 5.1B
     quantization:
@@ -348,6 +353,7 @@ models:
     routing:
       private_local: blocked
       private_attested: cleared
+    eval_evidence_artifact: docs/evals/tinfoil-deepseek-v4-1-flash.json
     remote_trust:
       tier: enclave_runtime_attested
       attestation_method: tinfoil-proxy-sigstore
@@ -361,8 +367,8 @@ models:
         input: 0.65
         output: 1.45
     license: mit
-    release_date: 2026-10-17
-    verified_date: 2026-10-31
+    release_date: "2026-10-17"
+    verified_date: "2026-10-31"
     params_total: null
     params_active: null
     quantization:
@@ -446,7 +452,7 @@ models:
         output: 5.75
     license: mit
     release_date: null
-    verified_date: 2026-10-31
+    verified_date: "2026-10-31"
     params_total: null
     params_active: null
     quantization:
@@ -526,7 +532,7 @@ models:
         output: 20.00
     license: mit
     release_date: null
-    verified_date: 2026-10-31
+    verified_date: "2026-10-31"
     params_total: null
     params_active: null
     quantization:

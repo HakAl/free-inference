@@ -1,3 +1,6 @@
+# Note: `./scripts/eval tools <model-id>` renders a single-provider `runs/<run-id>/suite.yaml`
+# from `models.yaml` via `./scripts/render-suite`. The `providers:` list below provides defaults
+# for registered Rung 1 local models when inspecting the suite directly.
 description: Local LLM tool-calling eval suite (OpenAI tools / tool_calls)
 
 prompts:
@@ -52,14 +55,6 @@ providers:
                   type: string
                   description: Optional test module or path.
               additionalProperties: false
-  - id: openai:chat:mlx-community/phi-4-4bit
-    transform: "typeof output === 'string' ? output.replace(/<\\|im_end\\|>\\s*$/g, '').trim() : output"
-    config:
-      apiBaseUrl: http://127.0.0.1:8080/v1
-      apiKey: none
-      temperature: 0.0
-      max_tokens: 500
-      tools: *agent_tools
   - id: openai:chat:mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit
     transform: "typeof output === 'string' ? output.replace(/<\\|im_end\\|>\\s*$/g, '').trim() : output"
     config:
@@ -75,14 +70,6 @@ providers:
       apiKey: none
       temperature: 0.0
       max_tokens: 500
-      tools: *agent_tools
-  - id: openai:chat:mlx-community/gpt-oss-20b-MXFP4-Q4
-    transform: file://evals/transforms/harmony.js
-    config:
-      apiBaseUrl: http://127.0.0.1:8080/v1
-      apiKey: none
-      temperature: 0.0
-      max_tokens: 700
       tools: *agent_tools
 
 tests:

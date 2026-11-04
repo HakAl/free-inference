@@ -1,16 +1,12 @@
+# Note: `./scripts/eval v1 <model-id>` renders a single-provider `runs/<run-id>/suite.yaml`
+# from `models.yaml` via `./scripts/render-suite`. The `providers:` list below provides defaults
+# for registered Rung 1 local models when inspecting the suite directly.
 description: Local LLM v1 practical eval suite
 
 prompts:
   - "{{prompt}}"
 
 providers:
-  - id: openai:chat:mlx-community/phi-4-4bit
-    transform: "typeof output === 'string' ? output.replace(/<\\|im_end\\|>\\s*$/g, '').trim() : output"
-    config:
-      apiBaseUrl: http://127.0.0.1:8080/v1
-      apiKey: none
-      temperature: 0.2
-      max_tokens: 700
   - id: openai:chat:mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit
     transform: "typeof output === 'string' ? output.replace(/<\\|im_end\\|>\\s*$/g, '').trim() : output"
     config:
@@ -25,13 +21,6 @@ providers:
       apiKey: none
       temperature: 0.2
       max_tokens: 700
-  - id: openai:chat:mlx-community/gpt-oss-20b-MXFP4-Q4
-    transform: file://evals/transforms/harmony.js
-    config:
-      apiBaseUrl: http://127.0.0.1:8080/v1
-      apiKey: none
-      temperature: 0.2
-      max_tokens: 900
 
 tests:
   - description: code-explanation-cache-key
@@ -184,6 +173,8 @@ tests:
       - type: javascript
         value: "output.includes('diff --git') && output.includes('---') && output.includes('+++') && output.includes('@@') && output.includes('.cache/') && output.includes('*.log') && output.includes('runs/')"
 
+  # Note: `phi-4-mlx-4bit` below is an arbitrary hypothetical model ID fixture used to test
+  # JSON schema adherence; the prompt text is frozen to preserve the suite's `tests_sha256` digest.
   - description: tool-schema-readiness
     vars:
       prompt: |

@@ -1,0 +1,118 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  verify-macos-arm64:
+    name: Verify on macOS Apple Silicon (arm64)
+    runs-on: macos-15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22.22.0"
+
+      - name: Check platform (Darwin arm64) and Python >= 3.11
+        run: |
+          test "$(uname -s)" = "Darwin"
+          test "$(uname -m)" = "arm64"
+          python3 -c 'import sys; assert sys.version_info >= (3, 11), sys.version'
+
+      - name: Build Secure Enclave key proxy and test binary
+        run: |
+          python3 -I -B ./scripts/se-key build --include-test-binary
+
+      - name: Run Secure Enclave selftest (accept exit 0 or 77 on headless runners)
+        run: |
+          rc=0
+          ./bin/se-key-proxy selftest || rc=$?
+          if [ "$rc" -ne 0 ] && [ "$rc" -ne 77 ]; then
+            echo "Unexpected selftest exit code: $rc" >&2
+            exit "$rc"
+          fi
+
+      - name: Verify committed evaluation evidence manifests (offline CI mode)
+        run: |
+          python3 -I -B ./scripts/generate-eval-manifest --check --offline-ci
+
+      - name: Run unit test suite under isolated stdlib-only Python (-I)
+        run: |
+          python3 -I -B -c "import importlib.util; assert importlib.util.find_spec('yaml') is None, 'Expected stdlib-only environment without PyYAML'"
+          python3 -I -B -m unittest discover -s tests -v
+
+      - name: Verify PyYAML parity against _MiniYamlParser in isolated temp venv
+        run: |
+          python3 -m venv "$RUNNER_TEMP/pyyaml-venv"
+          "$RUNNER_TEMP/pyyaml-venv/bin/pip" install --disable-pip-version-check pyyaml==6.0.3
+          FREE_INFERENCE_REQUIRE_PYYAML_PARITY=1 "$RUNNER_TEMP/pyyaml-venv/bin/python" -B -m unittest discover -s tests -k "*test_miniyaml_parity*" -k "*test_eval_evidence*" -v
+
+      - name: Run offline opencode-attested-e2e boundary and spend-cap checks
+        run: |
+          python3 -I -B ./scripts/opencode-attested-e2e
+
+      - name: Verify zero em dashes in repository
+        run: |
+          python3 -c '
+          import pathlib, sys
+          root = pathlib.Path(".")
+          skip = {".git", ".venv", "node_modules", ".home", "bin", ".pycache", ".uv-cache", "runs"}
+          hits = []
+          for p in root.rglob("*"):
+              if any(part in skip for part in p.parts) or not p.is_file():
+                  continue
+              try:
+                  txt = p.read_text(encoding="utf-8")
+              except Exception:
+                  continue
+              if "\u2014" in txt:
+                  hits.append(str(p))
+          if hits:
+              print("Em dash found in:", hits, file=sys.stderr)
+              sys.exit(1)
+          '
+
+  verify-linux-portable:
+    name: Verify portable Python and Node suites on Linux
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: "22.22.0"
+
+      - name: Verify committed evaluation evidence manifests (offline CI mode)
+        run: |
+          python3 -I -B ./scripts/generate-eval-manifest --check --offline-ci
+
+      - name: Run portable unit tests (and verify Darwin-only SEKeyTests skip cleanly)
+        run: |
+          python3 -I -B -c "import importlib.util; assert importlib.util.find_spec('yaml') is None, 'Expected stdlib-only environment without PyYAML'"
+          python3 -I -B -m unittest discover -s tests -v
+
+      - name: Verify PyYAML parity against _MiniYamlParser in isolated temp venv
+        run: |
+          python3 -m venv "$RUNNER_TEMP/pyyaml-venv"
+          "$RUNNER_TEMP/pyyaml-venv/bin/pip" install --disable-pip-version-check pyyaml==6.0.3
+          FREE_INFERENCE_REQUIRE_PYYAML_PARITY=1 "$RUNNER_TEMP/pyyaml-venv/bin/python" -B -m unittest discover -s tests -k "*test_miniyaml_parity*" -k "*test_eval_evidence*" -v

@@ -21,12 +21,13 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 ROOT = Path(__file__).resolve().parents[1]
 VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
-if VENV_PYTHON.exists() and Path(sys.executable) != VENV_PYTHON:
+if __name__ == "__main__" and VENV_PYTHON.exists() and Path(sys.executable) != VENV_PYTHON:
     os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), __file__, *sys.argv[1:]])
 
 sys.path.insert(0, str(ROOT))
 
 from local_assist.registry import (
+    BASE_SAFE_ENV_ALLOWLIST,
     SESSION_TOKEN_ENV_VAR,
     EndpointConfig,
     RegistryError,
@@ -53,18 +54,11 @@ HOST_STATE_CHECK_SCOPE = (
     "~/.config/opencode, ~/.local/share/opencode, ~/.cache/opencode, "
     "~/Library/Application Support/opencode"
 )
-SAFE_ENV_ALLOWLIST = (
-    "PATH",
-    "LANG",
-    "LC_ALL",
-    "LC_CTYPE",
-    "TERM",
-    "TMPDIR",
-    "USER",
-    "LOGNAME",
-    "SHELL",
-    "SYSTEMROOT",
-)
+SAFE_ENV_ALLOWLIST = tuple(sorted(BASE_SAFE_ENV_ALLOWLIST))
+
+
+def _json_escape(val: Any) -> str:
+    return json.dumps(str(val))[1:-1]
 
 
 def render_opencode_config(
@@ -81,12 +75,14 @@ def render_opencode_config(
     else:
         api_key_placeholder = endpoint.api_key
     effective_base_url = api_base_url_override or endpoint.api_base_url
-    return (
-        tmpl.replace("__API_BASE_URL__", effective_base_url)
-        .replace("__API_KEY_VALUE__", api_key_placeholder)
-        .replace("__SERVED_MODEL_ID__", endpoint.served_model_id)
-        .replace("__MODEL_ID__", endpoint.model_id)
+    rendered = (
+        tmpl.replace("__API_BASE_URL__", _json_escape(effective_base_url))
+        .replace("__API_KEY_VALUE__", _json_escape(api_key_placeholder))
+        .replace("__SERVED_MODEL_ID__", _json_escape(endpoint.served_model_id))
+        .replace("__MODEL_ID__", _json_escape(endpoint.model_id))
     )
+    json.loads(rendered)
+    return rendered
 
 
 def build_isolated_env(

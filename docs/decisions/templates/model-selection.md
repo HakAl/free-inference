@@ -46,8 +46,8 @@ Questions:
 
 Current planned comparison:
 
-- `qwen3-30b-a3b-2507-mlx-4bit` vs `phi-4-mlx-4bit`
-- `qwen3-coder-30b-a3b-mlx-4bit` vs `phi-4-mlx-4bit` for coding tasks
+- `qwen3-30b-a3b-2507-mlx-4bit` vs `gemma-4-26b-a4b-it-optiq-mlx-4bit`
+- `qwen3-coder-30b-a3b-mlx-4bit` vs `qwen3-30b-a3b-2507-mlx-4bit` for coding tasks
 
 ## Decision
 

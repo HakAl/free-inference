@@ -2,8 +2,14 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import unittest
+from pathlib import Path
 from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 from local_assist.client import DEFAULT_TIMEOUT_SECONDS, default_timeout_seconds, normalize_text
 from local_assist.logging import summarize_args
@@ -435,6 +441,118 @@ class LocalAssistTests(unittest.TestCase):
             self.assertEqual(summary["context_chars"], len("super-secret-inline-context"))
             self.assertIsNotNone(summary["context_sha256"])
             self.assertNotIn("super-secret-inline-context", json.dumps(summary))
+
+    def test_compress_context_and_extract_fields_redact_prompt_in_logs(self) -> None:
+        import hashlib
+        import tempfile
+        from unittest.mock import patch
+        import local_assist.logging as log_mod
+        from local_assist.client import ChatResult
+        from local_assist.tools import compress_context as cc_mod
+        from local_assist.tools import extract_fields as ef_mod
+
+        secret_diff = (
+            "diff --git a/secret.py b/secret.py\n"
+            "--- a/secret.py\n"
+            "+++ b/secret.py\n"
+            "@@ -1 +1 @@\n"
+            "-PRIVATE_TOKEN_OLD_999\n"
+            "+PRIVATE_TOKEN_NEW_888\n"
+        )
+        secret_text = "Confidential invoice #7721 for Project Chimera amount 42000"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp)
+            la_runs = tmp_root / "runs" / "local-assist"
+            with (
+                patch.object(log_mod, "ROOT", tmp_root),
+                patch.object(log_mod, "LOCAL_ASSIST_RUNS", la_runs),
+            ):
+                with (
+                    patch.object(cc_mod, "require_chat_succeeds"),
+                    patch.object(
+                        cc_mod,
+                        "chat",
+                        return_value=ChatResult(
+                            raw_text="{}",
+                            text=json.dumps(
+                                {
+                                    "summary": "Updated secret.py.",
+                                    "key_points": ["rotated token"],
+                                    "changed_files": ["secret.py"],
+                                    "failures": [],
+                                    "risks": [],
+                                    "commands": [],
+                                    "followups": [],
+                                    "omitted": [],
+                                }
+                            ),
+                            served_model="mock-local",
+                            usage={"prompt_tokens": 10, "completion_tokens": 10, "total_tokens": 20},
+                            latency_ms=12,
+                            finish_reason="stop",
+                        ),
+                    ),
+                ):
+                    cc_res = cc_mod.run("diff", secret_diff, "token rotation", 5)
+                    self.assertEqual(cc_res["changed_files"], ["secret.py"])
+
+                with (
+                    patch.object(ef_mod, "require_chat_succeeds"),
+                    patch.object(
+                        ef_mod,
+                        "chat",
+                        return_value=ChatResult(
+                            raw_text="{}",
+                            text=json.dumps(
+                                {
+                                    "extracted": {"amount": 42000},
+                                    "extraction_note": None,
+                                }
+                            ),
+                            served_model="mock-local",
+                            usage={"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15},
+                            latency_ms=10,
+                            finish_reason="stop",
+                        ),
+                    ),
+                ):
+                    ef_res = ef_mod.run(
+                        secret_text,
+                        {"amount": {"type": "integer", "description": "Invoice amount", "required": True}},
+                    )
+                    self.assertEqual(ef_res["extracted"]["amount"], 42000)
+
+                log_files = sorted(la_runs.rglob("*.json"))
+                self.assertEqual(len(log_files), 2)
+                by_tool = {
+                    json.loads(p.read_text(encoding="utf-8"))["tool"]: json.loads(p.read_text(encoding="utf-8"))
+                    for p in log_files
+                }
+
+                cc_log = by_tool["compress_context"]
+                self.assertNotIn("prompt", cc_log)
+                self.assertIn("prompt_redacted", cc_log)
+                self.assertGreater(cc_log["prompt_redacted"]["chars"], len(secret_diff))
+                self.assertNotIn("text", cc_log["args"])
+                self.assertEqual(cc_log["args"]["text_chars"], len(secret_diff))
+                self.assertEqual(
+                    cc_log["args"]["text_sha256"],
+                    hashlib.sha256(secret_diff.encode("utf-8")).hexdigest(),
+                )
+                self.assertNotIn("PRIVATE_TOKEN_OLD_999", json.dumps(cc_log))
+
+                ef_log = by_tool["extract_fields"]
+                self.assertNotIn("prompt", ef_log)
+                self.assertIn("prompt_redacted", ef_log)
+                self.assertGreater(ef_log["prompt_redacted"]["chars"], len(secret_text))
+                self.assertNotIn("text", ef_log["args"])
+                self.assertEqual(ef_log["args"]["text_chars"], len(secret_text))
+                self.assertEqual(
+                    ef_log["args"]["text_sha256"],
+                    hashlib.sha256(secret_text.encode("utf-8")).hexdigest(),
+                )
+                self.assertNotIn("Project Chimera", json.dumps(ef_log))
 
     def test_mcp_initialize_and_tools_list(self) -> None:
         proc = subprocess.Popen(

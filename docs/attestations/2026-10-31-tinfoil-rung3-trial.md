@@ -316,3 +316,12 @@ Total `tinfoil-kimi-k3` spend across all runs and timing probes: `26,381` input 
 
 - **`tools` (`4/4`, `100%`) and `opencode-smoke` (`PASS` in `2.9050s`)**: Passed all 4 tool cells (including `parallel-tool-calls-diff-check` via `--tool-call-parser kimi_k3`) in `5s` and completed `opencode-smoke` in `2.9050s`.
 - **`v1` (`9/10`, `90%`)**: Passed 9 of 10 automated cells (including `bug-fix-python-batching` and `shell-tool-reasoning-safe-commands`), missing only `patch-like-edit-gitignore` because it emitted a POSIX unified diff (`--- a/.gitignore\n+++ b/.gitignore...`) without a `diff --git` header.
+
+---
+
+## Addendum (2026-11-02): Public Repository Path Mapping
+
+This trial record was captured in the internal workspace prior to standalone public export:
+- References to `proposal.md` correspond to `docs/proposal.md` in this repository.
+- References to `plans/tinfoil-attestation-trial.md` (`T4`, `T6`, `T7`, Section 5) refer to the pre-export trial protocol; the resulting architectural invariants and committed evaluation manifests live in `docs/proposal.md` and `docs/evals/tinfoil-deepseek-v4-1-flash.json`.
+- Host-specific paths in historical command outputs were replaced with `<repo-root>` during public export sanitization.

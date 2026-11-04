@@ -1,0 +1,853 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import sys
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
+if __name__ == "__main__" and VENV_PYTHON.exists() and Path(sys.executable) != VENV_PYTHON:
+    os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), __file__, *sys.argv[1:]])
+
+sys.path.insert(0, str(ROOT))
+
+from local_assist.registry import (
+    EndpointConfig,
+    RegistryError,
+    _load_yaml,
+    load_model,
+    load_models,
+    resolve_endpoint,
+)
+
+RUNS_DIR = ROOT / "runs"
+EVALS_DOCS_DIR = ROOT / "docs" / "evals"
+PRIVATE_PATH_RE = re.compile(r"(/Users/[^\s\"']+|/home/[^\s\"']+)")
+
+SUITE_REL_PATHS: dict[str, str] = {
+    "sanity": "promptfooconfig.yaml",
+    "v1": "evals/suites/v1.yaml",
+    "tools": "evals/suites/tools.yaml",
+}
+
+DEFAULT_CLEARANCE_BASIS: dict[str, dict[str, Any]] = {
+    "qwen3-30b-a3b-2507-mlx-4bit": {
+        "mode": "automated_full_pass",
+        "approved_date": "2026-10-30",
+        "note": (
+            "Passed all five automated Rung 1 private-local gates: sanity 1/1, "
+            "v1 10/10, tools 4/4, streaming tool-call probe "
+            "(buffered complete tool-call TTFT 0.6442s, tool_call_chunks=1), and opencode-smoke (0 non-localhost sockets)."
+        ),
+        "smoke_notes": (
+            "Primary smoke run 2026-10-31-175655-opencode-smoke-qwen3-30b-a3b-2507-mlx-4bit-2aee4a3e-5x1_fu_n "
+            "includes post-run session_token_scan (matches_found: 0); initial clearing smoke run "
+            "2026-10-30-181950-opencode-smoke-qwen3-30b-a3b-2507-mlx-4bit-2aee4a3e-eq188l2v also passed with "
+            "0 non-localhost sockets and token_verified=true."
+        ),
+        "default_runs": {
+            "sanity": "2026-10-29-214329-sanity-qwen3-30b-a3b-2507-mlx-4bit-2aee4a3e-mS7YQ1",
+            "v1": "2026-10-29-214337-v1-qwen3-30b-a3b-2507-mlx-4bit-2aee4a3e-WVXFms",
+            "tools": "2026-10-29-214522-tools-qwen3-30b-a3b-2507-mlx-4bit-2aee4a3e-YoRV2d",
+            "opencode_smoke": "2026-10-31-175655-opencode-smoke-qwen3-30b-a3b-2507-mlx-4bit-2aee4a3e-5x1_fu_n",
+        },
+    },
+    "tinfoil-deepseek-v4-1-flash": {
+        "mode": "operator_exception",
+        "approved_date": "2026-11-01",
+        "note": (
+            "Passed sanity 1/1, tools 4/4 (incremental tool_call_chunks=4), and "
+            "opencode-smoke (0 non-localhost sockets, 0 session token leaks). Scored "
+            "9/10 on automated v1 (missing only the git-extended 'diff --git' header on "
+            "an otherwise valid POSIX unified diff in patch-like-edit-gitignore). "
+            "Cleared by explicit operator decision on 2026-11-01 following full-day "
+            "production coding and review sessions in opencode-attested."
+        ),
+        "operator_clearance_decision": {
+            "approved": True,
+            "date": "2026-11-01",
+            "suite": "v1",
+            "score": "9/10",
+            "failed_case": "patch-like-edit-gitignore",
+            "rationale": "Output was a minimal, valid POSIX unified diff omitting only the git-specific diff --git header line.",
+            "decision_artifact": "docs/attestations/2026-10-31-tinfoil-rung3-trial.md",
+        },
+        "default_runs": {
+            "sanity": "2026-10-31-213403-sanity-tinfoil-deepseek-v4-1-flash-b41fc330-iXVep2",
+            "v1": "2026-10-31-213433-v1-tinfoil-deepseek-v4-1-flash-b41fc330-HlnCge",
+            "tools": "2026-10-31-213459-tools-tinfoil-deepseek-v4-1-flash-b41fc330-0QR0vt",
+            "opencode_smoke": "2026-10-31-213515-opencode-smoke-tinfoil-deepseek-v4-1-flash-b41fc330-vf7313bc",
+        },
+    },
+}
+
+
+import copy
+import importlib.machinery
+import importlib.util
+
+
+def _load_render_suite_module() -> Any:
+    render_path = ROOT / "scripts" / "render-suite"
+    loader = importlib.machinery.SourceFileLoader("_render_suite_helper", str(render_path))
+    spec = importlib.util.spec_from_loader("_render_suite_helper", loader)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+_RENDER_SUITE_MOD = _load_render_suite_module()
+
+
+def compute_suite_tests_sha256(suite_yaml_path: Path) -> tuple[str, int]:
+    data = copy.deepcopy(_load_yaml(suite_yaml_path))
+    tests = data.get("tests")
+    if not isinstance(tests, list) or not tests:
+        raise ValueError(f"Expected non-empty 'tests' list in {suite_yaml_path}")
+    _RENDER_SUITE_MOD.expand_needle_placeholders(data)
+    canonical = json.dumps(data["tests"], sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return digest, len(tests)
+
+
+def compute_suite_spec_sha256(suite_yaml_path: Path, suite_name: str) -> str:
+    data = copy.deepcopy(_load_yaml(suite_yaml_path))
+    tests = data.get("tests")
+    if not isinstance(tests, list) or not tests:
+        raise ValueError(f"Expected non-empty 'tests' list in {suite_yaml_path}")
+    _RENDER_SUITE_MOD.expand_needle_placeholders(data)
+    max_tokens, temperature, tools = _RENDER_SUITE_MOD._extract_suite_defaults(
+        data.get("providers") or [], suite_name
+    )
+    spec_payload = {
+        "max_tokens": max_tokens,
+        "prompts": data.get("prompts"),
+        "temperature": temperature,
+        "tests": data["tests"],
+        "tools": tools,
+    }
+    canonical = json.dumps(spec_payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _extract_evaluated_provider_config(run_suite_path: Path) -> dict[str, Any] | None:
+    if not run_suite_path.is_file():
+        return None
+    data = _load_yaml(run_suite_path)
+    providers = data.get("providers")
+    if not isinstance(providers, list) or not providers or not isinstance(providers[0], dict):
+        return None
+    prov = providers[0]
+    cfg = prov.get("config") if isinstance(prov.get("config"), dict) else {}
+    out: dict[str, Any] = {"id": prov.get("id")}
+    if prov.get("transform") is not None:
+        out["transform"] = prov.get("transform")
+    for k in ("temperature", "max_tokens", "extraBody", "passthrough"):
+        if k in cfg:
+            out[k] = cfg[k]
+    return out
+
+
+def all_pinned_clearance_runs_present(
+    runs_dir: Path = RUNS_DIR,
+    root_dir: Path = ROOT,
+) -> bool:
+    if not runs_dir.is_dir():
+        return False
+    required_run_ids: set[str] = set()
+    for defaults in DEFAULT_CLEARANCE_BASIS.values():
+        for rid in (defaults.get("default_runs") or {}).values():
+            if isinstance(rid, str) and rid.strip():
+                required_run_ids.add(rid.strip())
+    try:
+        for model in load_models(root_dir / "models.yaml"):
+            ep = resolve_endpoint(model, require_api_key=False)
+            if (
+                ep.routing_private_local == "cleared"
+                or ep.routing_private_attested == "cleared"
+            ) and ep.eval_evidence_artifact:
+                art_path = root_dir / ep.eval_evidence_artifact
+                if art_path.is_file():
+                    m_obj = json.loads(art_path.read_text(encoding="utf-8"))
+                    suites = m_obj.get("suites") if isinstance(m_obj, dict) else None
+                    if isinstance(suites, dict):
+                        for s_obj in suites.values():
+                            if isinstance(s_obj, dict) and isinstance(s_obj.get("run_dir_id"), str):
+                                required_run_ids.add(s_obj["run_dir_id"])
+    except Exception:
+        return False
+    if not required_run_ids:
+        return False
+    return all((runs_dir / rid).is_dir() for rid in required_run_ids)
+
+
+def _sanitize_token_scan(raw_scan: Any) -> dict[str, int] | None:
+    if not isinstance(raw_scan, dict):
+        return None
+    return {
+        "files_scanned": int(raw_scan.get("files_scanned", 0)),
+        "bytes_scanned": int(raw_scan.get("bytes_scanned", 0)),
+        "matches_found": int(raw_scan.get("matches_found", 0)),
+        "redactions_applied": int(raw_scan.get("redactions_applied", 0)),
+        "remaining_unredacted_matches": int(raw_scan.get("remaining_unredacted_matches", 0)),
+    }
+
+
+def _extract_promptfoo_suite(
+    run_dir: Path,
+    expected_suite: str,
+    *,
+    root_dir: Path = ROOT,
+) -> dict[str, Any]:
+    metrics_path = run_dir / "metrics.json"
+    output_path = run_dir / "output.json"
+    if not metrics_path.is_file() or not output_path.is_file():
+        raise FileNotFoundError(f"Missing metrics.json or output.json in {run_dir}")
+
+    source_suite_path = root_dir / SUITE_REL_PATHS[expected_suite]
+    expected_tests_sha256, expected_total = compute_suite_tests_sha256(source_suite_path)
+    expected_spec_sha256 = compute_suite_spec_sha256(source_suite_path, expected_suite)
+
+    run_suite_path = run_dir / "suite.yaml"
+    evaluated_prov_cfg: dict[str, Any] | None = None
+    if run_suite_path.is_file():
+        run_tests_sha256, _ = compute_suite_tests_sha256(run_suite_path)
+        if run_tests_sha256 != expected_tests_sha256:
+            raise ValueError(
+                f"Run {run_dir.name} suite.yaml tests_sha256 ({run_tests_sha256}) does not match "
+                f"{SUITE_REL_PATHS[expected_suite]} ({expected_tests_sha256})"
+            )
+        run_spec_sha256 = compute_suite_spec_sha256(run_suite_path, expected_suite)
+        if run_spec_sha256 != expected_spec_sha256:
+            raise ValueError(
+                f"Run {run_dir.name} suite.yaml suite_spec_sha256 ({run_spec_sha256}) does not match "
+                f"{SUITE_REL_PATHS[expected_suite]} ({expected_spec_sha256})"
+            )
+        evaluated_prov_cfg = _extract_evaluated_provider_config(run_suite_path)
+
+    metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    output = json.loads(output_path.read_text(encoding="utf-8"))
+    results = output.get("results", {}).get("results", [])
+    if not isinstance(results, list) or not results:
+        raise ValueError(f"No promptfoo test results found in {output_path}")
+
+    cases: list[dict[str, Any]] = []
+    for idx, r in enumerate(results):
+        if not isinstance(r, dict):
+            continue
+        desc = str(
+            (r.get("testCase") or {}).get("description")
+            or r.get("description")
+            or f"{expected_suite}-case-{idx + 1}"
+        )
+        cases.append(
+            {
+                "description": desc,
+                "pass": bool(r.get("success") is True),
+                "score": float(r.get("score", 1.0 if r.get("success") else 0.0)),
+            }
+        )
+
+    passed = sum(1 for c in cases if c["pass"] is True)
+    total = len(cases)
+    if total != expected_total:
+        raise ValueError(
+            f"Run {run_dir.name} has {total} test cases, expected {expected_total} from {SUITE_REL_PATHS[expected_suite]}"
+        )
+    failed_tests = [c["description"] for c in cases if not c["pass"]]
+
+    tp = metrics.get("timing_probe") if isinstance(metrics.get("timing_probe"), dict) else {}
+    ttp = metrics.get("tools_timing_probe") if isinstance(metrics.get("tools_timing_probe"), dict) else None
+
+    entry: dict[str, Any] = {
+        "run_dir_id": run_dir.name,
+        "suite": metrics.get("suite", expected_suite),
+        "tests_sha256": expected_tests_sha256,
+        "suite_spec_sha256": expected_spec_sha256,
+        "promptfoo_status": int(metrics.get("promptfoo_status", 0)),
+        "passed": passed,
+        "total": total,
+        "failed_tests": failed_tests,
+        "cases": cases,
+        "ttft_seconds": tp.get("ttft_seconds"),
+        "total_seconds": tp.get("total_seconds"),
+        "runtime_versions": metrics.get("runtime_versions"),
+    }
+    if evaluated_prov_cfg is not None:
+        entry["evaluated_provider_config"] = evaluated_prov_cfg
+    if ttp is not None:
+        entry["tools_timing_probe"] = {
+            "ttft_seconds": ttp.get("ttft_seconds"),
+            "total_seconds": ttp.get("total_seconds"),
+            "stream_chunks": ttp.get("stream_chunks"),
+            "tool_call_chunks": ttp.get("tool_call_chunks"),
+            "tool_calls_emitted": ttp.get("tool_calls_emitted"),
+        }
+    if isinstance(metrics.get("token_accounting"), dict):
+        entry["token_accounting"] = metrics["token_accounting"]
+    scan_summary = _sanitize_token_scan(metrics.get("session_token_scan"))
+    if scan_summary is not None:
+        entry["session_token_scan_summary"] = scan_summary
+    return entry
+
+
+def _extract_smoke_suite(run_dir: Path, *, notes: str | None = None) -> dict[str, Any]:
+    summary_path = run_dir / "summary.json"
+    if not summary_path.is_file():
+        raise FileNotFoundError(f"Missing summary.json in {run_dir}")
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    entry: dict[str, Any] = {
+        "run_dir_id": run_dir.name,
+        "passed": bool(summary.get("passed")),
+        "exit_code": int(summary.get("exit_code", -1)),
+        "elapsed_seconds": summary.get("elapsed_seconds"),
+        "opencode_version": summary.get("opencode_version"),
+        "host_state_unchanged": bool(summary.get("host_state_unchanged")),
+        "network_observation_ok": bool(summary.get("network_observation_ok")),
+        "non_localhost_sockets": int(summary.get("non_localhost_sockets", -1)),
+        "unconnected_udp_sockets": int(summary.get("unconnected_udp_sockets", -1)),
+        "request_budget_ok": bool(summary.get("request_budget_ok")),
+        "only_read_tool_called": bool(summary.get("only_read_tool_called")),
+        "read_target_only": bool(summary.get("read_target_only")),
+        "token_verified": bool(summary.get("token_verified")),
+    }
+    if isinstance(summary.get("token_accounting"), dict):
+        entry["token_accounting"] = summary["token_accounting"]
+    scan_summary = _sanitize_token_scan(summary.get("session_token_scan"))
+    if scan_summary is not None:
+        entry["session_token_scan_summary"] = scan_summary
+    if notes:
+        entry["notes"] = notes
+    return entry
+
+
+def _find_latest_run(model_id: str, suite_prefix: str, runs_dir: Path) -> Path:
+    pattern = f"*-{suite_prefix}-{model_id}-*"
+    candidates = sorted(
+        [p for p in runs_dir.glob(pattern) if p.is_dir()],
+        key=lambda p: p.name,
+    )
+    if not candidates:
+        raise FileNotFoundError(f"No run directory matching '{pattern}' in {runs_dir}")
+    return candidates[-1]
+
+
+def build_manifest_for_model(
+    endpoint: EndpointConfig,
+    *,
+    root_dir: Path = ROOT,
+    runs_dir: Path = RUNS_DIR,
+    sanity_run: str | None = None,
+    v1_run: str | None = None,
+    tools_run: str | None = None,
+    smoke_run: str | None = None,
+    clearance_mode: str | None = None,
+    approved_date: str | None = None,
+    clearance_note: str | None = None,
+) -> dict[str, Any]:
+    defaults = DEFAULT_CLEARANCE_BASIS.get(endpoint.model_id, {})
+    default_runs = defaults.get("default_runs", {})
+
+    s_dir = (
+        runs_dir / sanity_run
+        if sanity_run
+        else (
+            runs_dir / default_runs["sanity"]
+            if "sanity" in default_runs
+            else _find_latest_run(endpoint.model_id, "sanity", runs_dir)
+        )
+    )
+    v_dir = (
+        runs_dir / v1_run
+        if v1_run
+        else (
+            runs_dir / default_runs["v1"]
+            if "v1" in default_runs
+            else _find_latest_run(endpoint.model_id, "v1", runs_dir)
+        )
+    )
+    t_dir = (
+        runs_dir / tools_run
+        if tools_run
+        else (
+            runs_dir / default_runs["tools"]
+            if "tools" in default_runs
+            else _find_latest_run(endpoint.model_id, "tools", runs_dir)
+        )
+    )
+    sm_dir = (
+        runs_dir / smoke_run
+        if smoke_run
+        else (
+            runs_dir / default_runs["opencode_smoke"]
+            if "opencode_smoke" in default_runs
+            else _find_latest_run(endpoint.model_id, "opencode-smoke", runs_dir)
+        )
+    )
+
+    suites = {
+        "sanity": _extract_promptfoo_suite(s_dir, "sanity", root_dir=root_dir),
+        "v1": _extract_promptfoo_suite(v_dir, "v1", root_dir=root_dir),
+        "tools": _extract_promptfoo_suite(t_dir, "tools", root_dir=root_dir),
+        "opencode_smoke": _extract_smoke_suite(sm_dir, notes=defaults.get("smoke_notes")),
+    }
+
+    mode = clearance_mode or defaults.get("mode") or "automated_full_pass"
+    date_str = approved_date or defaults.get("approved_date") or "2026-11-01"
+    note_str = clearance_note or defaults.get("note") or "Cleared after passing evaluation suites."
+
+    clearance_basis: dict[str, Any] = {
+        "mode": mode,
+        "approved_date": date_str,
+        "note": note_str,
+    }
+    if isinstance(defaults.get("operator_clearance_decision"), dict):
+        clearance_basis["operator_clearance_decision"] = dict(defaults["operator_clearance_decision"])
+
+    manifest = {
+        "schema_version": 1,
+        "model_id": endpoint.model_id,
+        "served_model_id": endpoint.served_model_id,
+        "trust_tier": endpoint.trust_tier,
+        "data_control_rung": endpoint.data_control_rung,
+        "usage_policy": endpoint.usage_policy,
+        "routing_status": {
+            "private_local": endpoint.routing_private_local,
+            "private_attested": endpoint.routing_private_attested,
+        },
+        "clearance_basis": clearance_basis,
+        "suites": suites,
+    }
+    serialized = json.dumps(manifest, indent=2)
+    if PRIVATE_PATH_RE.search(serialized):
+        raise ValueError(f"Generated manifest for {endpoint.model_id} contains a host user path")
+    return manifest
+
+
+def validate_manifest_dict(
+    manifest: Any,
+    endpoint: EndpointConfig,
+    *,
+    root_dir: Path = ROOT,
+    runs_dir: Path = RUNS_DIR,
+    offline_ci: bool = False,
+) -> list[str]:
+    errors: list[str] = []
+    if not isinstance(manifest, dict):
+        return ["Manifest root must be a JSON object"]
+    if manifest.get("schema_version") != 1:
+        errors.append(f"Expected schema_version=1, got {manifest.get('schema_version')!r}")
+    if manifest.get("model_id") != endpoint.model_id:
+        errors.append(f"model_id mismatch: manifest has {manifest.get('model_id')!r}, expected {endpoint.model_id!r}")
+    if manifest.get("served_model_id") != endpoint.served_model_id:
+        errors.append(
+            f"served_model_id mismatch: manifest has {manifest.get('served_model_id')!r}, expected {endpoint.served_model_id!r}"
+        )
+    if manifest.get("trust_tier") != endpoint.trust_tier:
+        errors.append(f"trust_tier mismatch: manifest has {manifest.get('trust_tier')!r}, expected {endpoint.trust_tier!r}")
+    if manifest.get("data_control_rung") != endpoint.data_control_rung:
+        errors.append(
+            f"data_control_rung mismatch: manifest has {manifest.get('data_control_rung')!r}, expected {endpoint.data_control_rung!r}"
+        )
+    if manifest.get("usage_policy") != endpoint.usage_policy:
+        errors.append(
+            f"usage_policy mismatch: manifest has {manifest.get('usage_policy')!r}, expected {endpoint.usage_policy!r}"
+        )
+
+    routing_status = manifest.get("routing_status")
+    if not isinstance(routing_status, dict):
+        errors.append("routing_status must be a JSON object")
+    else:
+        if routing_status.get("private_local") != endpoint.routing_private_local:
+            errors.append(
+                f"routing_status.private_local={routing_status.get('private_local')!r} != models.yaml {endpoint.routing_private_local!r}"
+            )
+        if routing_status.get("private_attested") != endpoint.routing_private_attested:
+            errors.append(
+                f"routing_status.private_attested={routing_status.get('private_attested')!r} != models.yaml {endpoint.routing_private_attested!r}"
+            )
+
+    defaults = DEFAULT_CLEARANCE_BASIS.get(endpoint.model_id)
+    basis = manifest.get("clearance_basis")
+    if not isinstance(basis, dict):
+        errors.append("clearance_basis must be a JSON object")
+    else:
+        if basis.get("mode") not in ("automated_full_pass", "operator_exception"):
+            errors.append(f"Invalid clearance_basis.mode: {basis.get('mode')!r}")
+        if defaults and basis.get("mode") != defaults.get("mode"):
+            errors.append(
+                f"clearance_basis.mode for '{endpoint.model_id}' must be {defaults.get('mode')!r}, got {basis.get('mode')!r}"
+            )
+        if not isinstance(basis.get("approved_date"), str) or not basis["approved_date"].strip():
+            errors.append("clearance_basis.approved_date must be a non-empty string")
+        if not isinstance(basis.get("note"), str) or not basis["note"].strip():
+            errors.append("clearance_basis.note must be a non-empty string")
+
+    suites = manifest.get("suites")
+    if not isinstance(suites, dict):
+        errors.append("suites must be a JSON object")
+        return errors
+
+    for req_suite in ("sanity", "v1", "tools", "opencode_smoke"):
+        s_obj = suites.get(req_suite)
+        if not isinstance(s_obj, dict):
+            errors.append(f"Missing suite object '{req_suite}'")
+            continue
+        run_id = s_obj.get("run_dir_id")
+        if not isinstance(run_id, str) or not run_id.strip():
+            errors.append(f"suites.{req_suite}.run_dir_id must be a non-empty string")
+            continue
+        suite_token = "opencode-smoke" if req_suite == "opencode_smoke" else req_suite
+        expected_run_pattern = re.compile(
+            rf"^\d{{4}}-\d{{2}}-\d{{2}}-\d{{6}}-{re.escape(suite_token)}-{re.escape(endpoint.model_id)}-[0-9a-f]{{8}}-[A-Za-z0-9_-]+$"
+        )
+        if not expected_run_pattern.match(run_id):
+            errors.append(
+                f"suites.{req_suite}.run_dir_id {run_id!r} does not match expected format "
+                f"YYYY-MM-DD-HHMMSS-{suite_token}-{endpoint.model_id}-<8hex>-<id>"
+            )
+        if defaults and isinstance(defaults.get("default_runs"), dict) and req_suite in defaults["default_runs"]:
+            pinned_run_id = defaults["default_runs"][req_suite]
+            if run_id != pinned_run_id:
+                errors.append(
+                    f"suites.{req_suite}.run_dir_id ({run_id!r}) does not match pinned clearance run ({pinned_run_id!r})"
+                )
+
+        run_path = runs_dir / run_id
+        if not offline_ci and not run_path.is_dir():
+            errors.append(
+                f"suites.{req_suite} references missing local run directory {run_id} in {runs_dir} "
+                "(pass --offline-ci when verifying in a clean checkout without gitignored runs/)"
+            )
+
+        if req_suite in ("sanity", "v1", "tools"):
+            source_suite_path = root_dir / SUITE_REL_PATHS[req_suite]
+            try:
+                expected_sha256, expected_total = compute_suite_tests_sha256(source_suite_path)
+                expected_spec_sha256 = compute_suite_spec_sha256(source_suite_path, req_suite)
+            except Exception as exc:
+                errors.append(f"Could not compute digests for {SUITE_REL_PATHS[req_suite]}: {exc}")
+                continue
+
+            if s_obj.get("tests_sha256") != expected_sha256:
+                errors.append(
+                    f"suites.{req_suite}.tests_sha256 ({s_obj.get('tests_sha256')!r}) does not match "
+                    f"current {SUITE_REL_PATHS[req_suite]} ({expected_sha256!r})"
+                )
+            if s_obj.get("suite_spec_sha256") != expected_spec_sha256:
+                errors.append(
+                    f"suites.{req_suite}.suite_spec_sha256 ({s_obj.get('suite_spec_sha256')!r}) does not match "
+                    f"current {SUITE_REL_PATHS[req_suite]} ({expected_spec_sha256!r})"
+                )
+
+            passed = s_obj.get("passed")
+            total = s_obj.get("total")
+            if not isinstance(passed, int) or not isinstance(total, int) or total <= 0:
+                errors.append(f"suites.{req_suite} must have integer passed and total > 0")
+                continue
+
+            if total != expected_total:
+                errors.append(
+                    f"suites.{req_suite}.total ({total}) does not match suite definition count ({expected_total})"
+                )
+
+            cases = s_obj.get("cases")
+            if not isinstance(cases, list) or len(cases) != expected_total:
+                errors.append(
+                    f"suites.{req_suite}.cases must be a list of {expected_total} per-test results"
+                )
+            else:
+                case_passes = sum(1 for c in cases if isinstance(c, dict) and c.get("pass") is True)
+                if case_passes != passed:
+                    errors.append(
+                        f"suites.{req_suite}.cases pass count ({case_passes}) != suites.{req_suite}.passed ({passed})"
+                    )
+
+            if req_suite in ("sanity", "tools") and passed != expected_total:
+                errors.append(f"suites.{req_suite} must pass all tests ({passed}/{expected_total})")
+            elif req_suite == "v1":
+                if passed == expected_total:
+                    if isinstance(basis, dict) and basis.get("mode") != "automated_full_pass":
+                        errors.append(
+                            "suites.v1 passed 10/10 so clearance_basis.mode must be 'automated_full_pass'"
+                        )
+                    if s_obj.get("failed_tests") != []:
+                        errors.append("suites.v1 passed 10/10 but failed_tests is non-empty")
+                else:
+                    if not isinstance(basis, dict) or basis.get("mode") != "operator_exception":
+                        errors.append(
+                            f"suites.v1 has {passed}/{total} (< 100%) without clearance_basis.mode='operator_exception'"
+                        )
+                    else:
+                        decision = basis.get("operator_clearance_decision")
+                        if not isinstance(decision, dict) or decision.get("approved") is not True:
+                            errors.append(
+                                "clearance_basis.mode='operator_exception' requires operator_clearance_decision.approved=true"
+                            )
+                        elif (
+                            passed != 9
+                            or expected_total != 10
+                            or decision.get("suite") != "v1"
+                            or decision.get("score") != "9/10"
+                            or decision.get("failed_case") != "patch-like-edit-gitignore"
+                            or s_obj.get("failed_tests") != ["patch-like-edit-gitignore"]
+                        ):
+                            errors.append(
+                                "operator_exception on v1 is only permitted for 9/10 with failed_case='patch-like-edit-gitignore'"
+                            )
+                        else:
+                            dec_art = decision.get("decision_artifact")
+                            if (
+                                not isinstance(dec_art, str)
+                                or not dec_art.startswith("docs/")
+                                or ".." in dec_art.split("/")
+                                or not (root_dir / dec_art).is_file()
+                            ):
+                                errors.append(
+                                    f"operator_clearance_decision.decision_artifact must be an existing file under docs/, got {dec_art!r}"
+                                )
+
+            if req_suite == "tools":
+                ttp = s_obj.get("tools_timing_probe")
+                if not isinstance(ttp, dict) or int(ttp.get("tool_call_chunks") or 0) < 1 or not ttp.get("tool_calls_emitted"):
+                    errors.append(
+                        "suites.tools.tools_timing_probe must record tool_call_chunks >= 1 and non-empty tool_calls_emitted"
+                    )
+
+            if not offline_ci and run_path.is_dir():
+                run_suite_yaml = run_path / "suite.yaml"
+                if not run_suite_yaml.is_file():
+                    errors.append(f"Run directory {run_id} is missing suite.yaml")
+                else:
+                    try:
+                        run_sha256, _ = compute_suite_tests_sha256(run_suite_yaml)
+                        if run_sha256 != expected_sha256:
+                            errors.append(
+                                f"Run {run_id} suite.yaml tests_sha256 ({run_sha256}) != current {SUITE_REL_PATHS[req_suite]} ({expected_sha256})"
+                            )
+                    except Exception as exc:
+                        errors.append(f"Could not parse {run_suite_yaml}: {exc}")
+                try:
+                    live_entry = _extract_promptfoo_suite(run_path, req_suite, root_dir=root_dir)
+                    if live_entry["passed"] != passed or live_entry["total"] != total:
+                        errors.append(
+                            f"suites.{req_suite} pass count ({passed}/{total}) does not match live run {run_id} ({live_entry['passed']}/{live_entry['total']})"
+                        )
+                except Exception as exc:
+                    errors.append(f"Failed to extract live promptfoo suite from {run_id}: {exc}")
+        else:
+            if s_obj.get("passed") is not True or s_obj.get("exit_code") != 0:
+                errors.append("suites.opencode_smoke must have passed=true and exit_code=0")
+            if s_obj.get("token_verified") is not True:
+                errors.append("suites.opencode_smoke must have token_verified=true")
+            if s_obj.get("only_read_tool_called") is not True or s_obj.get("read_target_only") is not True:
+                errors.append("suites.opencode_smoke must have only_read_tool_called=true and read_target_only=true")
+            if s_obj.get("non_localhost_sockets") != 0 or s_obj.get("unconnected_udp_sockets") != 0:
+                errors.append("suites.opencode_smoke must have 0 non_localhost_sockets and 0 unconnected_udp_sockets")
+            if not offline_ci and run_path.is_dir():
+                try:
+                    live_smoke = _extract_smoke_suite(run_path)
+                    if (
+                        live_smoke["passed"] != s_obj.get("passed")
+                        or live_smoke["token_verified"] != s_obj.get("token_verified")
+                        or live_smoke["non_localhost_sockets"] != s_obj.get("non_localhost_sockets")
+                    ):
+                        errors.append(f"suites.opencode_smoke does not match live run {run_id}")
+                except Exception as exc:
+                    errors.append(f"Failed to extract live opencode_smoke from {run_id}: {exc}")
+
+        scan = s_obj.get("session_token_scan_summary")
+        if isinstance(scan, dict):
+            if scan.get("matches_found", 0) != 0 or scan.get("remaining_unredacted_matches", 0) != 0:
+                errors.append(f"suites.{req_suite}.session_token_scan_summary has non-zero token matches")
+
+    if not offline_ci and not errors:
+        try:
+            s_run = ((suites.get("sanity") or {}).get("run_dir_id"))
+            v_run = ((suites.get("v1") or {}).get("run_dir_id"))
+            t_run = ((suites.get("tools") or {}).get("run_dir_id"))
+            sm_run = ((suites.get("opencode_smoke") or {}).get("run_dir_id"))
+            regenerated = build_manifest_for_model(
+                endpoint,
+                root_dir=root_dir,
+                runs_dir=runs_dir,
+                sanity_run=s_run,
+                v1_run=v_run,
+                tools_run=t_run,
+                smoke_run=sm_run,
+                clearance_mode=(basis or {}).get("mode") if isinstance(basis, dict) else None,
+                approved_date=(basis or {}).get("approved_date") if isinstance(basis, dict) else None,
+                clearance_note=(basis or {}).get("note") if isinstance(basis, dict) else None,
+            )
+            if manifest != regenerated:
+                errors.append(
+                    "Committed manifest does not match regenerated manifest from runs/; re-run './scripts/generate-eval-manifest --all'"
+                )
+        except Exception as exc:
+            errors.append(f"Regenerate-and-compare failed against {runs_dir}: {exc}")
+
+    raw_text = json.dumps(manifest)
+    if PRIVATE_PATH_RE.search(raw_text):
+        errors.append("Manifest contains a private host home path")
+    return errors
+
+
+def check_all_cleared_models(
+    *,
+    root_dir: Path = ROOT,
+    runs_dir: Path = RUNS_DIR,
+    offline_ci: bool = False,
+) -> tuple[bool, list[str]]:
+    errors: list[str] = []
+    try:
+        models = load_models(root_dir / "models.yaml")
+    except RegistryError as exc:
+        return False, [str(exc)]
+
+    checked_count = 0
+    for model in models:
+        try:
+            endpoint = resolve_endpoint(model, require_api_key=False)
+        except RegistryError as exc:
+            errors.append(str(exc))
+            continue
+
+        is_cleared = (
+            endpoint.routing_private_local == "cleared"
+            or endpoint.routing_private_attested == "cleared"
+        )
+        if not is_cleared:
+            continue
+
+        checked_count += 1
+        if not endpoint.eval_evidence_artifact:
+            errors.append(f"Cleared model '{endpoint.model_id}' is missing eval_evidence_artifact")
+            continue
+
+        artifact_path = (root_dir / endpoint.eval_evidence_artifact).resolve()
+        if not artifact_path.is_file():
+            errors.append(
+                f"Cleared model '{endpoint.model_id}' eval_evidence_artifact not found at {artifact_path}"
+            )
+            continue
+
+        try:
+            manifest = json.loads(artifact_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            errors.append(f"Could not parse {artifact_path}: {exc}")
+            continue
+
+        model_errors = validate_manifest_dict(
+            manifest,
+            endpoint,
+            root_dir=root_dir,
+            runs_dir=runs_dir,
+            offline_ci=offline_ci,
+        )
+        for err in model_errors:
+            errors.append(f"{endpoint.model_id} ({endpoint.eval_evidence_artifact}): {err}")
+
+    if checked_count == 0:
+        errors.append("No cleared models found in models.yaml")
+    return len(errors) == 0, errors
+
+
+def main(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        description="Generate or verify committed evaluation evidence manifests under docs/evals/."
+    )
+    parser.add_argument(
+        "model_id",
+        nargs="?",
+        default=None,
+        help="Model id from models.yaml to generate manifest for.",
+    )
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        default=False,
+        help="Generate manifests for all cleared models in models.yaml.",
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        default=False,
+        help="Verify that all cleared models in models.yaml have valid, up-to-date manifests under docs/evals/.",
+    )
+    parser.add_argument(
+        "--offline-ci",
+        action="store_true",
+        default=False,
+        help="Verify committed manifests and suite tests_sha256 digests without requiring gitignored runs/ directories.",
+    )
+    parser.add_argument("--sanity-run", default=None, help="Run directory name in runs/ for sanity.")
+    parser.add_argument("--v1-run", default=None, help="Run directory name in runs/ for v1.")
+    parser.add_argument("--tools-run", default=None, help="Run directory name in runs/ for tools.")
+    parser.add_argument("--smoke-run", default=None, help="Run directory name in runs/ for opencode-smoke.")
+    parser.add_argument("--clearance-mode", default=None, choices=("automated_full_pass", "operator_exception"))
+    parser.add_argument("--approved-date", default=None, help="Approval date (YYYY-MM-DD).")
+    parser.add_argument("--clearance-note", default=None, help="Clearance rationale note.")
+    args = parser.parse_args(argv[1:])
+
+    if args.check:
+        ok, errors = check_all_cleared_models(offline_ci=args.offline_ci)
+        if not ok:
+            for err in errors:
+                print(f"ERROR: {err}", file=sys.stderr)
+            return 1
+        mode_label = "offline-ci (committed manifests + suite digests)" if args.offline_ci else "full (live runs/ + suite digests)"
+        print(f"All cleared model evaluation manifests under docs/evals/ are valid [{mode_label}].")
+        return 0
+
+    EVALS_DOCS_DIR.mkdir(parents=True, exist_ok=True)
+    target_ids: list[str] = []
+    try:
+        if args.all:
+            for m in load_models():
+                routing = m.get("routing") or {}
+                if routing.get("private_local") == "cleared" or routing.get("private_attested") == "cleared":
+                    target_ids.append(str(m["id"]))
+        elif args.model_id:
+            target_ids.append(args.model_id)
+        else:
+            parser.print_usage(sys.stderr)
+            return 2
+
+        for mid in target_ids:
+            model = load_model(mid)
+            endpoint = resolve_endpoint(
+                model,
+                require_api_key=False,
+                require_eval_evidence_file=False,
+            )
+            manifest = build_manifest_for_model(
+                endpoint,
+                sanity_run=args.sanity_run,
+                v1_run=args.v1_run,
+                tools_run=args.tools_run,
+                smoke_run=args.smoke_run,
+                clearance_mode=args.clearance_mode,
+                approved_date=args.approved_date,
+                clearance_note=args.clearance_note,
+            )
+            rel_path = endpoint.eval_evidence_artifact or f"docs/evals/{mid}.json"
+            out_path = ROOT / rel_path
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            out_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+            print(f"Wrote {out_path.relative_to(ROOT)}")
+    except (RegistryError, FileNotFoundError, ValueError, OSError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))

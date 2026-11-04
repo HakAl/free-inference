@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import re
 import sys
@@ -99,11 +100,24 @@ def run(
     max_items: Any = DEFAULT_MAX_ITEMS,
 ) -> CompressContextResult:
     model = JOB_TO_MODEL[JOB]
+    text_chars = len(text) if isinstance(text, str) else 0
+    text_sha256 = (
+        hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if isinstance(text, str) and text
+        else None
+    )
 
     with log_call(
         JOB,
         model,
-        args={"kind": kind, "text": text, "focus": focus, "max_items": max_items},
+        args={
+            "kind": kind,
+            "text_chars": text_chars,
+            "text_sha256": text_sha256,
+            "focus": focus,
+            "max_items": max_items,
+        },
+        redact_prompt=True,
     ) as call:
         try:
             validated = validate_inputs(kind, text, focus, max_items)

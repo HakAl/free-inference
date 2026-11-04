@@ -1,5 +1,7 @@
 # Milestone 0 Candidate Review
 
+> **Historical Note**: This review dates from the May 2026 `local-llm-lab` Milestone 0 bootstrap phase prior to the October 2026 `free-inference` 5-rung expansion.
+
 ## Candidate
 
 - Local alias: `qwen3-1.7b-mlx-4bit`

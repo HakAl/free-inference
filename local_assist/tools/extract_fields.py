@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 import time
@@ -59,8 +60,23 @@ requested. Do not omit fields that were requested."""
 
 def run(text: Any, fields: Any) -> ExtractFieldsResult:
     model = JOB_TO_MODEL[JOB]
+    text_chars = len(text) if isinstance(text, str) else 0
+    text_sha256 = (
+        hashlib.sha256(text.encode("utf-8")).hexdigest()
+        if isinstance(text, str) and text
+        else None
+    )
 
-    with log_call(JOB, model, args={"text": text, "fields": fields}) as call:
+    with log_call(
+        JOB,
+        model,
+        args={
+            "text_chars": text_chars,
+            "text_sha256": text_sha256,
+            "fields": fields,
+        },
+        redact_prompt=True,
+    ) as call:
         try:
             validated_fields = validate_field_specs(text, fields)
             deadline = time.monotonic() + float(default_timeout_seconds())

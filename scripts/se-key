@@ -10,11 +10,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
-if VENV_PYTHON.exists() and Path(sys.executable) != VENV_PYTHON:
+if __name__ == "__main__" and VENV_PYTHON.exists() and Path(sys.executable) != VENV_PYTHON:
     os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), __file__, *sys.argv[1:]])
 
 sys.path.insert(0, str(ROOT))
 
+from local_assist.registry import KEYCHAIN_SERVICE_RE
 from local_assist.se_key import (
     SEKeyIntegrityError,
     build_se_key_proxy,
@@ -54,6 +55,14 @@ def main(argv: list[str]) -> int:
             info = build_se_key_proxy(include_test_binary=args.include_test_binary)
             print(json.dumps(info, indent=2, sort_keys=True))
             return 0
+
+        if args.cmd in ("store", "status", "delete"):
+            if not KEYCHAIN_SERVICE_RE.match(args.service):
+                print(
+                    f"Invalid Keychain service identifier '{args.service}': must be 1-128 ASCII chars in [A-Za-z0-9._-]",
+                    file=sys.stderr,
+                )
+                return 2
 
         bin_path = verify_se_key_proxy_binary()
 

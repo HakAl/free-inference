@@ -30,8 +30,14 @@ def summarize_args(args: dict[str, Any]) -> dict[str, Any]:
         summary["language"] = args["language"]
     if "category" in args and isinstance(args["category"], str):
         summary["category"] = args["category"]
-    if "text" in args and isinstance(args["text"], str):
+    if "text_chars" in args and isinstance(args["text_chars"], int):
+        summary["text_chars"] = args["text_chars"]
+    elif "text" in args and isinstance(args["text"], str):
         summary["text_chars"] = len(args["text"])
+    if "text_sha256" in args and isinstance(args["text_sha256"], str):
+        summary["text_sha256"] = args["text_sha256"]
+    elif "text" in args and isinstance(args["text"], str) and args["text"]:
+        summary["text_sha256"] = hashlib.sha256(args["text"].encode("utf-8")).hexdigest()
     if "fields" in args and isinstance(args["fields"], dict):
         summary["n_fields"] = len(args["fields"])
     if "kind" in args and isinstance(args["kind"], str):
@@ -56,10 +62,18 @@ def summarize_args(args: dict[str, Any]) -> dict[str, Any]:
 
 
 class LogCall(AbstractContextManager["LogCall"]):
-    def __init__(self, tool: str, requested_model: str, args: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        tool: str,
+        requested_model: str,
+        args: dict[str, Any],
+        *,
+        redact_prompt: bool = False,
+    ) -> None:
         self.tool = tool
         self.requested_model = requested_model
         self.args = args
+        self.redact_prompt = redact_prompt
         self.started = time.perf_counter()
         self.ts = now_local()
         self.date = self.ts.strftime("%Y-%m-%d")
@@ -84,7 +98,14 @@ class LogCall(AbstractContextManager["LogCall"]):
 
     def record_prompt(self, *, system: str, prompt: str) -> None:
         self.payload["system"] = system
-        self.payload["prompt"] = prompt
+        if self.redact_prompt:
+            prompt_sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+            self.payload["prompt_redacted"] = {
+                "chars": len(prompt),
+                "sha256": prompt_sha,
+            }
+        else:
+            self.payload["prompt"] = prompt
 
     def record_raw_response(self, *, raw_response: str, normalized_response: str) -> None:
         self.payload["raw_response"] = raw_response
@@ -153,5 +174,11 @@ class LogCall(AbstractContextManager["LogCall"]):
             handle.write(json.dumps(row, ensure_ascii=False) + "\n")
 
 
-def log_call(tool: str, requested_model: str, args: dict[str, Any]) -> LogCall:
-    return LogCall(tool, requested_model, args)
+def log_call(
+    tool: str,
+    requested_model: str,
+    args: dict[str, Any],
+    *,
+    redact_prompt: bool = False,
+) -> LogCall:
+    return LogCall(tool, requested_model, args, redact_prompt=redact_prompt)

@@ -195,9 +195,14 @@ def _resolve_effective_connection(model: str | None = None) -> tuple[str, str]:
         if selected_ep is not None:
             if canonical_endpoint_key(selected_ep.api_base_url) != target_key:
                 if not dest_endpoints_for_model:
+                    ipv6_hint = (
+                        " (note: local servers bind IPv4 127.0.0.1; use 127.0.0.1 instead of [::1])"
+                        if target_key[1] == "::1"
+                        else ""
+                    )
                     raise LocalAssistError(
                         "trust_tier_blocked",
-                        f"Refusing LOCAL_ASSIST_BASE_URL override '{effective_url}' because it changes the admitted destination '{selected_ep.api_base_url}' for model '{selected_ep.model_id}'.",
+                        f"Refusing LOCAL_ASSIST_BASE_URL override '{effective_url}' because it changes the admitted destination '{selected_ep.api_base_url}' for model '{selected_ep.model_id}'{ipv6_hint}.",
                         details={
                             "model_id": selected_ep.model_id,
                             "admitted_api_base_url": selected_ep.api_base_url,
