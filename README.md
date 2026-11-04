@@ -16,31 +16,31 @@ Most "free inference" lists optimize for `$0` API tiers where your prompts and c
 
 Every endpoint in [`models.yaml`](models.yaml) is ordered along five explicit data-control rungs enforced by [`local_assist/registry.py`](local_assist/registry.py) and [`local_assist/client.py`](local_assist/client.py):
 
-| Rung | `remote_trust.tier` | What is verified | Cleared Default Model | Launcher |
-|---|---|---|---|---|
-| **1** | `local` | Local weights (`mlx-lm`), localhost `127.0.0.1:8080`, `HF_HUB_OFFLINE=1` forced at serve time | `qwen3-30b-a3b-2507-mlx-4bit` (`1/1` sanity, `10/10` v1, `4/4` tools, `PASS` opencode-smoke; [evidence](docs/evals/qwen3-30b-a3b-2507-mlx-4bit.json)) | `./scripts/opencode-local` |
-| **2** | `enclave_weights_attested` | Hardware TEE + local proxy verifies enclave measurement **and** independent local `dm-verity` `weights_hash` reproduction against a pinned Hugging Face commit | *(`0` registered models today; requires local multi-hundred-GB `modelwrap --verify` build)* | `./scripts/opencode-attested` |
-| **3** | `enclave_runtime_attested` | Hardware TEE + local `tinfoil-proxy` verifies AMD SEV-SNP / Intel TDX enclave measurement and Sigstore provenance (`tinfoilsh/confidential-model-router`) + `se-key-proxy` verifies kernel socket PCB ownership (`libproc`) | `tinfoil-deepseek-v4-1-flash` (1M context, `1/1` sanity, `9/10` v1, `4/4` tools, `PASS` opencode-smoke; [evidence](docs/evals/tinfoil-deepseek-v4-1-flash.json)) | `./scripts/opencode-attested` |
-| **4** | `zdr_contract` | Contractual zero data retention over standard TLS (`store=False`) | Blocked from private coding workflows | Eval / general only |
-| **5** | `standard_api` | Standard retaining third-party API | Blocked from private coding workflows | Eval / general only |
+| Rung | Tier & Verification Boundary | Cleared Default & Launcher |
+|---|---|---|
+| **1**<br>Local | `local`: Local weights (`mlx-lm`), localhost `127.0.0.1:8080`, `HF_HUB_OFFLINE=1` forced at serve time | `qwen3-30b-a3b-2507-mlx-4bit`<br>`1/1` sanity, `10/10` v1, `4/4` tools, `PASS` smoke ([evidence](docs/evals/qwen3-30b-a3b-2507-mlx-4bit.json))<br>Launcher: `./scripts/opencode-local` |
+| **2**<br>Weights TEE | `enclave_weights_attested`: Hardware TEE + local proxy verifies enclave measurement **and** local `dm-verity` `weights_hash` reproduction against a pinned HF commit | *`0` models today (requires local `modelwrap --verify` build)*<br>Launcher: `./scripts/opencode-attested` |
+| **3**<br>Runtime TEE | `enclave_runtime_attested`: Hardware TEE + `tinfoil-proxy` verifies SEV-SNP / TDX measurement & Sigstore provenance + `se-key-proxy` verifies kernel socket PCB (`libproc`) | `tinfoil-deepseek-v4-1-flash` (1M ctx)<br>`1/1` sanity, `9/10` v1, `4/4` tools, `PASS` smoke ([evidence](docs/evals/tinfoil-deepseek-v4-1-flash.json))<br>Launcher: `./scripts/opencode-attested` |
+| **4**<br>ZDR API | `zdr_contract`: Contractual zero data retention over standard TLS (`store=False`) | Blocked from private coding *(eval / general only)* |
+| **5**<br>Standard API | `standard_api`: Standard retaining third-party API | Blocked from private coding *(eval / general only)* |
 
 ### What Leaves Your Mac by Rung
 
-| Mode / Rung | Network Egress | What Content Leaves Your Mac | Who Can Inspect Prompts & Code | Private Coding Admitted? |
-|---|---|---|---|---|
-| **Rung 1 (`private-local`)** | None during inference (`127.0.0.1:8080`, `HF_HUB_OFFLINE=1` & `TRANSFORMERS_OFFLINE=1`) | Nothing (`0` bytes leave localhost during inference) | Nobody outside your Mac | **Yes (Default)** |
-| **Rung 2 (`enclave_weights_attested`)** | HPKE-encrypted TLS to hardware TEE (`127.0.0.1:8081` -> `:9081` -> enclave) | Prompts, workspace files read by the agent, approved `bash` outputs, conversation history, `small_model` session title requests, and `local_assist` MCP tool outputs returned to the planner | Hardware enclave only (subject to AMD SEV-SNP / Intel TDX hardware root of trust and physical memory-bus assumptions); runtime **and** weights independently reproduced (`0` models registered today) | **Yes** (with `LOCAL_ASSIST_ALLOW_ATTESTED_TEE=1` / `opencode-attested`) |
-| **Rung 3 (`enclave_runtime_attested`)** | HPKE-encrypted TLS to hardware TEE (`127.0.0.1:8081` -> `:9081` -> enclave) | Prompts, workspace files read by the agent, approved `bash` outputs, conversation history, `small_model` session title requests, and `local_assist` MCP tool outputs returned to the planner | Hardware enclave only (subject to AMD SEV-SNP / Intel TDX hardware root of trust, physical memory-bus assumptions, and the provider build pipeline for declared weight digests; `provider_terms_apply`) | **Yes** (with `LOCAL_ASSIST_ALLOW_ATTESTED_TEE=1` / `opencode-attested`) |
-| **Rung 4 (`zdr_contract`)** | Standard HTTPS TLS to provider host | Synthetic/public benchmark prompts only | Provider infrastructure (governed by contractual ZDR policy) | **No** (Blocked by `local_assist` and launchers) |
-| **Rung 5 (`standard_api`)** | Standard HTTPS TLS to provider host | Synthetic/public benchmark prompts only | Provider infrastructure (retaining API) | **No** (Blocked by `local_assist` and launchers) |
+| Rung & Admission | Network Egress | What Leaves Your Mac | Who Can Inspect Prompts & Code |
+|---|---|---|---|
+| **Rung 1** (`local`)<br>**Admitted** (default) | None (`127.0.0.1:8080`, offline env forced) | Nothing (`0` bytes leave localhost during inference) | Nobody outside your Mac |
+| **Rung 2** (weights TEE)<br>**Admitted** (opt-in) | HPKE TLS (`:8081` -> `:9081` -> TEE) | Prompts, files read by agent, approved `bash` outputs, history, `small_model` title requests, and Rung 1 MCP outputs returned to planner | Hardware enclave only (AMD SEV-SNP / Intel TDX root of trust and memory-bus assumptions); runtime **and** weights reproduced (`0` models today) |
+| **Rung 3** (runtime TEE)<br>**Admitted** (opt-in) | HPKE TLS (`:8081` -> `:9081` -> TEE) | Prompts, files read by agent, approved `bash` outputs, history, `small_model` title requests, and Rung 1 MCP outputs returned to planner | Hardware enclave only (AMD SEV-SNP / Intel TDX root of trust, memory-bus assumptions, and provider weight build pipeline; provider terms apply) |
+| **Rung 4** (ZDR API)<br>**Blocked** | Standard HTTPS TLS | Synthetic/public benchmark prompts only | Provider infrastructure (contractual ZDR policy) |
+| **Rung 5** (standard API)<br>**Blocked** | Standard HTTPS TLS | Synthetic/public benchmark prompts only | Provider infrastructure (retaining API) |
 
 ### Platform Support Matrix
 
-| Environment | Rung 1 (`opencode-local`, `delegate-local`, `eval`) | Rung 2/3 (`opencode-attested`, `se-key-proxy`) | Offline Unit & Manifest Suite (`tests/`, `generate-eval-manifest`) |
+| Platform | Rung 1 Local | Rung 2/3 Attested | Offline Tests & CI |
 |---|---|---|---|
-| **macOS Apple Silicon (`Darwin arm64`) with Touch ID** | Supported (48 GB RAM recommended for 30B 4-bit MLX) | Supported (hardware Secure Enclave `.biometryCurrentSet` + Touch ID) | Supported (full 65-test suite including hardware SE selftest) |
-| **macOS Apple Silicon (`Darwin arm64`) without Touch ID** (e.g., Mac mini / Studio without Magic Keyboard) | Supported | Unsupported (`se-key-proxy selftest` exits `77` and `./scripts/setup` skips gracefully) | Supported (`test_se_key` skips interactive biometric assertions on exit `77`) |
-| **Linux (`x86_64` / `arm64`)** | N/A (MLX requires Apple Silicon Metal) | N/A (Secure Enclave requires Apple Silicon macOS) | Portable stdlib registry, MCP, transform, and `--offline-ci` manifest suite (`verify-linux-portable` CI job; verified locally on macOS arm64, Linux runner execution pending first GitHub Actions run) |
+| **macOS Apple Silicon (`arm64`) + Touch ID** | Supported (48 GB RAM rec. for 30B MLX) | Supported (Secure Enclave + Touch ID) | Supported (all 65 tests + hardware SE selftest) |
+| **macOS Apple Silicon (`arm64`) without Touch ID**<br>*(e.g. Mac mini / Studio without Magic Keyboard)* | Supported | Unsupported (`selftest` exits `77`; `setup` skips gracefully) | Supported (`test_se_key` skips biometric gate on exit `77`) |
+| **Linux (`x86_64` / `arm64`)** | N/A (requires Apple Metal) | N/A (requires Secure Enclave) | Supported (portable stdlib unit + `--offline-ci` manifest suite) |
 
 ---
 
@@ -140,18 +140,18 @@ See [`SECURITY.md`](SECURITY.md) for the full threat model. Key operational boun
 
 ## CLI Reference, Key Rotation & Troubleshooting
 
-| Script | Purpose | Example |
-|---|---|---|
-| `./scripts/models` | List all models in `models.yaml` with data-control rung, status, and usage policy | `./scripts/models` |
-| `./scripts/serve-model` | Start a local MLX server (`127.0.0.1:8080`) or dual attested proxy (`127.0.0.1:8081` + `:9081`) | `./scripts/serve-model qwen3-30b-a3b-2507-mlx-4bit` |
-| `./scripts/verify-served-model` | Verify active PID records (`pid_lstart`), `/v1/models`, and OS listener `--model` flags | `./scripts/verify-served-model qwen3-30b-a3b-2507-mlx-4bit --require-offline` |
-| `./scripts/stop-model` | Stop a running model server or proxy after verifying `pid_lstart` (`--all` stops all) | `./scripts/stop-model --all` |
-| `./scripts/opencode-local` | Launch OpenCode locked to Rung 1 (`private-local`) with isolated state and `local_assist` MCP | `./scripts/opencode-local -- run "Explain main.swift"` |
-| `./scripts/opencode-attested` | Launch OpenCode locked to Rung 2/3 (`private-attested`) with spend caps and Rung 1 MCP | `./scripts/opencode-attested --max-session-usd 5.00` |
-| `./scripts/delegate-local` | Delegate bounded subtasks (`delegate_task`, `compress_context`, `extract_fields`, `propose_eval_prompts`) to Rung 1 | `./scripts/delegate-local compress_context --kind diff --text-file patch.diff` |
-| `./scripts/se-key` | Build `bin/se-key-proxy`, run `selftest`, or `store` / `status` / `delete` Secure Enclave sealed keys | `./scripts/se-key status free-inference.tinfoil` |
-| `./scripts/eval` | Run `sanity`, `v1`, or `tools` promptfoo suites plus streaming TTFT probe | `./scripts/eval sanity qwen3-30b-a3b-2507-mlx-4bit` |
-| `./scripts/generate-eval-manifest` | Generate or `--check` committed evaluation evidence manifests in `docs/evals/` | `./scripts/generate-eval-manifest --check --offline-ci` |
+| Command | Purpose |
+|---|---|
+| `./scripts/models` | List all models in `models.yaml` with data-control rung, status, and usage policy |
+| `./scripts/serve-model <id>` | Start a local MLX server (`127.0.0.1:8080`) or dual attested proxy (`:8081` + `:9081`) |
+| `./scripts/verify-served-model <id>` | Verify active PID records (`pid_lstart`), `/v1/models`, and OS listener `--model` flags (`--require-offline` for Rung 1) |
+| `./scripts/stop-model <id>` | Stop a running model server or proxy after verifying `pid_lstart` (`--all` stops all) |
+| `./scripts/opencode-local` | Launch OpenCode locked to Rung 1 (`private-local`) with isolated state and Rung 1 MCP |
+| `./scripts/opencode-attested` | Launch OpenCode locked to Rung 2/3 (`private-attested`) with spend caps (`--max-session-usd`) and Rung 1 MCP |
+| `./scripts/delegate-local <tool>` | Delegate bounded subtasks (`delegate_task`, `compress_context`, `extract_fields`, `propose_eval_prompts`) to Rung 1 |
+| `./scripts/se-key <cmd> <service>` | Build `bin/se-key-proxy`, run `selftest`, or `store` / `status` / `delete` Secure Enclave keys |
+| `./scripts/eval <suite> <id>` | Run `sanity`, `v1`, or `tools` promptfoo suites plus streaming TTFT probe |
+| `./scripts/generate-eval-manifest` | Generate or `--check` (`--offline-ci`) committed evaluation evidence manifests in `docs/evals/` |
 
 ### Key Rotation & Clean Uninstall
 
