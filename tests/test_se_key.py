@@ -94,6 +94,12 @@ def _free_port() -> int:
 class _ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
 
+    def server_bind(self) -> None:
+        socketserver.TCPServer.server_bind(self)
+        bound_host, bound_port = self.server_address[:2]
+        self.server_name = str(bound_host)
+        self.server_port = int(bound_port)
+
 
 @unittest.skipUnless(
     sys.platform == "darwin" and shutil.which("swiftc") is not None,
@@ -2431,7 +2437,7 @@ class SEKeyTests(unittest.TestCase):
             call_count_file.write_text("0", encoding="utf-8")
             fake_se_bin = tmp_dir / "fake_se_bin.py"
             fake_se_bin.write_text(
-                f"#!/usr/bin/env python3\n"
+                f"#!{sys.executable}\n"
                 f"import json, os, pathlib, sys\n"
                 f"cmd = sys.argv[1] if len(sys.argv) > 1 else ''\n"
                 f"if cmd == 'seal':\n"

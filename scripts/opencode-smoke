@@ -332,6 +332,12 @@ def parse_events(events_text: str, workspace_dir: Path) -> dict[str, Any]:
 class _ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
 
+    def server_bind(self) -> None:
+        socketserver.TCPServer.server_bind(self)
+        bound_host, bound_port = self.server_address[:2]
+        self.server_name = str(bound_host)
+        self.server_port = int(bound_port)
+
 
 class _NoRedirectHandler(HTTPRedirectHandler):
     def redirect_request(

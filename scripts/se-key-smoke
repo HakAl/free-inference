@@ -49,11 +49,14 @@ def _free_port_pair() -> int:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s1, socket.socket(
             socket.AF_INET, socket.SOCK_STREAM
         ) as s2:
-            if (
-                s1.connect_ex(("127.0.0.1", candidate)) != 0
-                and s2.connect_ex(("127.0.0.1", candidate + 1000)) != 0
-            ):
-                return candidate
+            s1.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s2.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s1.bind(("127.0.0.1", candidate))
+                s2.bind(("127.0.0.1", candidate + 1000))
+            except OSError:
+                continue
+            return candidate
     raise RuntimeError("Could not find free port pair for se-key-smoke")
 
 
@@ -73,6 +76,16 @@ def _confirm_prompt(question: str) -> bool:
 
 def _run_mock_upstream(host: str, port: int, log_file: Path) -> int:
     import http.server
+    import socketserver
+
+    class _FastHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
+        daemon_threads = True
+
+        def server_bind(self) -> None:
+            socketserver.TCPServer.server_bind(self)
+            bound_host, bound_port = self.server_address[:2]
+            self.server_name = str(bound_host)
+            self.server_port = int(bound_port)
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: Any) -> None:
@@ -124,7 +137,7 @@ def _run_mock_upstream(host: str, port: int, log_file: Path) -> int:
             self.end_headers()
             self.wfile.write(body)
 
-    srv = http.server.HTTPServer((host, port), Handler)
+    srv = _FastHTTPServer((host, port), Handler)
     srv.serve_forever()
     return 0
 

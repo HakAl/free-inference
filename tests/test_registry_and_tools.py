@@ -1168,7 +1168,17 @@ class RegistryAndToolsTests(unittest.TestCase):
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
 
-        server = http.server.HTTPServer(("127.0.0.1", 0), MockSSEHandler)
+        import http.server
+        import socketserver
+
+        class _FastHTTPServer(http.server.HTTPServer):
+            def server_bind(self) -> None:
+                socketserver.TCPServer.server_bind(self)
+                bound_host, bound_port = self.server_address[:2]
+                self.server_name = str(bound_host)
+                self.server_port = int(bound_port)
+
+        server = _FastHTTPServer(("127.0.0.1", 0), MockSSEHandler)
         port = server.server_address[1]
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
@@ -1557,7 +1567,16 @@ class RegistryAndToolsTests(unittest.TestCase):
                 self.wfile.write(b"data: [DONE]\n\n")
                 self.wfile.flush()
 
-        upstream = http.server.HTTPServer(("127.0.0.1", 0), UpstreamMockHandler)
+        import socketserver
+
+        class _FastHTTPServer(http.server.HTTPServer):
+            def server_bind(self) -> None:
+                socketserver.TCPServer.server_bind(self)
+                bound_host, bound_port = self.server_address[:2]
+                self.server_name = str(bound_host)
+                self.server_port = int(bound_port)
+
+        upstream = _FastHTTPServer(("127.0.0.1", 0), UpstreamMockHandler)
         upstream_port = upstream.server_address[1]
         upstream_thread = threading.Thread(target=upstream.serve_forever, daemon=True)
         upstream_thread.start()
@@ -1955,7 +1974,16 @@ class RegistryAndToolsTests(unittest.TestCase):
                 self.end_headers()
                 self.wfile.write(body)
 
-        srv = http.server.HTTPServer(("127.0.0.1", 0), ModelsHandler)
+        import socketserver
+
+        class _FastHTTPServer(http.server.HTTPServer):
+            def server_bind(self) -> None:
+                socketserver.TCPServer.server_bind(self)
+                bound_host, bound_port = self.server_address[:2]
+                self.server_name = str(bound_host)
+                self.server_port = int(bound_port)
+
+        srv = _FastHTTPServer(("127.0.0.1", 0), ModelsHandler)
         port = srv.server_address[1]
         t = threading.Thread(target=srv.serve_forever, daemon=True)
         t.start()
