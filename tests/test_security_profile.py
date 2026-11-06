@@ -1369,6 +1369,8 @@ class LiveSeatbeltAttackTests(unittest.TestCase):
             "rc_trustd = libc.bootstrap_look_up(bp, b'com.apple.trustd.agent', ctypes.byref(sp1))\n"
             "sp2 = ctypes.c_uint32(0)\n"
             "rc_sec = libc.bootstrap_look_up(bp, b'com.apple.SecurityServer', ctypes.byref(sp2))\n"
+            "sp3 = ctypes.c_uint32(0)\n"
+            "rc_trustd_sys = libc.bootstrap_look_up(bp, b'com.apple.trustd', ctypes.byref(sp3))\n"
             "cf.CFDataCreate.restype = ctypes.c_void_p\n"
             "cf.CFDataCreate.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long]\n"
             "sec.SecCertificateCreateWithData.restype = ctypes.c_void_p\n"
@@ -1404,7 +1406,7 @@ class LiveSeatbeltAttackTests(unittest.TestCase):
             "assert st_create == 0 and st_anc == 0 and st_net == 0, f'{st_create}/{st_anc}/{st_net}'\n"
             "err = ctypes.c_void_p()\n"
             "sec.SecTrustEvaluateWithError(trust, ctypes.byref(err))\n"
-            "print(f'evaluated rc_trustd={rc_trustd} rc_sec={rc_sec}')\n",
+            "print(f'evaluated rc_trustd={rc_trustd} rc_trustd_sys={rc_trustd_sys} rc_sec={rc_sec}')\n",
             encoding="utf-8",
         )
         try:
@@ -1413,13 +1415,14 @@ class LiveSeatbeltAttackTests(unittest.TestCase):
             self.assertEqual(res.returncode, 0, res.stderr)
             self.assertIn("evaluated", res.stdout)
             self.assertNotIn("rc_trustd=0", res.stdout)
+            self.assertNotIn("rc_trustd_sys=0", res.stdout)
             self.assertNotIn("rc_sec=0", res.stdout)
             time.sleep(0.25)
             self.assertEqual(hits, [])
 
             # 2. Positive control (R2-MINOR-1): running the exact same probe script unsandboxed (where
-            # com.apple.trustd.agent is reachable) succeeds on both Mach lookups and triggers real
-            # AIA/OCSP HTTP requests to the local listener.
+            # com.apple.trustd.agent, com.apple.trustd, and com.apple.SecurityServer are reachable)
+            # succeeds on all Mach lookups, and on interactive macOS hosts triggers AIA/OCSP HTTP requests.
             unsandboxed = subprocess.run(
                 [sys.executable, str(probe_py)],
                 capture_output=True,
@@ -1428,9 +1431,12 @@ class LiveSeatbeltAttackTests(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(unsandboxed.returncode, 0, unsandboxed.stderr)
-            self.assertIn("rc_trustd=0 rc_sec=0", unsandboxed.stdout)
+            self.assertIn("rc_trustd=0 rc_trustd_sys=0 rc_sec=0", unsandboxed.stdout)
             time.sleep(0.25)
-            self.assertGreaterEqual(len(hits), 1, f"Expected unsandboxed trustd AIA/OCSP hits, got {hits}")
+            if os.environ.get("GITHUB_ACTIONS") != "true":
+                self.assertGreaterEqual(
+                    len(hits), 1, f"Expected unsandboxed trustd AIA/OCSP hits, got {hits}"
+                )
         finally:
             srv.shutdown()
             srv.server_close()
