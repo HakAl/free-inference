@@ -1149,6 +1149,7 @@ class LiveSeatbeltAttackTests(unittest.TestCase):
 
     def test_r3_blocker1_trustd_certificate_aia_ocsp_triggers_zero_requests(self) -> None:
         hits: list[str] = []
+        sub_der_payload: list[bytes] = [b""]
 
         class _HitHandler(BaseHTTPRequestHandler):
             def log_message(self, format: str, *args: Any) -> None:
@@ -1157,7 +1158,13 @@ class LiveSeatbeltAttackTests(unittest.TestCase):
             def do_GET(self) -> None:
                 hits.append(self.path)
                 self.send_response(200)
-                self.end_headers()
+                if self.path == "/ca.cer" and sub_der_payload[0]:
+                    self.send_header("Content-Type", "application/pkix-cert")
+                    self.send_header("Content-Length", str(len(sub_der_payload[0])))
+                    self.end_headers()
+                    self.wfile.write(sub_der_payload[0])
+                else:
+                    self.end_headers()
 
             def do_POST(self) -> None:
                 hits.append(self.path)
@@ -1170,15 +1177,32 @@ class LiveSeatbeltAttackTests(unittest.TestCase):
         port = srv.server_address[1]
         ca_key = self.ws_dir / "ca.key"
         ca_crt = self.ws_dir / "ca.crt"
+        sub_key = self.ws_dir / "sub.key"
+        sub_csr = self.ws_dir / "sub.csr"
+        sub_crt = self.ws_dir / "sub.crt"
+        sub_der = self.ws_dir / "sub.der"
         leaf_key = self.ws_dir / "leaf.key"
         leaf_csr = self.ws_dir / "leaf.csr"
         leaf_crt = self.ws_dir / "leaf.crt"
         leaf_der = self.ws_dir / "leaf.der"
         ca_der = self.ws_dir / "ca.der"
+        ca_ext = self.ws_dir / "ca_ext.cnf"
+        ca_ext.write_text(
+            "[req]\ndistinguished_name=dn\n[dn]\n[v3_ca]\n"
+            "basicConstraints=critical,CA:TRUE\n"
+            "keyUsage=critical,keyCertSign,cRLSign\n"
+            "subjectKeyIdentifier=hash\n",
+            encoding="utf-8",
+        )
         ext = self.ws_dir / "ext.cnf"
         ext.write_text(
+            "basicConstraints=CA:FALSE\n"
+            "keyUsage=digitalSignature,keyEncipherment\n"
+            "extendedKeyUsage=serverAuth\n"
+            "authorityKeyIdentifier=keyid,issuer\n"
             f"authorityInfoAccess = OCSP;URI:http://127.0.0.1:{port}/ocsp,"
-            f"caIssuers;URI:http://127.0.0.1:{port}/ca.cer\n",
+            f"caIssuers;URI:http://127.0.0.1:{port}/ca.cer\n"
+            f"crlDistributionPoints = URI:http://127.0.0.1:{port}/crl.pem\n",
             encoding="utf-8",
         )
         subprocess.run(
@@ -1197,6 +1221,53 @@ class LiveSeatbeltAttackTests(unittest.TestCase):
                 "1",
                 "-subj",
                 "/CN=TestRootCA",
+                "-config",
+                str(ca_ext),
+                "-extensions",
+                "v3_ca",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                "/usr/bin/openssl",
+                "req",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-keyout",
+                str(sub_key),
+                "-out",
+                str(sub_csr),
+                "-subj",
+                "/CN=TestSubCA",
+                "-config",
+                str(ca_ext),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                "/usr/bin/openssl",
+                "x509",
+                "-req",
+                "-in",
+                str(sub_csr),
+                "-CA",
+                str(ca_crt),
+                "-CAkey",
+                str(ca_key),
+                "-CAcreateserial",
+                "-out",
+                str(sub_crt),
+                "-days",
+                "1",
+                "-extfile",
+                str(ca_ext),
+                "-extensions",
+                "v3_ca",
             ],
             check=True,
             capture_output=True,
@@ -1214,6 +1285,8 @@ class LiveSeatbeltAttackTests(unittest.TestCase):
                 str(leaf_csr),
                 "-subj",
                 "/CN=leaf.local",
+                "-config",
+                str(ca_ext),
             ],
             check=True,
             capture_output=True,
@@ -1226,9 +1299,9 @@ class LiveSeatbeltAttackTests(unittest.TestCase):
                 "-in",
                 str(leaf_csr),
                 "-CA",
-                str(ca_crt),
+                str(sub_crt),
                 "-CAkey",
-                str(ca_key),
+                str(sub_key),
                 "-CAcreateserial",
                 "-out",
                 str(leaf_crt),
@@ -1259,6 +1332,20 @@ class LiveSeatbeltAttackTests(unittest.TestCase):
                 "/usr/bin/openssl",
                 "x509",
                 "-in",
+                str(sub_crt),
+                "-outform",
+                "DER",
+                "-out",
+                str(sub_der),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                "/usr/bin/openssl",
+                "x509",
+                "-in",
                 str(ca_crt),
                 "-outform",
                 "DER",
@@ -1268,6 +1355,7 @@ class LiveSeatbeltAttackTests(unittest.TestCase):
             check=True,
             capture_output=True,
         )
+        sub_der_payload[0] = sub_der.read_bytes()
         probe_py = self.ws_dir / "trustd_probe.py"
         probe_py.write_text(
             "import ctypes, pathlib\n"
@@ -1377,7 +1465,7 @@ class LiveSeatbeltAttackTests(unittest.TestCase):
             lab_write_profile = parse_security_profile_dict(
                 {
                     "filesystem": {
-                        "read_roots": [str(ROOT)],
+                        "read_roots": [str(ROOT), str(self.ws_dir)],
                         "write_roots": [str(ROOT)],
                     },
                     "mcp": {"enable_local_assist": True},
@@ -2664,13 +2752,30 @@ class Phase2LookoutRemediationTests(unittest.TestCase):
                 )
                 # Create a dedicated mock opencode_real binary distinct from sys.executable
                 fake_opencode = Path(bin_tmp) / "fake-opencode-bin"
-                shutil.copyfile("/bin/dash", fake_opencode)
-                os.chmod(fake_opencode, 0o755)
+                fake_src = Path(bin_tmp) / "fake_opencode.c"
+                fake_src.write_text(
+                    "#include <string.h>\n"
+                    "#include <unistd.h>\n"
+                    "#include <wordexp.h>\n"
+                    "int main(int argc, char **argv) {\n"
+                    "    if (argc >= 3 && strcmp(argv[1], \"-c\") == 0) {\n"
+                    "        const char *cmd = argv[2];\n"
+                    "        if (strncmp(cmd, \"exec \", 5) == 0) cmd += 5;\n"
+                    "        wordexp_t we;\n"
+                    "        if (wordexp(cmd, &we, WRDE_NOCMD) == 0 && we.we_wordc > 0) {\n"
+                    "            execv(we.we_wordv[0], we.we_wordv);\n"
+                    "        }\n"
+                    "    }\n"
+                    "    return 127;\n"
+                    "}\n",
+                    encoding="utf-8",
+                )
                 subprocess.run(
-                    ["/usr/bin/codesign", "--force", "--sign", "-", str(fake_opencode)],
+                    ["/usr/bin/cc", "-O2", str(fake_src), "-o", str(fake_opencode)],
                     capture_output=True,
                     check=True,
                 )
+                os.chmod(fake_opencode, 0o755)
 
                 prof = parse_security_profile_dict(
                     {
@@ -3800,6 +3905,7 @@ class Phase2LookoutRemediationTests(unittest.TestCase):
                         isolated_home=iso_home,
                         workspace_dir=ws,
                         opencode_bin=Path(sys.executable),
+                        sandbox_exec_bin=Path(sys.executable),
                     )
                 self.assertIn("localhost:5432", sb_text)
                 self.assertIn("localhost:6379", sb_text)
@@ -4262,13 +4368,30 @@ class Phase2LookoutRemediationTests(unittest.TestCase):
                 fake_runs = Path(tmp) / "runs"
                 fake_runs.mkdir(parents=True, exist_ok=True)
                 fake_opencode = Path(tmp) / "fake-opencode"
-                shutil.copyfile("/bin/dash", fake_opencode)
-                os.chmod(fake_opencode, 0o755)
+                fake_src = Path(tmp) / "fake_opencode.c"
+                fake_src.write_text(
+                    "#include <string.h>\n"
+                    "#include <unistd.h>\n"
+                    "#include <wordexp.h>\n"
+                    "int main(int argc, char **argv) {\n"
+                    "    if (argc >= 3 && strcmp(argv[1], \"-c\") == 0) {\n"
+                    "        const char *cmd = argv[2];\n"
+                    "        if (strncmp(cmd, \"exec \", 5) == 0) cmd += 5;\n"
+                    "        wordexp_t we;\n"
+                    "        if (wordexp(cmd, &we, WRDE_NOCMD) == 0 && we.we_wordc > 0) {\n"
+                    "            execv(we.we_wordv[0], we.we_wordv);\n"
+                    "        }\n"
+                    "    }\n"
+                    "    return 127;\n"
+                    "}\n",
+                    encoding="utf-8",
+                )
                 subprocess.run(
-                    ["/usr/bin/codesign", "--force", "--sign", "-", str(fake_opencode)],
+                    ["/usr/bin/cc", "-O2", str(fake_src), "-o", str(fake_opencode)],
                     capture_output=True,
                     check=True,
                 )
+                os.chmod(fake_opencode, 0o755)
 
                 pid_path = pid_file_for_model(model_id, fake_runs)
                 pid_path.write_text(

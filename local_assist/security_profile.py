@@ -2398,6 +2398,39 @@ def _provision_dedicated_local_assist_python(iso_real: Path) -> Path:
     pth_file = site_packages / "local_assist_runtime.pth"
     pth_file.write_text(f"{runtime_dir}\n", encoding="utf-8")
 
+    # Copy any shared libpython*.dylib from the base/source Python installation into
+    # <isolated_home>/lib so relocatable Python builds (such as actions/setup-python
+    # linked against @executable_path/../lib/libpythonX.Y.dylib) resolve cleanly.
+    for cand_lib_dir in (
+        Path(sys.base_prefix).resolve() / "lib",
+        Path(sys.exec_prefix).resolve() / "lib",
+        src_macho.parent.parent / "lib",
+    ):
+        if not cand_lib_dir.is_dir():
+            continue
+        for dylib in cand_lib_dir.glob("libpython*.dylib"):
+            if not dylib.is_file():
+                continue
+            dst_dylib = lib_dir / dylib.name
+            if dst_dylib.exists():
+                continue
+            real_dylib = dylib.resolve()
+            dylib_copied = False
+            if Path("/bin/cp").is_file():
+                try:
+                    cp_dl = subprocess.run(
+                        ["/bin/cp", "-c", str(real_dylib), str(dst_dylib)],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                        check=False,
+                    )
+                    dylib_copied = cp_dl.returncode == 0 and dst_dylib.is_file()
+                except (OSError, subprocess.SubprocessError):
+                    dylib_copied = False
+            if not dylib_copied:
+                shutil.copyfile(real_dylib, dst_dylib)
+
     for tree_root in (runtime_dir, lib_dir):
         for dirpath, _dirnames, filenames in os.walk(tree_root, topdown=False, followlinks=False):
             dp = Path(dirpath)
