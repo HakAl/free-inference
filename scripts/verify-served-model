@@ -15,7 +15,12 @@ from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parents[1]
 VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
-if __name__ == "__main__" and VENV_PYTHON.exists() and Path(sys.executable) != VENV_PYTHON:
+if (
+    __name__ == "__main__"
+    and os.environ.get("LOCAL_ASSIST_WORKER_SANDBOX") != "1"
+    and VENV_PYTHON.exists()
+    and Path(sys.executable) != VENV_PYTHON
+):
     os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), __file__, *sys.argv[1:]])
 
 sys.path.insert(0, str(ROOT))

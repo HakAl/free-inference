@@ -957,35 +957,39 @@ def read_pid_record_for_model(
         pid_file_for_model(model_id, base),
         _legacy_unhashed_pid_file(model_id, base),
     ):
-        if candidate.exists():
-            try:
+        try:
+            if candidate.exists():
                 record = json.loads(candidate.read_text())
                 if isinstance(record, dict) and record.get("model_id") == model_id:
                     return record
-            except (OSError, json.JSONDecodeError):
-                pass
+        except (OSError, json.JSONDecodeError):
+            pass
 
     for _, record in list_pid_records(base):
         if record.get("model_id") == model_id:
             return record
 
     legacy = legacy_pid_file(base)
-    if legacy.exists():
-        try:
+    try:
+        if legacy.exists():
             record = json.loads(legacy.read_text())
             if isinstance(record, dict) and record.get("model_id") == model_id:
                 return record
-        except (OSError, json.JSONDecodeError):
-            pass
+    except (OSError, json.JSONDecodeError):
+        pass
     return None
 
 
 def list_pid_records(runs_dir: Path | None = None) -> list[tuple[Path, dict[str, Any]]]:
     base = runs_dir or DEFAULT_RUNS_DIR
-    if not base.exists():
+    try:
+        if not base.exists():
+            return []
+        paths = sorted(base.glob(".serve*.pid"))
+    except OSError:
         return []
     records: list[tuple[Path, dict[str, Any]]] = []
-    for path in sorted(base.glob(".serve*.pid")):
+    for path in paths:
         try:
             data = json.loads(path.read_text())
             if isinstance(data, dict):

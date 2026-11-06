@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import ctypes
+import json
 import os
+from pathlib import Path
 import subprocess
 import sys
 import time
@@ -13,6 +16,8 @@ from .registry import (
     RegistryError,
     find_model_by_id_or_repo,
     load_model,
+    pid_is_alive,
+    pid_matches_record,
     read_pid_record_for_model,
     resolve_endpoint,
 )
@@ -22,6 +27,68 @@ from .routing import MODEL_TO_REGISTRY_ID
 SMOKE_SYSTEM = "You are a health-check responder. Follow the user instruction exactly."
 SMOKE_PROMPT = "Return exactly OK."
 DEFAULT_AUTO_SERVE_WAIT_SECONDS = 45.0
+_PROC_PIDTBSDINFO = 3
+_PROC_SZOMB = 5
+
+
+class _ProcBsdInfo(ctypes.Structure):
+    _fields_ = [
+        ("pbi_flags", ctypes.c_uint32),
+        ("pbi_status", ctypes.c_uint32),
+        ("pbi_xstatus", ctypes.c_uint32),
+        ("pbi_pid", ctypes.c_uint32),
+        ("pbi_ppid", ctypes.c_uint32),
+        ("pbi_uid", ctypes.c_uint32),
+        ("pbi_gid", ctypes.c_uint32),
+        ("pbi_ruid", ctypes.c_uint32),
+        ("pbi_rgid", ctypes.c_uint32),
+        ("pbi_svuid", ctypes.c_uint32),
+        ("pbi_svgid", ctypes.c_uint32),
+        ("rfu_1", ctypes.c_uint32),
+        ("pbi_comm", ctypes.c_char * 16),
+        ("pbi_name", ctypes.c_char * 32),
+        ("pbi_nfiles", ctypes.c_uint32),
+        ("pbi_pgid", ctypes.c_uint32),
+        ("pbi_pjobc", ctypes.c_uint32),
+        ("e_tdev", ctypes.c_uint32),
+        ("e_tpgid", ctypes.c_uint32),
+        ("pbi_nice", ctypes.c_int32),
+        ("pbi_start_tvsec", ctypes.c_uint64),
+        ("pbi_start_tvusec", ctypes.c_uint64),
+    ]
+
+
+def _sandbox_safe_pid_matches_lstart(pid: int, expected_lstart: str) -> bool:
+    if not pid_is_alive(pid):
+        return False
+    expected_norm = " ".join(expected_lstart.strip().split())
+    if not expected_norm:
+        return False
+    # Under macOS Seatbelt, /bin/ps is setuid-root and cannot be executed, so query
+    # the kernel directly via libSystem proc_pidinfo(PROC_PIDTBSDINFO) (R2-MAJOR-2).
+    if sys.platform == "darwin":
+        try:
+            libc = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+            info = _ProcBsdInfo()
+            ret = libc.proc_pidinfo(
+                int(pid),
+                _PROC_PIDTBSDINFO,
+                0,
+                ctypes.byref(info),
+                ctypes.sizeof(info),
+            )
+            if ret == ctypes.sizeof(info):
+                if info.pbi_status == _PROC_SZOMB:
+                    return False
+                actual_lstart = time.strftime(
+                    "%a %b %e %H:%M:%S %Y",
+                    time.gmtime(int(info.pbi_start_tvsec)),
+                ).strip()
+                actual_norm = " ".join(actual_lstart.split())
+                return actual_norm == expected_norm
+        except Exception:
+            pass
+    return pid_matches_record(pid, expected_lstart, require_lstart=True)
 
 
 def _default_auto_serve_wait_seconds() -> float:
@@ -34,6 +101,77 @@ def _default_auto_serve_wait_seconds() -> float:
             pass
     overall = float(default_timeout_seconds())
     return min(DEFAULT_AUTO_SERVE_WAIT_SECONDS, max(5.0, overall - 15.0))
+
+
+def _verify_worker_sandbox_handoff(real_id: str, endpoint: Any) -> bool:
+    if (
+        os.environ.get("LOCAL_ASSIST_WORKER_SANDBOX") != "1"
+        or endpoint.trust_tier != "local"
+        or endpoint.routing_private_local != "cleared"
+    ):
+        return False
+    worker_id = os.environ.get("LOCAL_ASSIST_WORKER_ID", "").strip()
+    handoff_raw = os.environ.get("LOCAL_ASSIST_VERIFIED_MODELS_FILE", "").strip()
+    if not worker_id or not handoff_raw:
+        return False
+    handoff_path = Path(handoff_raw)
+    if handoff_path.is_symlink() or not handoff_path.is_file():
+        return False
+    try:
+        manifest = json.loads(handoff_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(manifest, dict) or manifest.get("schema_version") != 1:
+        return False
+    if manifest.get("worker_id") != worker_id:
+        return False
+    expires_at = manifest.get("expires_at")
+    if (
+        isinstance(expires_at, bool)
+        or not isinstance(expires_at, (int, float))
+        or time.time() > float(expires_at)
+    ):
+        return False
+    models_map = manifest.get("models")
+    if not isinstance(models_map, dict):
+        return False
+    entry = models_map.get(real_id)
+    if not isinstance(entry, dict):
+        return False
+    if (
+        entry.get("model_id") != real_id
+        or entry.get("served_model_id") != endpoint.served_model_id
+        or entry.get("api_base_url") != endpoint.api_base_url
+        or entry.get("hf_offline") is not True
+    ):
+        return False
+    pid = entry.get("pid")
+    pid_lstart = entry.get("pid_lstart")
+    if (
+        isinstance(pid, bool)
+        or not isinstance(pid, int)
+        or pid <= 1
+        or not isinstance(pid_lstart, str)
+        or not pid_lstart.strip()
+    ):
+        return False
+    return _sandbox_safe_pid_matches_lstart(pid, pid_lstart)
+
+
+def _is_sandbox_unverifiable_verify_result(returncode: int, detail: str) -> bool:
+    if returncode == 1:
+        return True
+    if returncode != 3:
+        return False
+    # Exit code 3 is only eligible for the worker sandbox handoff when verify-served-model
+    # failed solely because runs/ PID records or lsof/ps listener inspection were blocked
+    # by Seatbelt, never when a positive model or offline mismatch was observed (R3-MAJOR-2).
+    if "served model mismatch" in detail or "was started with --allow-hf-online" in detail:
+        return False
+    return (
+        "has no active PID record confirming offline startup" in detail
+        or "could not identify any OS listener process via lsof/ps" in detail
+    )
 
 
 def ensure_local_model_served(
@@ -97,6 +235,17 @@ def ensure_local_model_served(
         return
 
     check_detail = (check_proc.stderr or check_proc.stdout or "").strip()
+    if (
+        _is_sandbox_unverifiable_verify_result(check_proc.returncode, check_detail)
+        and _verify_worker_sandbox_handoff(real_id, endpoint)
+    ):
+        try:
+            available = get_models(timeout_seconds=max(1, int(_rem(5.0))), model=model)
+        except LocalAssistError:
+            available = []
+        if model in available or real_id in available or endpoint.served_model_id in available:
+            return
+
     if check_proc.returncode == 3:
         raise ModelMismatch(
             "model_mismatch",

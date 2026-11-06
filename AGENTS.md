@@ -36,6 +36,9 @@ Read these documents before making changes:
 - List registered models: `./scripts/models`
 - Launch Rung 1 local coding session (from target project directory): `/path/to/free-inference/scripts/opencode-local`
 - Launch Rung 3 attested enclave coding session (from target project directory): `/path/to/free-inference/scripts/opencode-attested`
+- Launch unattended sandboxed worker (Rung 1 or Rung 3):
+  - `/path/to/free-inference/scripts/opencode-local --unattended-worker -- run --format json "<prompt>"`
+  - `/path/to/free-inference/scripts/opencode-attested --security-profile <profile.yaml> --max-session-usd 0.50 -- run --format json "<prompt>"`
 - Delegate bounded Rung 1 subtasks: `./scripts/delegate-local <delegate_task|compress_context|extract_fields|propose_eval_prompts> ...`
 - Serve / verify / eval / stop a model:
   - `./scripts/serve-model <model-id>`

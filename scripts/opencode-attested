@@ -35,6 +35,29 @@ from local_assist.registry import (
     read_pid_record_for_model,
     resolve_endpoint,
 )
+from local_assist.security_profile import (
+    SecurityProfileError,
+    WorkerSecurityProfile,
+    _WorkerTokenRelay,
+    allocate_worker_home,
+    apply_cli_overrides,
+    build_worker_environment,
+    check_tracked_protected_files,
+    cleanup_worker_home,
+    compile_opencode_security_config,
+    compile_seatbelt_profile,
+    default_unattended_worker_profile,
+    harvest_worker_local_assist_logs,
+    load_security_profile,
+    reap_worker_processes,
+    redact_session_tokens,
+    run_worker_sandbox_lifecycle,
+    sweep_stale_worker_homes,
+    teardown_worker_home,
+    validate_worker_opencode_args,
+    verify_opencode_version,
+    write_worker_runtime_artifacts,
+)
 
 DEFAULT_CONTEXT_LIMIT = 131072
 DEFAULT_OUTPUT_LIMIT = 16384
@@ -238,6 +261,20 @@ def compute_worst_case_session_usd(
     }
 
 
+def _positive_finite_float(raw: str) -> float:
+    try:
+        val = float(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"must be a finite positive number, got {raw!r}"
+        ) from exc
+    if not math.isfinite(val) or val <= 0:
+        raise argparse.ArgumentTypeError(
+            f"must be a finite positive number, got {raw!r}"
+        )
+    return val
+
+
 def check_session_spend_ceiling(
     endpoint: EndpointConfig,
     *,
@@ -247,15 +284,33 @@ def check_session_spend_ceiling(
     max_session_usd: float | None = DEFAULT_MAX_SESSION_USD,
     attached: bool = False,
 ) -> dict[str, Any]:
-    if max_session_usd is not None and max_session_usd <= 0:
-        raise ValueError("max_session_usd must be positive")
+    if max_session_usd is not None:
+        if (
+            isinstance(max_session_usd, bool)
+            or not isinstance(max_session_usd, (int, float))
+            or not math.isfinite(float(max_session_usd))
+            or float(max_session_usd) <= 0
+        ):
+            raise LocalAssistError(
+                "spend_ceiling_invalid",
+                f"Refusing to launch '{endpoint.model_id}': --max-session-usd must be a finite "
+                f"positive USD ceiling, got {max_session_usd!r}.",
+                details={"model_id": endpoint.model_id, "max_session_usd": max_session_usd},
+            )
     est = compute_worst_case_session_usd(
         endpoint,
         max_chat_requests=max_chat_requests,
         max_request_bytes=max_request_bytes,
         max_tokens_cap=max_tokens_cap,
     )
-    if max_session_usd is not None and est["worst_total_usd"] > max_session_usd:
+    if not math.isfinite(float(est["worst_total_usd"])):
+        raise LocalAssistError(
+            "spend_ceiling_invalid",
+            f"Refusing to launch '{endpoint.model_id}': computed worst-case session cost is non-finite "
+            f"({est['worst_total_usd']!r}).",
+            details={**est, "max_session_usd": max_session_usd, "attached": attached},
+        )
+    if max_session_usd is not None and est["worst_total_usd"] > float(max_session_usd):
         if attached:
             raise LocalAssistError(
                 "spend_ceiling_exceeded",
@@ -779,6 +834,96 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
         default=False,
         help="Verify/start the proxy, write the isolated opencode.json, print redacted metadata and JSON, and exit.",
     )
+    parser.add_argument(
+        "--security-profile",
+        default=None,
+        help="Path to a YAML or JSON worker security profile enforcing Seatbelt and OpenCode tool/MCP boundaries.",
+    )
+    parser.add_argument(
+        "--unattended-worker",
+        action="store_true",
+        default=False,
+        help="Enforce the default unattended_worker security profile (Seatbelt OS sandbox + default-deny permissions + loopback token relay).",
+    )
+    parser.add_argument(
+        "--read-root",
+        action="append",
+        default=None,
+        help="Override filesystem.read_roots in the worker security profile (repeatable).",
+    )
+    parser.add_argument(
+        "--write-root",
+        action="append",
+        default=None,
+        help="Override filesystem.write_roots in the worker security profile (repeatable).",
+    )
+    parser.add_argument(
+        "--protect-path",
+        action="append",
+        default=None,
+        help="Append to filesystem.protected_paths in the worker security profile (repeatable).",
+    )
+    parser.add_argument(
+        "--allow-tool",
+        action="append",
+        default=None,
+        help="Override tools.allowed_tools in the worker security profile (repeatable).",
+    )
+    parser.add_argument(
+        "--deny-tool",
+        action="append",
+        default=None,
+        help="Append to tools.denied_tools in the worker security profile (repeatable).",
+    )
+    parser.add_argument(
+        "--allow-mcp-tool",
+        action="append",
+        default=None,
+        help="Append '<server>_<tool>' pattern to mcp.allowed_tools in the worker security profile (repeatable).",
+    )
+    parser.add_argument(
+        "--deny-mcp-tool",
+        action="append",
+        default=None,
+        help="Append '<server>_<tool>' pattern to mcp.denied_tools in the worker security profile (repeatable).",
+    )
+    parser.add_argument(
+        "--allow-subagents",
+        action="store_true",
+        default=False,
+        help="Allow native OpenCode subagents (task/subagent tools) in the worker security profile.",
+    )
+    parser.add_argument(
+        "--allow-ssh-agent",
+        action="store_true",
+        default=False,
+        help="Allow SSH_AUTH_SOCK forwarding into the worker sandbox.",
+    )
+    parser.add_argument(
+        "--allow-localhost-port",
+        type=int,
+        action="append",
+        default=None,
+        help="Allow worker-shell child processes to connect to an unreserved localhost TCP port (repeatable).",
+    )
+    parser.add_argument(
+        "--pass-env",
+        action="append",
+        default=None,
+        help="Append a non-secret, unreserved environment variable name to environment.allowlist (repeatable).",
+    )
+    parser.add_argument(
+        "--keep-worker-home",
+        action="store_true",
+        default=False,
+        help="Preserve the per-invocation worker home directory under .home/workers/ after exit for inspection.",
+    )
+    parser.add_argument(
+        "--allow-opencode-version-drift",
+        action="store_true",
+        default=False,
+        help="Allow running unattended worker mode when the installed opencode version differs from the tested version.",
+    )
 
     if "--" in argv[1:]:
         sep_idx = argv.index("--", 1)
@@ -790,9 +935,94 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     return args, opencode_args
 
 
+def _resolve_active_security_profile(args: argparse.Namespace) -> WorkerSecurityProfile | None:
+    has_override_flags = any(
+        val is not None and val is not False
+        for val in (
+            args.read_root,
+            args.write_root,
+            args.protect_path,
+            args.allow_tool,
+            args.deny_tool,
+            args.allow_mcp_tool,
+            args.deny_mcp_tool,
+            args.allow_subagents,
+            args.allow_ssh_agent,
+            args.allow_localhost_port,
+            args.pass_env,
+        )
+    )
+    if not args.security_profile and not args.unattended_worker and not has_override_flags:
+        return None
+
+    base_profile = (
+        load_security_profile(args.security_profile)
+        if args.security_profile
+        else default_unattended_worker_profile()
+    )
+    return apply_cli_overrides(
+        base_profile,
+        read_roots=args.read_root,
+        write_roots=args.write_root,
+        protected_paths=args.protect_path,
+        allowed_tools=args.allow_tool,
+        denied_tools=args.deny_tool,
+        allowed_mcp_tools=args.allow_mcp_tool,
+        denied_mcp_tools=args.deny_mcp_tool,
+        allow_subagents=True if args.allow_subagents else None,
+        allow_ssh_agent=True if args.allow_ssh_agent else None,
+        allowed_localhost_ports=args.allow_localhost_port,
+        pass_env=args.pass_env,
+    )
+
+
 def main(argv: list[str]) -> int:
     caller_cwd = Path.cwd()
     args, opencode_args = parse_args(argv)
+
+    try:
+        active_profile = _resolve_active_security_profile(args)
+    except SecurityProfileError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    if active_profile is not None and args.preserve_host_home:
+        print(
+            "Refusing --preserve-host-home: host HOME cannot be preserved when a worker security profile is active.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if active_profile is not None and args.allow_uncleared_model and not active_profile.allow_uncleared_model:
+        print(
+            "Refusing --allow-uncleared-model in unattended worker mode because security profile has allow_uncleared_model=false.",
+            file=sys.stderr,
+        )
+        return 1
+
+    effective_allow_uncleared = (
+        active_profile.allow_uncleared_model
+        if active_profile is not None
+        else args.allow_uncleared_model
+    )
+    effective_max_session_usd = (
+        args.max_session_usd
+        if args.max_session_usd is not None
+        else (active_profile.spend_max_session_usd if active_profile is not None else None)
+    )
+    if active_profile is not None and (
+        effective_max_session_usd is None
+        or isinstance(effective_max_session_usd, bool)
+        or not isinstance(effective_max_session_usd, (int, float))
+        or not math.isfinite(float(effective_max_session_usd))
+        or float(effective_max_session_usd) <= 0
+    ):
+        print(
+            "Unattended worker mode on private-attested requires an explicit spend ceiling (finite positive USD): "
+            "pass --max-session-usd <usd> or set spend.max_session_usd in the security profile.",
+            file=sys.stderr,
+        )
+        return 1
 
     eff_max_reqs = (
         args.max_chat_requests
@@ -824,11 +1054,19 @@ def main(argv: list[str]) -> int:
         or args.output_limit <= 0
         or args.wait < 0
         or (args.context_limit is not None and args.context_limit <= 0)
-        or (args.max_session_usd is not None and args.max_session_usd <= 0)
+        or (
+            effective_max_session_usd is not None
+            and (
+                isinstance(effective_max_session_usd, bool)
+                or not isinstance(effective_max_session_usd, (int, float))
+                or not math.isfinite(float(effective_max_session_usd))
+                or float(effective_max_session_usd) <= 0
+            )
+        )
     ):
         print(
             "All cap/limit flags (--max-chat-requests, --max-tokens-cap, --max-request-bytes, "
-            "--ttl-seconds, --stream-timeout-seconds, --output-limit, --context-limit, --max-session-usd) must be > 0 and --wait >= 0.",
+            "--ttl-seconds, --stream-timeout-seconds, --output-limit, --context-limit, --max-session-usd) must be finite values > 0 and --wait >= 0.",
             file=sys.stderr,
         )
         return 1
@@ -842,29 +1080,54 @@ def main(argv: list[str]) -> int:
         )
         validate_private_attested_endpoint(
             endpoint_pre,
-            allow_uncleared_model=args.allow_uncleared_model,
+            allow_uncleared_model=effective_allow_uncleared,
         )
     except (RegistryError, LocalAssistError, ValueError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
 
-    opencode_bin: str | None = None
-    if not args.print_config:
-        opencode_bin = shutil.which("opencode")
-        if not opencode_bin:
-            print("opencode binary not found on PATH", file=sys.stderr)
-            return 1
+    opencode_bin: str | None = shutil.which("opencode")
+    if not args.print_config and not opencode_bin:
+        print("opencode binary not found on PATH", file=sys.stderr)
+        return 1
 
+    validated_worker_args: list[str] = []
+    sandbox_exec_bin = Path("/usr/bin/sandbox-exec")
+    if active_profile is not None:
+        if opencode_bin:
+            try:
+                verify_opencode_version(
+                    opencode_bin,
+                    allow_version_drift=args.allow_opencode_version_drift,
+                )
+            except SecurityProfileError as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+        if not args.print_config:
+            if not sandbox_exec_bin.is_file():
+                print(
+                    f"Required macOS Seatbelt binary '{sandbox_exec_bin}' not found for worker security profile.",
+                    file=sys.stderr,
+                )
+                return 1
+            assert opencode_bin is not None
+            try:
+                validated_worker_args = validate_worker_opencode_args(opencode_args)
+            except SecurityProfileError as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+
+    effective_no_serve = True if active_profile is not None else args.no_serve
     ok, err_msg, session_meta = ensure_model_served(
         endpoint_pre,
-        no_serve=args.no_serve,
+        no_serve=effective_no_serve,
         wait_seconds=args.wait,
         max_chat_requests=eff_max_reqs,
         max_tokens_cap=eff_max_tokens,
         max_request_bytes=eff_max_bytes,
         ttl_seconds=eff_ttl,
         stream_timeout_seconds=args.stream_timeout_seconds,
-        max_session_usd=args.max_session_usd,
+        max_session_usd=effective_max_session_usd,
     )
     if not ok or session_meta is None:
         print(err_msg or "Failed to verify served model", file=sys.stderr)
@@ -885,16 +1148,11 @@ def main(argv: list[str]) -> int:
         format_session_banner(
             endpoint,
             session_meta,
-            max_session_usd=args.max_session_usd,
+            max_session_usd=effective_max_session_usd,
         ),
         file=sys.stderr,
     )
 
-    isolated_home = DEFAULT_ISOLATED_HOME
-    for subdir in (".config", ".local/share", ".cache", ".local/state"):
-        (isolated_home / subdir).mkdir(parents=True, exist_ok=True)
-
-    edit_permission = "allow" if args.allow_edit else "ask"
     sess_tokens_cap = int(session_meta["max_tokens_cap"])
     sess_bytes_cap = int(session_meta["max_request_bytes"])
     if args.context_limit is not None and sess_bytes_cap > 0 and args.context_limit > max(1, sess_bytes_cap // 6):
@@ -909,6 +1167,163 @@ def main(argv: list[str]) -> int:
             f"to {sess_tokens_cap} tokens to fit session max_tokens_cap={sess_tokens_cap}.",
             file=sys.stderr,
         )
+
+    if active_profile is not None:
+        sweep_stale_worker_homes()
+        worker_id, isolated_home = allocate_worker_home()
+        retain_home = bool(args.keep_worker_home or args.print_config)
+        relay: _WorkerTokenRelay | None = None
+        exit_code = 1
+        lifecycle_handled_teardown = False
+        try:
+            relay = _WorkerTokenRelay(
+                upstream_base_url=endpoint.api_base_url,
+                upstream_session_token=endpoint.api_key,
+                max_chat_requests=int(session_meta["max_chat_requests"]),
+                max_request_bytes=sess_bytes_cap,
+                max_tokens_cap=sess_tokens_cap,
+                upstream_timeout_seconds=float(args.stream_timeout_seconds),
+            ).start()
+
+            base_config_text = render_private_attested_config(
+                endpoint,
+                context_limit=args.context_limit,
+                output_limit=args.output_limit,
+                max_tokens_cap=sess_tokens_cap,
+                max_request_bytes=sess_bytes_cap,
+                edit_permission="allow",
+                workspace_dir=caller_cwd,
+                api_base_url_override=relay.api_base_url,
+            )
+            base_cfg = json.loads(base_config_text)
+            base_cfg["provider"]["private-attested"]["options"]["baseURL"] = relay.api_base_url
+            base_cfg["provider"]["private-attested"]["options"]["apiKey"] = relay.relay_token
+            compiled_cfg = compile_opencode_security_config(
+                base_cfg,
+                active_profile,
+                isolated_home=isolated_home,
+            )
+            upstream_port_val = (
+                int(active_pid_record["upstream_port"])
+                if isinstance(active_pid_record, dict)
+                and isinstance(active_pid_record.get("upstream_port"), int)
+                else 9181
+            )
+            opencode_bin_for_sb = Path(opencode_bin) if opencode_bin else Path("/usr/bin/true")
+            sb_bin_for_sb = sandbox_exec_bin if sandbox_exec_bin.is_file() else Path("/usr/bin/true")
+            seatbelt_text = compile_seatbelt_profile(
+                active_profile,
+                workspace_dir=caller_cwd,
+                isolated_home=isolated_home,
+                opencode_bin=opencode_bin_for_sb,
+                sandbox_exec_bin=sb_bin_for_sb,
+                upstream_port=upstream_port_val,
+                use_token_relay=True,
+            )
+            opencode_config_path, seatbelt_path, _ = write_worker_runtime_artifacts(
+                isolated_home=isolated_home,
+                worker_id=worker_id,
+                profile=active_profile,
+                opencode_config=compiled_cfg,
+                seatbelt_text=seatbelt_text,
+            )
+            env = build_worker_environment(
+                active_profile,
+                isolated_home=isolated_home,
+                worker_id=worker_id,
+            )
+            flagged_tracked = check_tracked_protected_files(
+                caller_cwd,
+                protected_paths=active_profile.protected_paths,
+            )
+            if flagged_tracked:
+                print(
+                    f"WARNING: git repository tracks protected path(s) {flagged_tracked}; "
+                    "writes to these paths inside the worker sandbox will be denied by Seatbelt.",
+                    file=sys.stderr,
+                )
+            if args.print_config:
+                out_text = json.dumps(
+                    {
+                        "model_id": endpoint.model_id,
+                        "served_model_id": endpoint.served_model_id,
+                        "trust_tier": endpoint.trust_tier,
+                        "data_control_rung": endpoint.data_control_rung,
+                        "usage_policy": endpoint.usage_policy,
+                        "api_base_url": endpoint.api_base_url,
+                        "worker_relay_base_url": relay.api_base_url,
+                        "session_token": "<redacted-se-session-token>",
+                        "session_caps": session_meta,
+                        "worker_id": worker_id,
+                        "opencode_config_path": str(opencode_config_path),
+                        "seatbelt_profile_path": str(seatbelt_path),
+                        "isolated_home": str(isolated_home),
+                        "config": compiled_cfg,
+                    },
+                    indent=2,
+                )
+                print(redact_session_tokens(out_text))
+                exit_code = 0
+            else:
+                assert opencode_bin is not None
+                lifecycle_handled_teardown = True
+                exit_code, teardown_res = run_worker_sandbox_lifecycle(
+                    [
+                        str(sandbox_exec_bin),
+                        "-f",
+                        str(seatbelt_path),
+                        str(opencode_bin),
+                        *validated_worker_args,
+                    ],
+                    cwd=str(caller_cwd),
+                    env=env,
+                    isolated_home=isolated_home,
+                    worker_id=worker_id,
+                    harvest_logs=active_profile.mcp_enable_local_assist,
+                    remove_home=not retain_home,
+                    relay=relay,
+                )
+                relay = None
+                if not teardown_res.get("clean", False):
+                    print(
+                        f"WARNING: worker teardown for '{worker_id}' was incomplete "
+                        f"(reaper_clean={teardown_res.get('reaper_clean')}, removed={teardown_res.get('removed')}).",
+                        file=sys.stderr,
+                    )
+                    exit_code = exit_code or 1
+        except SecurityProfileError as exc:
+            print(str(exc), file=sys.stderr)
+            exit_code = 1
+        finally:
+            if relay is not None:
+                relay.close()
+            if not lifecycle_handled_teardown:
+                if retain_home:
+                    try:
+                        (isolated_home / ".keep-worker-home").write_text("1\n", encoding="utf-8")
+                    except OSError:
+                        pass
+                teardown_res = teardown_worker_home(
+                    isolated_home,
+                    worker_id=worker_id,
+                    harvest_logs=active_profile.mcp_enable_local_assist,
+                    remove_home=not retain_home,
+                    reap_processes=True,
+                )
+                if not teardown_res.get("clean", False):
+                    print(
+                        f"WARNING: worker teardown for '{worker_id}' was incomplete "
+                        f"(reaper_clean={teardown_res.get('reaper_clean')}, removed={teardown_res.get('removed')}).",
+                        file=sys.stderr,
+                    )
+                    exit_code = exit_code or 1
+        return exit_code
+
+    isolated_home = DEFAULT_ISOLATED_HOME
+    for subdir in (".config", ".local/share", ".cache", ".local/state"):
+        (isolated_home / subdir).mkdir(parents=True, exist_ok=True)
+
+    edit_permission = "allow" if args.allow_edit else "ask"
     config_text = render_private_attested_config(
         endpoint,
         context_limit=args.context_limit,

@@ -28,6 +28,28 @@ from local_assist.registry import (
     read_pid_record_for_model,
     resolve_endpoint,
 )
+from local_assist.security_profile import (
+    SecurityProfileError,
+    WorkerSecurityProfile,
+    allocate_worker_home,
+    apply_cli_overrides,
+    build_worker_environment,
+    check_tracked_protected_files,
+    cleanup_worker_home,
+    compile_opencode_security_config,
+    compile_seatbelt_profile,
+    default_unattended_worker_profile,
+    harvest_worker_local_assist_logs,
+    load_security_profile,
+    reap_worker_processes,
+    redact_session_tokens,
+    run_worker_sandbox_lifecycle,
+    sweep_stale_worker_homes,
+    teardown_worker_home,
+    validate_worker_opencode_args,
+    verify_opencode_version,
+    write_worker_runtime_artifacts,
+)
 
 DEFAULT_MODEL_ID = "qwen3-30b-a3b-2507-mlx-4bit"
 DEFAULT_CONTEXT_LIMIT = 32768
@@ -314,6 +336,96 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
         default=False,
         help="Verify/start the server, write the isolated opencode.json, print its path and JSON, and exit.",
     )
+    parser.add_argument(
+        "--security-profile",
+        default=None,
+        help="Path to a YAML or JSON worker security profile enforcing Seatbelt and OpenCode tool/MCP boundaries.",
+    )
+    parser.add_argument(
+        "--unattended-worker",
+        action="store_true",
+        default=False,
+        help="Enforce the default unattended_worker security profile (Seatbelt OS sandbox + default-deny permissions).",
+    )
+    parser.add_argument(
+        "--read-root",
+        action="append",
+        default=None,
+        help="Override filesystem.read_roots in the worker security profile (repeatable).",
+    )
+    parser.add_argument(
+        "--write-root",
+        action="append",
+        default=None,
+        help="Override filesystem.write_roots in the worker security profile (repeatable).",
+    )
+    parser.add_argument(
+        "--protect-path",
+        action="append",
+        default=None,
+        help="Append to filesystem.protected_paths in the worker security profile (repeatable).",
+    )
+    parser.add_argument(
+        "--allow-tool",
+        action="append",
+        default=None,
+        help="Override tools.allowed_tools in the worker security profile (repeatable).",
+    )
+    parser.add_argument(
+        "--deny-tool",
+        action="append",
+        default=None,
+        help="Append to tools.denied_tools in the worker security profile (repeatable).",
+    )
+    parser.add_argument(
+        "--allow-mcp-tool",
+        action="append",
+        default=None,
+        help="Append '<server>_<tool>' pattern to mcp.allowed_tools in the worker security profile (repeatable).",
+    )
+    parser.add_argument(
+        "--deny-mcp-tool",
+        action="append",
+        default=None,
+        help="Append '<server>_<tool>' pattern to mcp.denied_tools in the worker security profile (repeatable).",
+    )
+    parser.add_argument(
+        "--allow-subagents",
+        action="store_true",
+        default=False,
+        help="Allow native OpenCode subagents (task/subagent tools) in the worker security profile.",
+    )
+    parser.add_argument(
+        "--allow-ssh-agent",
+        action="store_true",
+        default=False,
+        help="Allow SSH_AUTH_SOCK forwarding into the worker sandbox.",
+    )
+    parser.add_argument(
+        "--allow-localhost-port",
+        type=int,
+        action="append",
+        default=None,
+        help="Allow worker-shell child processes to connect to an unreserved localhost TCP port (repeatable).",
+    )
+    parser.add_argument(
+        "--pass-env",
+        action="append",
+        default=None,
+        help="Append a non-secret, unreserved environment variable name to environment.allowlist (repeatable).",
+    )
+    parser.add_argument(
+        "--keep-worker-home",
+        action="store_true",
+        default=False,
+        help="Preserve the per-invocation worker home directory under .home/workers/ after exit for inspection.",
+    )
+    parser.add_argument(
+        "--allow-opencode-version-drift",
+        action="store_true",
+        default=False,
+        help="Allow running unattended worker mode when the installed opencode version differs from the tested version.",
+    )
 
     if "--" in argv[1:]:
         sep_idx = argv.index("--", 1)
@@ -325,6 +437,47 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     return args, opencode_args
 
 
+def _resolve_active_security_profile(args: argparse.Namespace) -> WorkerSecurityProfile | None:
+    has_override_flags = any(
+        val is not None and val is not False
+        for val in (
+            args.read_root,
+            args.write_root,
+            args.protect_path,
+            args.allow_tool,
+            args.deny_tool,
+            args.allow_mcp_tool,
+            args.deny_mcp_tool,
+            args.allow_subagents,
+            args.allow_ssh_agent,
+            args.allow_localhost_port,
+            args.pass_env,
+        )
+    )
+    if not args.security_profile and not args.unattended_worker and not has_override_flags:
+        return None
+
+    base_profile = (
+        load_security_profile(args.security_profile)
+        if args.security_profile
+        else default_unattended_worker_profile()
+    )
+    return apply_cli_overrides(
+        base_profile,
+        read_roots=args.read_root,
+        write_roots=args.write_root,
+        protected_paths=args.protect_path,
+        allowed_tools=args.allow_tool,
+        denied_tools=args.deny_tool,
+        allowed_mcp_tools=args.allow_mcp_tool,
+        denied_mcp_tools=args.deny_mcp_tool,
+        allow_subagents=True if args.allow_subagents else None,
+        allow_ssh_agent=True if args.allow_ssh_agent else None,
+        allowed_localhost_ports=args.allow_localhost_port,
+        pass_env=args.pass_env,
+    )
+
+
 def main(argv: list[str]) -> int:
     caller_cwd = Path.cwd()
     args, opencode_args = parse_args(argv)
@@ -334,23 +487,73 @@ def main(argv: list[str]) -> int:
         return 1
 
     try:
+        active_profile = _resolve_active_security_profile(args)
+    except SecurityProfileError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    if active_profile is not None and args.preserve_host_home:
+        print(
+            "Refusing --preserve-host-home: host HOME cannot be preserved when a worker security profile is active.",
+            file=sys.stderr,
+        )
+        return 1
+
+    if active_profile is not None and args.allow_uncleared_model and not active_profile.allow_uncleared_model:
+        print(
+            "Refusing --allow-uncleared-model in unattended worker mode because security profile has allow_uncleared_model=false.",
+            file=sys.stderr,
+        )
+        return 1
+
+    effective_allow_uncleared = (
+        active_profile.allow_uncleared_model
+        if active_profile is not None
+        else args.allow_uncleared_model
+    )
+
+    try:
         model = load_model(args.model)
         pid_record = read_pid_record_for_model(args.model)
         endpoint = resolve_endpoint(model, pid_record=pid_record, require_api_key=False)
         validate_private_local_endpoint(
             endpoint,
-            allow_uncleared_model=args.allow_uncleared_model,
+            allow_uncleared_model=effective_allow_uncleared,
         )
     except (RegistryError, LocalAssistError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
 
-    opencode_bin: str | None = None
-    if not args.print_config:
-        opencode_bin = shutil.which("opencode")
-        if not opencode_bin:
-            print("opencode binary not found on PATH", file=sys.stderr)
-            return 1
+    opencode_bin: str | None = shutil.which("opencode")
+    if not args.print_config and not opencode_bin:
+        print("opencode binary not found on PATH", file=sys.stderr)
+        return 1
+
+    validated_worker_args: list[str] = []
+    sandbox_exec_bin = Path("/usr/bin/sandbox-exec")
+    if active_profile is not None:
+        if opencode_bin:
+            try:
+                verify_opencode_version(
+                    opencode_bin,
+                    allow_version_drift=args.allow_opencode_version_drift,
+                )
+            except SecurityProfileError as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+        if not args.print_config:
+            if not sandbox_exec_bin.is_file():
+                print(
+                    f"Required macOS Seatbelt binary '{sandbox_exec_bin}' not found for worker security profile.",
+                    file=sys.stderr,
+                )
+                return 1
+            assert opencode_bin is not None
+            try:
+                validated_worker_args = validate_worker_opencode_args(opencode_args)
+            except SecurityProfileError as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
 
     ok, err_msg = ensure_model_served(
         endpoint,
@@ -360,6 +563,123 @@ def main(argv: list[str]) -> int:
     if not ok:
         print(err_msg or "Failed to verify served model", file=sys.stderr)
         return 1
+
+    if active_profile is not None:
+        sweep_stale_worker_homes()
+        worker_id, isolated_home = allocate_worker_home()
+        retain_home = bool(args.keep_worker_home or args.print_config)
+        exit_code = 1
+        lifecycle_handled_teardown = False
+        try:
+            base_config_text = render_private_local_config(
+                endpoint,
+                context_limit=args.context_limit,
+                output_limit=args.output_limit,
+                edit_permission="allow",
+                workspace_dir=caller_cwd,
+            )
+            compiled_cfg = compile_opencode_security_config(
+                json.loads(base_config_text),
+                active_profile,
+                isolated_home=isolated_home,
+            )
+            opencode_bin_for_sb = Path(opencode_bin) if opencode_bin else Path("/usr/bin/true")
+            sb_bin_for_sb = sandbox_exec_bin if sandbox_exec_bin.is_file() else Path("/usr/bin/true")
+            seatbelt_text = compile_seatbelt_profile(
+                active_profile,
+                workspace_dir=caller_cwd,
+                isolated_home=isolated_home,
+                opencode_bin=opencode_bin_for_sb,
+                sandbox_exec_bin=sb_bin_for_sb,
+            )
+            opencode_config_path, seatbelt_path, _ = write_worker_runtime_artifacts(
+                isolated_home=isolated_home,
+                worker_id=worker_id,
+                profile=active_profile,
+                opencode_config=compiled_cfg,
+                seatbelt_text=seatbelt_text,
+            )
+            env = build_worker_environment(
+                active_profile,
+                isolated_home=isolated_home,
+                worker_id=worker_id,
+            )
+            flagged_tracked = check_tracked_protected_files(
+                caller_cwd,
+                protected_paths=active_profile.protected_paths,
+            )
+            if flagged_tracked:
+                print(
+                    f"WARNING: git repository tracks protected path(s) {flagged_tracked}; "
+                    "writes to these paths inside the worker sandbox will be denied by Seatbelt.",
+                    file=sys.stderr,
+                )
+            if args.print_config:
+                out_text = json.dumps(
+                    {
+                        "model_id": endpoint.model_id,
+                        "served_model_id": endpoint.served_model_id,
+                        "api_base_url": endpoint.api_base_url,
+                        "worker_id": worker_id,
+                        "opencode_config_path": str(opencode_config_path),
+                        "seatbelt_profile_path": str(seatbelt_path),
+                        "isolated_home": str(isolated_home),
+                        "config": compiled_cfg,
+                    },
+                    indent=2,
+                )
+                print(redact_session_tokens(out_text))
+                exit_code = 0
+            else:
+                assert opencode_bin is not None
+                lifecycle_handled_teardown = True
+                exit_code, teardown_res = run_worker_sandbox_lifecycle(
+                    [
+                        str(sandbox_exec_bin),
+                        "-f",
+                        str(seatbelt_path),
+                        str(opencode_bin),
+                        *validated_worker_args,
+                    ],
+                    cwd=str(caller_cwd),
+                    env=env,
+                    isolated_home=isolated_home,
+                    worker_id=worker_id,
+                    harvest_logs=active_profile.mcp_enable_local_assist,
+                    remove_home=not retain_home,
+                )
+                if not teardown_res.get("clean", False):
+                    print(
+                        f"WARNING: worker teardown for '{worker_id}' was incomplete "
+                        f"(reaper_clean={teardown_res.get('reaper_clean')}, removed={teardown_res.get('removed')}).",
+                        file=sys.stderr,
+                    )
+                    exit_code = exit_code or 1
+        except SecurityProfileError as exc:
+            print(str(exc), file=sys.stderr)
+            exit_code = 1
+        finally:
+            if not lifecycle_handled_teardown:
+                if retain_home:
+                    try:
+                        (isolated_home / ".keep-worker-home").write_text("1\n", encoding="utf-8")
+                    except OSError:
+                        pass
+                teardown_res = teardown_worker_home(
+                    isolated_home,
+                    worker_id=worker_id,
+                    harvest_logs=active_profile.mcp_enable_local_assist,
+                    remove_home=not retain_home,
+                    reap_processes=True,
+                )
+                if not teardown_res.get("clean", False):
+                    print(
+                        f"WARNING: worker teardown for '{worker_id}' was incomplete "
+                        f"(reaper_clean={teardown_res.get('reaper_clean')}, removed={teardown_res.get('removed')}).",
+                        file=sys.stderr,
+                    )
+                    exit_code = exit_code or 1
+        return exit_code
 
     isolated_home = DEFAULT_ISOLATED_HOME
     for subdir in (".config", ".local/share", ".cache", ".local/state"):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import secrets
 import time
 from contextlib import AbstractContextManager
@@ -79,14 +80,23 @@ class LogCall(AbstractContextManager["LogCall"]):
         self.date = self.ts.strftime("%Y-%m-%d")
         self.slug = f"{self.ts.strftime('%H-%M-%S')}-{tool.replace('_', '-')}-{secrets.token_hex(2)}"
         self.payload_rel = Path("runs") / "local-assist" / self.date / f"{self.slug}.json"
-        self.payload_path = ROOT / self.payload_rel
-        self.index_path = LOCAL_ASSIST_RUNS / f"{self.date}.jsonl"
+        custom_log_dir = os.environ.get("LOCAL_ASSIST_LOG_DIR", "").strip()
+        if custom_log_dir:
+            base_dir = Path(custom_log_dir)
+            self.payload_path = base_dir / self.date / f"{self.slug}.json"
+            self.index_path = base_dir / f"{self.date}.jsonl"
+        else:
+            self.payload_path = ROOT / self.payload_rel
+            self.index_path = LOCAL_ASSIST_RUNS / f"{self.date}.jsonl"
+        self.worker_sandbox_preverified = os.environ.get("LOCAL_ASSIST_WORKER_SANDBOX") == "1"
         self.payload: dict[str, Any] = {
             "ts": self.ts.isoformat(timespec="seconds"),
             "tool": tool,
             "requested_model": requested_model,
             "args": args,
         }
+        if self.worker_sandbox_preverified:
+            self.payload["worker_sandbox_preverified"] = True
 
     def __enter__(self) -> "LogCall":
         self.payload_path.parent.mkdir(parents=True, exist_ok=True)
@@ -134,37 +144,39 @@ class LogCall(AbstractContextManager["LogCall"]):
             }
         )
         self._write_payload()
-        self._append_index(
-            {
-                "ts": self.ts.isoformat(timespec="seconds"),
-                "tool": self.tool,
-                "requested_model": self.requested_model,
-                "served_model": served_model,
-                "args_summary": summarize_args(self.args),
-                "observed": observed,
-                "usage": usage,
-                "latency_ms": latency_ms,
-                "finish_reason": finish_reason,
-                "payload_path": self.payload_rel.as_posix(),
-            }
-        )
+        index_row: dict[str, Any] = {
+            "ts": self.ts.isoformat(timespec="seconds"),
+            "tool": self.tool,
+            "requested_model": self.requested_model,
+            "served_model": served_model,
+            "args_summary": summarize_args(self.args),
+            "observed": observed,
+            "usage": usage,
+            "latency_ms": latency_ms,
+            "finish_reason": finish_reason,
+            "payload_path": self.payload_rel.as_posix(),
+        }
+        if self.worker_sandbox_preverified:
+            index_row["worker_sandbox_preverified"] = True
+        self._append_index(index_row)
 
     def record_error(self, error: dict[str, Any]) -> None:
         elapsed_ms = int(round((time.perf_counter() - self.started) * 1000))
         self.payload.update({"error": error, "elapsed_ms": elapsed_ms})
         self._write_payload()
-        self._append_index(
-            {
-                "ts": self.ts.isoformat(timespec="seconds"),
-                "tool": self.tool,
-                "requested_model": self.requested_model,
-                "args_summary": summarize_args(self.args),
-                "observed": {"error": error.get("code", "unknown")},
-                "latency_ms": elapsed_ms,
-                "finish_reason": "error",
-                "payload_path": self.payload_rel.as_posix(),
-            }
-        )
+        index_row: dict[str, Any] = {
+            "ts": self.ts.isoformat(timespec="seconds"),
+            "tool": self.tool,
+            "requested_model": self.requested_model,
+            "args_summary": summarize_args(self.args),
+            "observed": {"error": error.get("code", "unknown")},
+            "latency_ms": elapsed_ms,
+            "finish_reason": "error",
+            "payload_path": self.payload_rel.as_posix(),
+        }
+        if self.worker_sandbox_preverified:
+            index_row["worker_sandbox_preverified"] = True
+        self._append_index(index_row)
 
     def _write_payload(self) -> None:
         self.payload_path.write_text(json.dumps(self.payload, indent=2, ensure_ascii=False) + "\n")

@@ -214,11 +214,11 @@ rm -rf .venv node_modules bin .home
 │   ├── delegate-local               CLI wrapper for Rung 1 local_assist tools
 │   ├── eval / timing / opencode-smoke
 │   └── *-e2e                        End-to-end verification harnesses
-├── tests/                           65 offline unit and Secure Enclave selftests
+├── tests/                           96 offline unit, Seatbelt, and SE selftests
 └── tools/se_key_proxy/main.swift    Hardware-backed Secure Enclave + Touch ID proxy
 ```
 
-Run the offline unit and Secure Enclave selftest suite (65 tests, stdlib + Node):
+Run the offline unit, Seatbelt, and Secure Enclave selftest suite (96 tests, stdlib + Node):
 
 ```bash
 .venv/bin/python -B -m unittest discover -s tests -v
