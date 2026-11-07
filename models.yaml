@@ -399,8 +399,8 @@ models:
       DeepSeek V4.1 Flash served inside Tinfoil's Intel TDX + AMD SEV-SNP B200/B300
       enclaves (tinfoilsh/confidential-deepseek-v4-1-flash v0.0.10+b200/b300) with
       --tool-call-parser deepseek_v41, --reasoning-parser deepseek_v41, and 1M context
-      window. Pricing verified on 2026-10-31: $0.65/1M input ($0.13 cached) and $1.45/1M
-      output.
+      window. Pricing verified on 2026-11-07: $0.60/1M input ($0.01 cached) and $1.45/1M
+      output ($0.65/1M input, $0.13 cached at initial 2026-10-31 trial).
     review_notes: |
       Attested and evaluated on 2026-10-31 via tinfoil-proxy v0.2.9 + se-key-proxy
       (see docs/attestations/2026-10-31-tinfoil-rung3-trial.md). Passed sanity
@@ -565,10 +565,11 @@ models:
       - https://huggingface.co/moonshotai/Kimi-K3
     fit_notes: |
       Kimi K3 served inside Tinfoil's Intel TDX 8x GPU enclaves
-      (tinfoilsh/confidential-kimi-k3 v0.0.6) with --tool-call-parser kimi_k3,
+      (tinfoilsh/confidential-kimi-k3 v0.0.16) with --tool-call-parser kimi_k3,
       --reasoning-parser kimi_k3, dspark speculative decoding, and 262k context
-      window. Pricing verified on 2026-10-31: $4.00/1M input ($0.80 cached) and
-      $20.00/1M output.
+      window. Pricing verified on 2026-11-07: $4.00/1M input ($0.60 cached; $0.80
+      cached at initial 2026-10-31 trial) and $20.00/1M output. Scheduled for
+      upstream deprecation on 2026-11-12.
     review_notes: |
       Attested and evaluated on 2026-10-31 via tinfoil-proxy v0.2.9 + se-key-proxy
       (see docs/attestations/2026-10-31-tinfoil-rung3-trial.md). Passed sanity
