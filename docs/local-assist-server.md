@@ -17,9 +17,11 @@ free-inference/
 ├── scripts/
 │   ├── local-assist-server          # MCP entry point (--auto-serve optional)
 │   ├── delegate-local               # CLI entry point for planner delegation
-│   └── delegate-local-e2e           # Live D1 negative test + lsof-sampled cold-start check
+│   ├── delegate-local-e2e           # Live D1 negative test + lsof-sampled cold-start check
+│   └── sync-model-catalog           # Upstream model catalog drift checker & issue reconciler
 ├── local_assist/                    # Python package (stdlib-portable)
 │   ├── _miniyaml.py                 # Fail-closed zero-dependency YAML 1.2 subset parser
+│   ├── catalog_sync.py              # Self-healing model catalog verifier & surgical YAML updater
 │   ├── client.py                    # Loopback HTTP client + 5-rung data-control admission gates
 │   ├── lifecycle.py                 # Pre-chat listener verification + opt-in auto-serve + chat check
 │   ├── logging.py                   # JSONL writer (redacts delegate_task context and compress/extract text)
@@ -27,6 +29,7 @@ free-inference/
 │   ├── registry.py                  # 5-rung models.yaml validator, endpoint resolver, pid_lstart helpers
 │   ├── routing.py                   # Job -> served OpenAI model ID table
 │   ├── se_key.py                    # Secure Enclave proxy verifier + serve_command / binary ownership checks
+│   ├── security_profile.py          # Unattended worker Seatbelt + OpenCode profile compiler & lifecycle
 │   ├── server.py                    # MCP tool registration and dispatch
 │   └── tools/
 │       ├── propose_eval_prompts.py

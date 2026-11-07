@@ -2,6 +2,14 @@
 
 All notable changes to `free-inference` are documented in this file.
 
+## [0.1.3] - 2026-11-07
+
+### Model Catalog Self-Healing and Rung 3 Evaluation
+- **Self-healing model catalog (`local_assist/catalog_sync.py`, `scripts/sync-model-catalog`, `.github/workflows/catalog-sync.yml`)**: Added `./scripts/sync-model-catalog` (`--check`, `--apply`, `--json`, `--write-markdown`, `--write-disagreement-json`, `--reconcile-github-issue`, `--attempt-id`) to verify registered Rung 1 (`local` Hugging Face) and Rung 2/3 (`tinfoil` attested enclave) models against live upstream router manifests (`https://inference.tinfoil.sh/.well-known/tinfoil-proxy`), Sigstore-backed enclave release metadata (`tinfoilsh/confidential-*`), `tinfoil-config.yml`, Tinfoil's pricing page, and Hugging Face API metadata.
+- **Fail-closed weight-drift demotion and multi-platform tag verification**: If a cleared model's upstream `provider_manifest_weights_hash`, `provider_manifest_weights_source`, or `upstream_sha` changes, `--apply` automatically sets `routing.private_attested: blocked` (or `routing.private_local: blocked`) and `status: candidate` until re-evaluated. Multi-platform router deployments (`verification.hosts[*].code_tag`, such as `v0.0.10+b200` on Intel TDX and `v0.0.10+b300` on AMD SEV-SNP) are canonicalized and cross-verified across every active host tag with `allow_served_id_fallback=False`.
+- **Weekly GitHub Actions drift monitor (`.github/workflows/catalog-sync.yml`)**: Added a scheduled weekly and `workflow_dispatch` job on `HakAl/free-inference` that runs `./scripts/sync-model-catalog --check` with per-run `--attempt-id` and `markdown_sha256` output binding and automatically opens, updates, or closes a `[catalog-drift]` tracking issue without auto-committing to `main`.
+- **Kimi K3.1 Pro (`tinfoil-kimi-k3-1-pro`) Rung 3 evaluation and catalog refresh (`models.yaml`, `docs/attestations/2026-11-07-tinfoil-kimi-k3-1-pro-eval.md`)**: Evaluated `tinfoil-kimi-k3-1-pro` (`moonshotai/Kimi-K2.5@2f3ef02087f242c4cd8dbd3ffbfefdc0ceb3a10d`, `dmverity:sha256:94fb36bc8e48cf6e3257fdcc0da69b06ca2eb7d1c5876b593c9841227db7d524`, `$0.60 / $3.00` per 1M tokens) across all 4 gates (`sanity` `1/1`, `v1` `9/10`, `tools` `4/4`, `opencode-smoke` `PASS` in `1.8837s`, `$0.0156` total spend, `0` session token leaks), updated `tinfoil-deepseek-v4-1-flash` to `v0.0.10+b200` / `v0.0.10+b300` (`$0.60 / $1.45` per 1M tokens, `$0.01` cached), and recorded `deprecation_date: "2026-11-12"` on `tinfoil-kimi-k3`.
+
 ## [0.1.2] - 2026-11-06
 
 ### Security and Unattended Worker Sandboxing

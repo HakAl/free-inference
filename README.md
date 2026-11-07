@@ -1,14 +1,14 @@
 # free-inference
 
-**Free as in freedom (libre), not free beer:** a private coding-agent launcher, Secure Enclave key-sealing proxy, and evaluation workbench for engineers running open-weight coding agents on Apple Silicon Macs.
+**Free as in liberty, not as in free compute. The software costs nothing; the Mac and the watts are yours to supply, and your prompts, keys, and code stay on your machine.** A private coding-agent launcher, Secure Enclave key-sealing proxy, and evaluation workbench for engineers running open-weight coding agents on Apple Silicon Macs.
 
-Most "free inference" lists optimize for `$0` API tiers where your prompts and code become the product. `free-inference` is built for software engineers and security-conscious teams who want **verifiable data control** over their coding agent sessions (target baseline: 48 GB unified memory for 30B local MLX models; 16 GB+ Apple Silicon Macs for Rung 3 attested enclave sessions or smaller local models):
+Most "free inference" lists optimize for `$0` API tiers where your prompts and code become the product. `free-inference` is built for software engineers and security-conscious teams who want **verifiable data control** over their coding agent sessions, targeting 48 GB unified memory for 30B local MLX models and 16 GB+ Apple Silicon Macs for Rung 3 attested enclave sessions or smaller local models:
 
-1. **Data control (`5-rung ladder`)**: Keep prompts, repository context, and outputs under the highest practical data control that clears the capability bar for the task.
-2. **Freedom of use (`usage_policy`)**: Run open-weight coding models without opaque third-party content filters or silent middleware blocking legitimate engineering and security work.
-3. **Verifiable boundaries**: Prompts leave the machine for a remote confidential compute enclave only through a local verifying proxy (`se-key-proxy` -> `tinfoil-proxy`), with an explicit registry boundary between **weight-attested** enclaves (Rung 2) and **runtime-attested** enclaves (Rung 3).
-4. **Hardware-backed key sealing (Secure Enclave ECIES + per-session Touch ID unseal into local proxy memory)**: Remote API keys never sit in `.env` files, shell profiles, or `os.environ`. They are sealed with an Apple Silicon Secure Enclave `.biometryCurrentSet` key and unsealed into `se-key-proxy` memory via a single live Touch ID tap per 12-hour session.
-5. **No silent downgrades**: Every model is gated by executable evals (`sanity`, `v1`, `tools`, and `opencode-smoke`), and no launcher or client ever silently falls back to a lower-control rung.
+1. **5-rung data control**: Keep prompts, repository context, and outputs under the highest practical data control that clears the capability bar for the task.
+2. **Freedom of use**: Run open-weight coding models without opaque third-party content filters or silent middleware blocking legitimate engineering and security work.
+3. **Verifiable boundaries**: Prompts leave the machine for a remote confidential compute enclave only through a local verifying proxy (`se-key-proxy` -> `tinfoil-proxy`), with an explicit registry boundary between **weight-attested** enclaves on Rung 2 and **runtime-attested** enclaves on Rung 3.
+4. **Hardware-backed key sealing**: Remote API keys never sit in `.env` files, shell profiles, or `os.environ`. They are sealed with an Apple Silicon Secure Enclave `.biometryCurrentSet` ECIES key and unsealed into `se-key-proxy` memory via a single live Touch ID tap per 12-hour session.
+5. **No silent downgrades**: Every model is gated by executable evals across `sanity`, `v1`, `tools`, and `opencode-smoke`, and no launcher or client ever silently falls back to a lower-control rung.
 
 ---
 
@@ -38,7 +38,7 @@ Every endpoint in [`models.yaml`](models.yaml) is ordered along five explicit da
 
 | Platform | Rung 1 Local | Rung 2/3 Attested | Offline Tests & CI |
 |---|---|---|---|
-| **macOS Apple Silicon (`arm64`) + Touch ID** | Supported (48 GB RAM rec. for 30B MLX) | Supported (Secure Enclave + Touch ID) | Supported (all 65 tests + hardware SE selftest) |
+| **macOS Apple Silicon (`arm64`) + Touch ID** | Supported (48 GB RAM rec. for 30B MLX) | Supported (Secure Enclave + Touch ID) | Supported (all 106 tests + hardware SE selftest) |
 | **macOS Apple Silicon (`arm64`) without Touch ID**<br>*(e.g. Mac mini / Studio without Magic Keyboard)* | Supported | Unsupported (`selftest` exits `77`; `setup` skips gracefully) | Supported (`test_se_key` skips biometric gate on exit `77`) |
 | **Linux (`x86_64` / `arm64`)** | N/A (requires Apple Metal) | N/A (requires Secure Enclave) | Supported (portable stdlib unit + `--offline-ci` manifest suite) |
 
@@ -83,7 +83,7 @@ Seal your [Tinfoil](https://tinfoil.sh) API key into the Apple Silicon Secure En
 
 Then launch OpenCode from your target project workspace against the default cleared Rung 3 enclave model (`tinfoil-deepseek-v4-1-flash`, 1M token context window):
 
-> **Pricing & Spend Ceiling (`tinfoil-deepseek-v4-1-flash`)**: Paid API calls bill against your Tinfoil account at **$0.65 / 1M input tokens ($0.13 cached) and $1.45 / 1M output tokens** (verified `2026-10-31` via `dash.tinfoil.sh` and cross-checked against `tinfoil.sh/pricing`). Pass `--max-session-usd <usd>` (for example `--max-session-usd 5.00`) to enforce a pre-flight worst-case session spend ceiling before starting or attaching to a proxy session.
+> **Pricing & Spend Ceiling (`tinfoil-deepseek-v4-1-flash`)**: Paid API calls bill against your Tinfoil account at **$0.60 / 1M input tokens ($0.01 cached) and $1.45 / 1M output tokens** (verified `2026-11-07` via `./scripts/sync-model-catalog` against Tinfoil's attested router and `tinfoil.sh/pricing`). Pass `--max-session-usd <usd>` (for example `--max-session-usd 5.00`) to enforce a pre-flight worst-case session spend ceiling before starting or attaching to a proxy session.
 
 ```bash
 cd /path/to/your/project
@@ -98,11 +98,11 @@ cd /path/to/your/project
 /path/to/free-inference/scripts/opencode-attested -- run "Review the current git diff for security issues"
 ```
 
-To try another evaluated Rung 3 candidate (`tinfoil-kimi-k3`, `tinfoil-glm-5-3`, or `tinfoil-gpt-oss-120b`), stop the active proxy on port `8081` and pass `--model <id> --allow-uncleared-model`:
+To try another evaluated Rung 3 candidate (`tinfoil-kimi-k3-1-pro`, `tinfoil-glm-5-3`, `tinfoil-gpt-oss-120b`, or `tinfoil-kimi-k3` [scheduled for upstream deprecation `2026-11-12`]), stop the active proxy on port `8081` and pass `--model <id> --allow-uncleared-model`:
 
 ```bash
 ./scripts/stop-model tinfoil-deepseek-v4-1-flash
-./scripts/opencode-attested --model tinfoil-kimi-k3 --allow-uncleared-model
+./scripts/opencode-attested --model tinfoil-kimi-k3-1-pro --allow-uncleared-model
 ```
 
 ---
@@ -143,6 +143,7 @@ See [`SECURITY.md`](SECURITY.md) for the full threat model. Key operational boun
 | Command | Purpose |
 |---|---|
 | `./scripts/models` | List all models in `models.yaml` with data-control rung, status, and usage policy |
+| `./scripts/sync-model-catalog` | `--check` or `--apply` upstream model catalog drift against live enclave and Hugging Face sources |
 | `./scripts/serve-model <id>` | Start a local MLX server (`127.0.0.1:8080`) or dual attested proxy (`:8081` + `:9081`) |
 | `./scripts/verify-served-model <id>` | Verify active PID records (`pid_lstart`), `/v1/models`, and OS listener `--model` flags (`--require-offline` for Rung 1) |
 | `./scripts/stop-model <id>` | Stop a running model server or proxy after verifying `pid_lstart` (`--all` stops all) |
@@ -183,7 +184,9 @@ rm -rf .venv node_modules bin .home
 
 ```text
 .
-├── .github/workflows/ci.yml         macOS arm64 + Linux CI (build, selftest, manifest check, unit + e2e suites)
+├── .github/workflows/
+│   ├── ci.yml                       macOS arm64 + Linux CI (build, selftest, manifest check, unit + e2e suites)
+│   └── catalog-sync.yml             Weekly upstream catalog drift check and GitHub issue reconciler
 ├── AGENTS.md                        Contributor invariants and 5-rung boundaries
 ├── CHANGELOG.md                     Release history and local-llm-lab lineage
 ├── CONTRIBUTING.md                  Contributor invariants and verification checklist
@@ -194,17 +197,18 @@ rm -rf .venv node_modules bin .home
 │   ├── opencode-private-local.json.tmpl
 │   └── opencode-private-attested.json.tmpl
 ├── docs/
-│   ├── attestations/                Rung 3 Tinfoil attestation & 4-model trial records
+│   ├── attestations/                Rung 3 Tinfoil attestation & 5-model trial records
 │   ├── decisions/                   Architecture and model-selection decision records
 │   ├── evals/                       Committed machine-readable evaluation evidence (*.json)
 │   ├── local-assist-server.md       MCP server & Rung 1 delegation contract
 │   ├── plan.md                      Evaluation workflow and capability gates
 │   └── proposal.md                  5-rung architecture and design rationale
 ├── evals/{prompts,suites,rubrics,chat_templates,transforms}/
-├── local_assist/                    Registry, admission gates, MCP server, and SE key verify
+├── local_assist/                    Registry, catalog sync, admission gates, MCP server, SE key & worker sandbox
 ├── scripts/
 │   ├── setup                        Bootstrap .venv, npm, bin/se-key-proxy, bin/tinfoil-proxy
 │   ├── models                       List registered models with rung and usage policy
+│   ├── sync-model-catalog           Check/heal upstream catalog drift and reconcile [catalog-drift] issues
 │   ├── se-key                       Build, selftest, store, status, and delete SE keys
 │   ├── serve-model / stop-model     Start/stop local MLX servers or dual attested proxies
 │   ├── verify-served-model          Verify PID records and live listener --model flags
@@ -214,11 +218,11 @@ rm -rf .venv node_modules bin .home
 │   ├── delegate-local               CLI wrapper for Rung 1 local_assist tools
 │   ├── eval / timing / opencode-smoke
 │   └── *-e2e                        End-to-end verification harnesses
-├── tests/                           96 offline unit, Seatbelt, and SE selftests
+├── tests/                           106 offline unit, catalog sync, Seatbelt, and SE selftests
 └── tools/se_key_proxy/main.swift    Hardware-backed Secure Enclave + Touch ID proxy
 ```
 
-Run the offline unit, Seatbelt, and Secure Enclave selftest suite (96 tests, stdlib + Node):
+Run the offline unit, catalog sync, Seatbelt, and Secure Enclave selftest suite (106 tests, stdlib + Node):
 
 ```bash
 .venv/bin/python -B -m unittest discover -s tests -v
