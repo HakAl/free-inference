@@ -593,7 +593,7 @@ models:
     runtime: proxy
     serve_command: ./bin/tinfoil-proxy --bind {host} --port {port} -e inference.tinfoil.sh --repo tinfoilsh/confidential-model-router
     enclave_repo: tinfoilsh/confidential-kimi-k3-1-pro
-    enclave_tag: v0.0.3
+    enclave_tag: v0.0.2
     promptfoo_provider:
       id: openai:chat:kimi-k3-1-pro
       apiBaseUrl: http://127.0.0.1:8081/v1
@@ -651,7 +651,7 @@ models:
       - https://github.com/tinfoilsh/confidential-model-router
       - https://huggingface.co/moonshotai/Kimi-K3.1-Pro
     fit_notes: |
-      Kimi K3.1 Pro served inside Tinfoil's attested enclaves (tinfoilsh/confidential-kimi-k3-1-pro v0.0.3) with --tool-call-parser kimi_k3, --reasoning-parser kimi_k3, and 262144 context window. Pricing verified on 2026-11-07: $4.00/1M input ($0.40 cached) and $20.00/1M output.
+      Kimi K3.1 Pro served inside Tinfoil's attested enclaves (tinfoilsh/confidential-kimi-k3-1-pro v0.0.2; evaluated at v0.0.3 with identical dm-verity weights hash) with --tool-call-parser kimi_k3, --reasoning-parser kimi_k3, and 262144 context window. Pricing verified on 2026-11-07: $4.00/1M input ($0.40 cached) and $20.00/1M output.
     review_notes: |
       Discovered and scaffolded via scripts/sync-model-catalog on 2026-11-07 from
       live router manifest (tinfoilsh/confidential-kimi-k3-1-pro@v0.0.3) and /v1/models,
