@@ -215,7 +215,7 @@ models:
     license: apache-2.0
     release_date: "2026-04-02"
     verified_date: "2026-05-23"
-    params_total: 26B
+    params_total: "26B"
     params_active: ~4B
     quantization:
       bits: 4
@@ -257,7 +257,7 @@ models:
     converter: tinfoilsh
     conversion_runtime_version: vllm
     runtime: proxy
-    serve_command: "./bin/tinfoil-proxy --bind {host} --port {port} -e inference.tinfoil.sh --repo tinfoilsh/confidential-model-router"
+    serve_command: ./bin/tinfoil-proxy --bind {host} --port {port} -e inference.tinfoil.sh --repo tinfoilsh/confidential-model-router
     promptfoo_provider:
       id: openai:chat:gpt-oss-120b
       apiBaseUrl: http://127.0.0.1:8081/v1
@@ -283,11 +283,11 @@ models:
       jurisdiction: US
       pricing_per_m_tokens:
         input: 0.15
-        output: 0.60
+        output: 0.6
     license: apache-2.0
     release_date: null
-    verified_date: "2026-10-31"
-    params_total: 120B
+    verified_date: "2026-11-07"
+    params_total: "120B"
     params_active: 5.1B
     quantization:
       bits: 4
@@ -329,6 +329,7 @@ models:
       and reasoning_effort=low; v1 and tools each retain 1 unused retry at default/medium
       reasoning effort. Zero session token leaks across all runs.
     eval_summary: "2026-10-31 via tinfoil-proxy v0.2.9 + se-key-proxy (at reasoning_effort=low, include_reasoning=false): opencode-smoke PASS in 1.5413s (runs/2026-10-31-205800-opencode-smoke-tinfoil-gpt-oss-120b-0f58d616-p45y_7pp, 2248 tokens); sanity 1/1 on initial run (runs/2026-10-31-205809-sanity-tinfoil-gpt-oss-120b-0f58d616-CtpYud) and 1/1 on retry #1 (runs/2026-10-31-210509-sanity-tinfoil-gpt-oss-120b-0f58d616-mn7fj3, text TTFT 0.3628s); automated v1 8/10 (runs/2026-10-31-210518-v1-tinfoil-gpt-oss-120b-0f58d616-RMnqCX, text TTFT 0.5395s); tools 3/4 (runs/2026-10-31-210614-tools-tinfoil-gpt-oss-120b-0f58d616-yaXq8R, text TTFT 0.4004s, incremental tool-call TTFT 0.4404s, tool_call_chunks=11)."
+    enclave_tag: v0.0.29
 
   - id: tinfoil-deepseek-v4-1-flash
     status: active
@@ -337,7 +338,7 @@ models:
     converter: tinfoilsh
     conversion_runtime_version: vllm
     runtime: proxy
-    serve_command: "./bin/tinfoil-proxy --bind {host} --port {port} -e inference.tinfoil.sh --repo tinfoilsh/confidential-model-router"
+    serve_command: ./bin/tinfoil-proxy --bind {host} --port {port} -e inference.tinfoil.sh --repo tinfoilsh/confidential-model-router
     promptfoo_provider:
       id: openai:chat:deepseek-v4-1-flash
       apiBaseUrl: http://127.0.0.1:8081/v1
@@ -364,11 +365,12 @@ models:
       usage_policy: provider_terms_apply
       jurisdiction: US
       pricing_per_m_tokens:
-        input: 0.65
+        input: 0.6
         output: 1.45
+        cached_input: 0.01
     license: mit
     release_date: "2026-10-17"
-    verified_date: "2026-10-31"
+    verified_date: "2026-11-07"
     params_total: null
     params_active: null
     quantization:
@@ -413,6 +415,7 @@ models:
       and v1 and tools were run once (0 retries used) with thinking=false. Zero session
       token leaks across all runs.
     eval_summary: "2026-10-31 via tinfoil-proxy v0.2.9 + se-key-proxy (chat_template_kwargs.thinking=false, include_reasoning=false): sanity 1/1 on retry #1 (runs/2026-10-31-213403-sanity-tinfoil-deepseek-v4-1-flash-b41fc330-iXVep2, 41 suite tokens; Run 1 runs/2026-10-31-213111-sanity-tinfoil-deepseek-v4-1-flash-b41fc330-UrDQRn hit max_tokens=60 under thinking_mode=chat); automated v1 9/10 in 14s (runs/2026-10-31-213433-v1-tinfoil-deepseek-v4-1-flash-b41fc330-HlnCge, text TTFT 0.2750s, 26483 tokens); tools 4/4 in 4s (runs/2026-10-31-213459-tools-tinfoil-deepseek-v4-1-flash-b41fc330-0QR0vt, text TTFT 0.5970s, incremental tool-call TTFT 0.4989s, tool_call_chunks=4, 2579 tokens); opencode-smoke PASS in 2.2122s (runs/2026-10-31-213515-opencode-smoke-tinfoil-deepseek-v4-1-flash-b41fc330-vf7313bc, 2744 tokens)."
+    enclave_tag: v0.0.10+b200
 
   - id: tinfoil-glm-5-3
     status: candidate
@@ -421,7 +424,7 @@ models:
     converter: tinfoilsh
     conversion_runtime_version: vllm
     runtime: proxy
-    serve_command: "./bin/tinfoil-proxy --bind {host} --port {port} -e inference.tinfoil.sh --repo tinfoilsh/confidential-model-router"
+    serve_command: ./bin/tinfoil-proxy --bind {host} --port {port} -e inference.tinfoil.sh --repo tinfoilsh/confidential-model-router
     promptfoo_provider:
       id: openai:chat:glm-5-3
       apiBaseUrl: http://127.0.0.1:8081/v1
@@ -448,11 +451,12 @@ models:
       usage_policy: provider_terms_apply
       jurisdiction: US
       pricing_per_m_tokens:
-        input: 1.80
+        input: 1.8
         output: 5.75
+        cached_input: 0.45
     license: mit
     release_date: null
-    verified_date: "2026-10-31"
+    verified_date: "2026-11-07"
     params_total: null
     params_active: null
     quantization:
@@ -494,6 +498,7 @@ models:
       diff --git header. Kept at status: candidate under the strict 10/10 automated v1
       gate. Zero retries used across all suites; zero session token leaks across all runs.
     eval_summary: "2026-10-31 via tinfoil-proxy v0.2.9 + se-key-proxy (reasoning_effort=low, include_reasoning=false): sanity 1/1 (runs/2026-10-31-214444-sanity-tinfoil-glm-5-3-6b0b2ccc-JCgzau, text TTFT 0.2813s, 90 tokens total); automated v1 8/10 in 23s (runs/2026-10-31-214455-v1-tinfoil-glm-5-3-6b0b2ccc-fQ0wwz, text TTFT 0.3519s, 26365 tokens); tools 4/4 in 14s (runs/2026-10-31-214528-tools-tinfoil-glm-5-3-6b0b2ccc-tFkinn, text TTFT 0.2864s, incremental tool-call TTFT 0.2805s, tool_call_chunks=2, 1857 tokens); opencode-smoke PASS in 1.4393s (runs/2026-10-31-214553-opencode-smoke-tinfoil-glm-5-3-6b0b2ccc-tdpkgjl1, 1685 tokens)."
+    enclave_tag: v0.0.10
 
   - id: tinfoil-kimi-k3
     status: candidate
@@ -502,7 +507,7 @@ models:
     converter: tinfoilsh
     conversion_runtime_version: vllm
     runtime: proxy
-    serve_command: "./bin/tinfoil-proxy --bind {host} --port {port} -e inference.tinfoil.sh --repo tinfoilsh/confidential-model-router"
+    serve_command: ./bin/tinfoil-proxy --bind {host} --port {port} -e inference.tinfoil.sh --repo tinfoilsh/confidential-model-router
     promptfoo_provider:
       id: openai:chat:kimi-k3
       apiBaseUrl: http://127.0.0.1:8081/v1
@@ -528,11 +533,12 @@ models:
       usage_policy: provider_terms_apply
       jurisdiction: US
       pricing_per_m_tokens:
-        input: 4.00
-        output: 20.00
+        input: 4.0
+        output: 20.0
+        cached_input: 0.6
     license: mit
     release_date: null
-    verified_date: "2026-10-31"
+    verified_date: "2026-11-07"
     params_total: null
     params_active: null
     quantization:
@@ -573,6 +579,87 @@ models:
       Kept at status: candidate under the strict 10/10 automated v1 gate. Zero retries
       used across all suites; zero session token leaks across all runs.
     eval_summary: "2026-10-31 via tinfoil-proxy v0.2.9 + se-key-proxy (chat_template_kwargs.thinking=false, include_reasoning=false): sanity 1/1 (runs/2026-10-31-215051-sanity-tinfoil-kimi-k3-65612a00-4kshda, text TTFT 0.3661s, 121 tokens total); automated v1 9/10 in 35s (runs/2026-10-31-215102-v1-tinfoil-kimi-k3-65612a00-D92nzB, text TTFT 0.3388s, 25809 tokens); tools 4/4 in 5s (runs/2026-10-31-215208-tools-tinfoil-kimi-k3-65612a00-jnpGS4, text TTFT 0.4203s, buffered tool-call TTFT 0.9319s, tool_call_chunks=1, 1649 tokens); opencode-smoke PASS in 2.9050s (runs/2026-10-31-215302-opencode-smoke-tinfoil-kimi-k3-65612a00-x86emkai, 1824 tokens)."
+    enclave_tag: v0.0.16
+    deprecated: true
+    deprecation_date: "2026-11-12"
 
-
-
+  - id: tinfoil-kimi-k3-1-pro
+    status: candidate
+    repo: kimi-k3-1-pro
+    upstream: moonshotai/Kimi-K3.1-Pro
+    converter: tinfoilsh
+    conversion_runtime_version: vllm
+    runtime: proxy
+    serve_command: ./bin/tinfoil-proxy --bind {host} --port {port} -e inference.tinfoil.sh --repo tinfoilsh/confidential-model-router
+    enclave_repo: tinfoilsh/confidential-kimi-k3-1-pro
+    enclave_tag: v0.0.3
+    promptfoo_provider:
+      id: openai:chat:kimi-k3-1-pro
+      apiBaseUrl: http://127.0.0.1:8081/v1
+      apiKeyKeychainService: free-inference.tinfoil
+      config:
+        showThinking: false
+        passthrough:
+          include_reasoning: false
+          chat_template_kwargs:
+            thinking: false
+    capabilities:
+      tool_calling: true
+    routing:
+      private_local: blocked
+      private_attested: blocked
+    remote_trust:
+      tier: enclave_runtime_attested
+      attestation_method: tinfoil-proxy-sigstore
+      weights_hash: null
+      weights_source: null
+      provider_manifest_weights_hash: dmverity:sha256:8d9c355a94e60f43598713759028328bbe795336f2700799d0ff4f3898e785e0
+      provider_manifest_weights_source: moonshotai/Kimi-K3.1-Pro@6d0a0202956796543364d666ab19c6ad1a494ee1
+      usage_policy: provider_terms_apply
+      jurisdiction: US
+      pricing_per_m_tokens:
+        input: 4.0
+        output: 20.0
+        cached_input: 0.4
+    license: null
+    release_date: null
+    verified_date: "2026-11-07"
+    params_total: null
+    params_active: null
+    quantization:
+      bits: null
+      group_size: null
+      tool: null
+      tool_version: null
+    kv_cache_dtype: fp8
+    disk_gb_estimate: 1561.4
+    ram_gb_estimate: null
+    context_window: 262144
+    modalities:
+      - text
+      - image
+    chat_template:
+      source: kimi_k3
+      roles_supported:
+        - system
+        - user
+        - assistant
+        - tool
+    source_links:
+      - https://github.com/tinfoilsh/confidential-kimi-k3-1-pro
+      - https://github.com/tinfoilsh/confidential-model-router
+      - https://huggingface.co/moonshotai/Kimi-K3.1-Pro
+    fit_notes: |
+      Kimi K3.1 Pro served inside Tinfoil's attested enclaves (tinfoilsh/confidential-kimi-k3-1-pro v0.0.3) with --tool-call-parser kimi_k3, --reasoning-parser kimi_k3, and 262144 context window. Pricing verified on 2026-11-07: $4.00/1M input ($0.40 cached) and $20.00/1M output.
+    review_notes: |
+      Discovered and scaffolded via scripts/sync-model-catalog on 2026-11-07 from
+      live router manifest (tinfoilsh/confidential-kimi-k3-1-pro@v0.0.3) and /v1/models,
+      then attested and evaluated via tinfoil-proxy v0.2.9 + se-key-proxy (see
+      docs/attestations/2026-10-31-tinfoil-rung3-trial.md Section 8). Passed sanity
+      (1/1 in 1s, text TTFT 0.3096s), tools (4/4 in 3s, including parallel-tool-calls-diff-check,
+      tool TTFT 0.5529s), and opencode-smoke (PASS in 2.5669s), and scored 9/10 on
+      automated v1 in 31s (text TTFT 0.2933s), missing only the diff --git header on
+      patch-like-edit-gitignore (emitted a valid POSIX unified diff --- /dev/null / +++ b/.gitignore).
+      Kept at status: candidate under the strict 10/10 automated v1 gate. Zero retries
+      used across all suites; zero session token leaks across all runs.
+    eval_summary: "2026-11-07 via tinfoil-proxy v0.2.9 + se-key-proxy (chat_template_kwargs.thinking=false, include_reasoning=false): sanity 1/1 (runs/2026-11-07-052113-sanity-tinfoil-kimi-k3-1-pro-549f5f54-MOpRpj, text TTFT 0.3096s, 155 tokens total); automated v1 9/10 in 31s (runs/2026-11-07-052129-v1-tinfoil-kimi-k3-1-pro-549f5f54-Os9S4D, text TTFT 0.2933s, 25644 tokens); tools 4/4 in 3s (runs/2026-11-07-052218-tools-tinfoil-kimi-k3-1-pro-549f5f54-iNm1IJ, text TTFT 0.2955s, buffered tool-call TTFT 0.5529s, tool_call_chunks=1, 1680 tokens); opencode-smoke PASS in 2.5669s (runs/2026-11-07-052238-opencode-smoke-tinfoil-kimi-k3-1-pro-549f5f54-9quqmsay, 1903 tokens)."

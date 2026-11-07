@@ -494,7 +494,19 @@ def resolve_endpoint(
     configured_url = provider.get("apiBaseUrl")
     if configured_url:
         api_base_url = str(configured_url).rstrip("/")
-    elif pid_record and isinstance(pid_record.get("port"), int):
+        if (
+            isinstance(pid_record, dict)
+            and pid_record.get("model_id") == model_id
+            and isinstance(pid_record.get("port"), int)
+            and not isinstance(pid_record.get("port"), bool)
+        ):
+            cfg_parsed = urlparse(api_base_url)
+            cfg_host = cfg_parsed.hostname or "127.0.0.1"
+            if cfg_host in LOCAL_HOSTS:
+                api_base_url = build_base_url(
+                    cfg_host, pid_record["port"], scheme=(cfg_parsed.scheme or "http").lower()
+                )
+    elif pid_record and isinstance(pid_record.get("port"), int) and not isinstance(pid_record.get("port"), bool):
         api_base_url = build_base_url("127.0.0.1", pid_record["port"])
     else:
         api_base_url = DEFAULT_BASE_URL
@@ -728,7 +740,7 @@ def resolve_endpoint(
                     f"Model {model_id}: remote_trust.pricing_per_m_tokens must be null or a mapping."
                 )
             parsed_pricing: dict[str, float] = {}
-            for k in ("input", "output"):
+            for k in ("input", "output", "cached_input"):
                 val = raw_pricing.get(k)
                 if val is not None:
                     if isinstance(val, bool) or not isinstance(val, (int, float)) or float(val) < 0:

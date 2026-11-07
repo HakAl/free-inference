@@ -1,0 +1,399 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
+if __name__ == "__main__" and VENV_PYTHON.exists() and Path(sys.executable) != VENV_PYTHON:
+    os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), __file__, *sys.argv[1:]])
+
+sys.path.insert(0, str(ROOT))
+
+from local_assist._miniyaml import safe_load
+from local_assist.catalog_sync import (
+    DEFAULT_GITHUB_RAW_BASE_URL,
+    DEFAULT_IGNORED_SERVED_IDS,
+    DEFAULT_OPENAI_MODELS_URL,
+    DEFAULT_ROUTER_MANIFEST_URL,
+    CatalogDriftReport,
+    CatalogSyncError,
+    apply_catalog_healing,
+    compute_catalog_drift,
+    compute_models_data_digest,
+    fetch_tinfoil_enclave_config,
+    fetch_tinfoil_openai_models,
+    fetch_tinfoil_router_manifest,
+    format_human_drift_report,
+    render_github_issue_body,
+)
+from local_assist.registry import DEFAULT_MODELS_PATH
+
+
+def _print_human_report(report: CatalogDriftReport, *, applied: bool = False) -> None:
+    print(format_human_drift_report(report, applied=applied))
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_raw = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=str(path.parent),
+    )
+    tmp_path = Path(tmp_raw)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+
+def _write_optional_outputs(
+    report: CatalogDriftReport,
+    *,
+    check_status: str,
+    exit_code: int,
+    applied: bool,
+    json_out: Path | None,
+    markdown_out: Path | None,
+    run_url: str | None,
+    checked_ref: str | None,
+    checked_sha: str | None,
+    attempt_id: str | None = None,
+) -> dict:
+    report_dict = report.to_dict()
+    report_dict["check_status"] = check_status
+    if applied:
+        report_dict["applied"] = True
+    if checked_ref:
+        report_dict["checked_ref"] = checked_ref
+    if checked_sha:
+        report_dict["checked_sha"] = checked_sha
+    if attempt_id:
+        report_dict["attempt_id"] = attempt_id
+    human_text = format_human_drift_report(report, applied=applied)
+    md_body = render_github_issue_body(
+        dict(report_dict),
+        exit_code=exit_code,
+        human_output=human_text,
+        run_url=run_url,
+        checked_ref=checked_ref,
+        checked_sha=checked_sha,
+    )
+    report_dict["markdown_sha256"] = hashlib.sha256(md_body.encode("utf-8")).hexdigest()
+    try:
+        if markdown_out is not None:
+            _atomic_write_text(markdown_out, md_body)
+        if json_out is not None:
+            _atomic_write_text(json_out, json.dumps(report_dict, indent=2) + "\n")
+    except OSError as exc:
+        _unlink_paths([json_out, markdown_out])
+        raise CatalogSyncError(f"Failed to write output report: {exc}") from exc
+    return report_dict
+
+
+def _extract_output_paths_from_argv(raw_argv: list[str]) -> list[Path]:
+    paths: list[Path] = []
+    idx = 0
+    while idx < len(raw_argv):
+        tok = raw_argv[idx]
+        if tok in ("--json-out", "--markdown-out"):
+            if idx + 1 < len(raw_argv) and raw_argv[idx + 1]:
+                paths.append(Path(raw_argv[idx + 1]))
+            idx += 2
+            continue
+        for prefix in ("--json-out=", "--markdown-out="):
+            if tok.startswith(prefix):
+                val = tok[len(prefix) :]
+                if val:
+                    paths.append(Path(val))
+        idx += 1
+    return paths
+
+
+def _unlink_paths(paths: list[Path | None], *, raise_on_failure: bool = False) -> None:
+    for out_path in paths:
+        if out_path is not None and out_path.exists():
+            try:
+                out_path.unlink()
+            except OSError as exc:
+                try:
+                    out_path.write_bytes(b"")
+                except OSError:
+                    if raise_on_failure:
+                        raise CatalogSyncError(
+                            f"Failed to remove or invalidate existing output file {out_path}: {exc}"
+                        ) from exc
+                    continue
+                if raise_on_failure:
+                    raise CatalogSyncError(
+                        f"Failed to unlink existing output file {out_path} (truncated in-place): {exc}"
+                    ) from exc
+
+
+def main(argv: list[str] | None = None) -> int:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    pre_output_paths = _extract_output_paths_from_argv(raw_argv)
+
+    parser = argparse.ArgumentParser(
+        description="Check and self-heal Tinfoil attested enclave models in models.yaml."
+    )
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--check",
+        action="store_true",
+        default=False,
+        help="Check for drift without modifying models.yaml (default mode).",
+    )
+    mode_group.add_argument(
+        "--apply",
+        action="store_true",
+        default=False,
+        help="Apply self-healing updates and scaffold new coding candidates in models.yaml.",
+    )
+    parser.add_argument(
+        "--models-path",
+        type=Path,
+        default=DEFAULT_MODELS_PATH,
+        help="Path to models.yaml (default: lab/models.yaml).",
+    )
+    parser.add_argument(
+        "--router-manifest-url",
+        default=DEFAULT_ROUTER_MANIFEST_URL,
+        help=f"URL for Tinfoil router verification manifest (default: {DEFAULT_ROUTER_MANIFEST_URL}).",
+    )
+    parser.add_argument(
+        "--openai-models-url",
+        default=DEFAULT_OPENAI_MODELS_URL,
+        help=f"URL for Tinfoil OpenAI /v1/models endpoint (default: {DEFAULT_OPENAI_MODELS_URL}).",
+    )
+    parser.add_argument(
+        "--github-raw-base-url",
+        default=DEFAULT_GITHUB_RAW_BASE_URL,
+        help=f"Base URL for fetching tinfoil-config.yml manifests (default: {DEFAULT_GITHUB_RAW_BASE_URL}).",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=15.0,
+        help="HTTP request timeout in seconds (default: 15.0).",
+    )
+    parser.add_argument(
+        "--json",
+        dest="json_output",
+        action="store_true",
+        default=False,
+        help="Emit drift report as JSON.",
+    )
+    parser.add_argument(
+        "--json-out",
+        type=Path,
+        default=None,
+        help="Write structured drift report JSON (with check_status) to file path.",
+    )
+    parser.add_argument(
+        "--markdown-out",
+        type=Path,
+        default=None,
+        help="Write sanitized Markdown summary / issue body to file path.",
+    )
+    parser.add_argument(
+        "--run-url",
+        default=None,
+        help="Optional CI workflow run URL to record in Markdown output.",
+    )
+    parser.add_argument(
+        "--checked-ref",
+        default=None,
+        help="Optional git ref to record in structured JSON and Markdown output.",
+    )
+    parser.add_argument(
+        "--checked-sha",
+        default=None,
+        help="Optional git commit SHA to record in structured JSON and Markdown output.",
+    )
+    parser.add_argument(
+        "--attempt-id",
+        default=None,
+        help="Optional unique attempt identifier to bind structured outputs to the current invocation.",
+    )
+    parser.add_argument(
+        "--exit-zero",
+        action="store_true",
+        default=False,
+        help="Exit 0 even when drift is detected in --check mode (never masks operational/disagreement errors).",
+    )
+    parser.add_argument(
+        "--quarantine-disagreements",
+        action="store_true",
+        default=False,
+        help="Conservatively demote routing to blocked on feed disagreements instead of failing.",
+    )
+    parser.add_argument(
+        "--no-discover-new",
+        action="store_true",
+        default=False,
+        help="Do not scaffold newly discovered coding models.",
+    )
+    parser.add_argument(
+        "--include-all-chat",
+        action="store_true",
+        default=False,
+        help="Include all chat+tool_calling models without filtering DEFAULT_IGNORED_SERVED_IDS.",
+    )
+    try:
+        args = parser.parse_args(raw_argv)
+    except SystemExit as exc:
+        if exc.code in (0, None):
+            return 0
+        _unlink_paths(pre_output_paths)
+        return 1
+
+    try:
+        _unlink_paths([args.json_out, args.markdown_out], raise_on_failure=True)
+        if not args.models_path.exists():
+            raise CatalogSyncError(f"models.yaml not found at {args.models_path}")
+        models_data = safe_load(args.models_path.read_text(encoding="utf-8"))
+        if not isinstance(models_data, dict):
+            raise CatalogSyncError(f"Invalid top-level mapping in {args.models_path}")
+
+        router_manifest = fetch_tinfoil_router_manifest(
+            args.router_manifest_url, timeout=args.timeout
+        )
+        openai_models = fetch_tinfoil_openai_models(
+            args.openai_models_url, timeout=args.timeout
+        )
+
+        ignored_ids = set() if args.include_all_chat else set(DEFAULT_IGNORED_SERVED_IDS)
+        enclave_cfg_cache: dict[str, dict] = {}
+
+        def _fetch_enclave_cfg(repo: str, tag: str) -> dict:
+            key = f"{repo}@{tag}"
+            if key not in enclave_cfg_cache:
+                enclave_cfg_cache[key] = fetch_tinfoil_enclave_config(
+                    repo,
+                    tag,
+                    raw_base_url=args.github_raw_base_url,
+                    timeout=args.timeout,
+                )
+            return enclave_cfg_cache[key]
+
+        report = compute_catalog_drift(
+            models_data,
+            router_manifest,
+            openai_models,
+            enclave_cfg_cache,
+            enclave_config_fetcher=_fetch_enclave_cfg,
+            discover_new_coding_models=not args.no_discover_new,
+            ignored_served_ids=ignored_ids,
+        )
+
+        if args.apply:
+            fresh_data = safe_load(args.models_path.read_text(encoding="utf-8"))
+            if not isinstance(fresh_data, dict):
+                raise CatalogSyncError(f"Invalid top-level mapping in {args.models_path}")
+            if compute_models_data_digest(fresh_data) != report.base_catalog_sha256:
+                report = compute_catalog_drift(
+                    fresh_data,
+                    router_manifest,
+                    openai_models,
+                    enclave_cfg_cache,
+                    enclave_config_fetcher=_fetch_enclave_cfg,
+                    discover_new_coding_models=not args.no_discover_new,
+                    ignored_served_ids=ignored_ids,
+                )
+
+        if report.disagreements and not (args.apply and args.quarantine_disagreements):
+            _write_optional_outputs(
+                report,
+                check_status="disagreement",
+                exit_code=1,
+                applied=False,
+                json_out=args.json_out,
+                markdown_out=args.markdown_out,
+                run_url=args.run_url,
+                checked_ref=args.checked_ref,
+                checked_sha=args.checked_sha,
+                attempt_id=args.attempt_id,
+            )
+            if args.json_output:
+                print(json.dumps(report.to_dict(), indent=2))
+            else:
+                _print_human_report(report, applied=False)
+            reasons = "; ".join(d.reason for d in report.disagreements)
+            print(f"ERROR: Primary catalog feeds disagree: {reasons}", file=sys.stderr)
+            return 1
+
+        if args.apply:
+            if report.has_drift:
+                apply_catalog_healing(
+                    args.models_path,
+                    report,
+                    quarantine_disagreements=args.quarantine_disagreements,
+                    append_new_models=not args.no_discover_new,
+                )
+            _write_optional_outputs(
+                report,
+                check_status="clean",
+                exit_code=0,
+                applied=True,
+                json_out=args.json_out,
+                markdown_out=args.markdown_out,
+                run_url=args.run_url,
+                checked_ref=args.checked_ref,
+                checked_sha=args.checked_sha,
+                attempt_id=args.attempt_id,
+            )
+            if args.json_output:
+                out = report.to_dict()
+                out["applied"] = True
+                print(json.dumps(out, indent=2))
+            else:
+                _print_human_report(report, applied=True)
+            return 0
+
+        check_status = "drift" if report.has_drift else "clean"
+        raw_rc = 2 if report.has_drift else 0
+        _write_optional_outputs(
+            report,
+            check_status=check_status,
+            exit_code=raw_rc,
+            applied=False,
+            json_out=args.json_out,
+            markdown_out=args.markdown_out,
+            run_url=args.run_url,
+            checked_ref=args.checked_ref,
+            checked_sha=args.checked_sha,
+            attempt_id=args.attempt_id,
+        )
+
+        if args.json_output:
+            print(json.dumps(report.to_dict(), indent=2))
+        else:
+            _print_human_report(report, applied=False)
+
+        if report.has_drift and not args.exit_zero:
+            return 2
+        return 0
+
+    except (CatalogSyncError, OSError) as exc:
+        _unlink_paths([args.json_out, args.markdown_out])
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

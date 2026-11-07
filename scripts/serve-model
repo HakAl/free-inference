@@ -276,6 +276,23 @@ def _write_pid_files(
 ) -> None:
     serialized = json.dumps(record, indent=2) + "\n"
     model_pid_file.write_text(serialized)
+    if default_pid_file.exists():
+        try:
+            existing = json.loads(default_pid_file.read_text())
+            if (
+                isinstance(existing, dict)
+                and existing.get("model_id") != record.get("model_id")
+            ):
+                existing_pid = existing.get("pid")
+                if pid_is_alive(existing_pid):
+                    expected_lstart = existing.get("pid_lstart")
+                    if not isinstance(expected_lstart, str) or not expected_lstart.strip():
+                        return
+                    actual_lstart = get_process_lstart(existing_pid)
+                    if actual_lstart is None or actual_lstart.strip() == expected_lstart.strip():
+                        return
+        except (OSError, json.JSONDecodeError):
+            pass
     default_pid_file.write_text(serialized)
 
 

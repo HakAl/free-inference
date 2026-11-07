@@ -319,6 +319,32 @@ Total `tinfoil-kimi-k3` spend across all runs and timing probes: `26,381` input 
 
 ---
 
+## 8. Phase 2 Capability and Security Evaluation (`tinfoil-kimi-k3-1-pro`, 2026-11-07)
+
+On `2026-11-07`, `./scripts/sync-model-catalog` queried Tinfoil's live router verification state (`https://inference.tinfoil.sh/.well-known/tinfoil-proxy`), OpenAI `/v1/models` catalog (`https://inference.tinfoil.sh/v1/models`), and per-enclave release manifests (`tinfoil-config.yml`):
+- Detected `kimi-k3` deprecation (`deprecated: true`, `deprecationDate: "2026-11-12"`, tag `v0.0.6 -> v0.0.16`), `deepseek-v4-1-flash` input price reduction (`$0.65 -> $0.60/1M`, cached `$0.13 -> $0.01/1M`), `gpt-oss-120b` enclave tag update (`v0.0.28 -> v0.0.29`), and the new `kimi-k3-1-pro` coding model (`Kimi K3.1 Pro`, `$4.00/1M` input, `$0.40/1M` cached input, `$20.00/1M` output).
+- Enclave provenance for `kimi-k3-1-pro`: `tinfoilsh/confidential-kimi-k3-1-pro` `v0.0.3` (`3/3` healthy enclaves, `snp-tdx-multiplatform/v1`), `provider_manifest_weights_source`: `moonshotai/Kimi-K3.1-Pro@6d0a0202956796543364d666ab19c6ad1a494ee1`, `provider_manifest_weights_hash`: `dmverity:sha256:8d9c355a94e60f43598713759028328bbe795336f2700799d0ff4f3898e785e0` (`1561.4 GB`).
+
+### 8.1 Bounded Session Launch and Suite Results Summary (`tinfoil-kimi-k3-1-pro`)
+
+Served on `127.0.0.1:8082` (`tinfoil-proxy` on `127.0.0.1:9082`) with `--max-chat-requests 40 --max-tokens-cap 700 --max-request-bytes 65536 --ttl-seconds 1800 --stream-timeout-seconds 300` and pre-step `check_pre_step_budget` verification under the `$1.00 USD` soft budget ceiling (`chat_template_kwargs.thinking: false`, `include_reasoning: false`, `0` retries used across all suites):
+
+| Suite / Gate | Run Directory | Result | Latency / TTFT | Token Usage (Prompt / Completion / Total) | Actual Step Spend (`$4/M` in, `$20/M` out) | Session Token Leaks (`matches_found`) |
+|---|---|---|---|---|---|---|
+| `sanity` | `runs/2026-11-07-052113-sanity-tinfoil-kimi-k3-1-pro-549f5f54-MOpRpj` | **PASS** (`1/1`) | `1s` suite / text TTFT `0.3096s` (`0.6506s` total) | `64` / `91` / `155` (`32` / `48` / `80` suite) | `$0.002076` | `0` (`60` files scanned) |
+| `v1` | `runs/2026-11-07-052129-v1-tinfoil-kimi-k3-1-pro-549f5f54-Os9S4D` | **9/10** (`90%`, `0` errors) | `31s` suite / text TTFT `0.2933s` (`0.5448s` total) | `23,274` / `2,370` / `25,644` | `$0.140496` | `0` (`60` files scanned) |
+| `tools` | `runs/2026-11-07-052218-tools-tinfoil-kimi-k3-1-pro-549f5f54-iNm1IJ` | **4/4** (`100%`, `0` errors) | `3s` suite / text TTFT `0.2955s`, buffered tool TTFT `0.5529s` (`tool_call_chunks: 1`) | `1,352` / `328` / `1,680` | `$0.011968` | `0` (`61` files scanned) |
+| `opencode-smoke` (`v2.0.32`) | `runs/2026-11-07-052238-opencode-smoke-tinfoil-kimi-k3-1-pro-549f5f54-9quqmsay` | **PASS** (`1/1`, `read` tool called on `target.txt`, exact token verified, `0` non-localhost sockets) | `2.5669s` total (`2` LLM steps, `3` HTTP requests) | `1,748` / `155` / `1,903` | `$0.010092` | `0` (`348` files scanned) |
+
+Total `tinfoil-kimi-k3-1-pro` spend across all `22` requests: `26,438` input tokens (`$0.1058`) + `2,944` output tokens (`$0.0589`) = **`$0.1646` (`16.5 cents`)**.
+
+### 8.2 Analysis of `tinfoil-kimi-k3-1-pro` Results
+
+- **`tools` (`4/4`, `100%`) and `opencode-smoke` (`PASS` in `2.5669s`)**: Improved latency over `tinfoil-kimi-k3` across every metric (`tools` suite `3s` vs `5s`, tool-call TTFT `0.5529s` vs `0.9319s`, `v1` suite `31s` vs `35s`, and `opencode-smoke` `2.5669s` vs `2.9050s`).
+- **`v1` (`9/10`, `90%`)**: Passed 9 of 10 automated cells on the first attempt (`0` retries used), missing only `patch-like-edit-gitignore` because it emitted a valid POSIX unified diff (`--- /dev/null\n+++ b/.gitignore`) without a `diff --git` header line. Kept at `status: candidate` and `routing.private_attested: blocked` unless promoted by the operator.
+
+---
+
 ## Addendum (2026-11-02): Public Repository Path Mapping
 
 This trial record was captured in the internal workspace prior to standalone public export:

@@ -34,6 +34,9 @@ Read these documents before making changes:
 
 - Bootstrap & verify dependencies: `./scripts/setup`
 - List registered models: `./scripts/models`
+- Check or heal upstream model catalog drift (also tracked weekly via `.github/workflows/catalog-sync.yml` issues on `https://github.com/HakAl/free-inference/issues`):
+  - `./scripts/sync-model-catalog --check`
+  - `./scripts/sync-model-catalog --apply`
 - Launch Rung 1 local coding session (from target project directory): `/path/to/free-inference/scripts/opencode-local`
 - Launch Rung 3 attested enclave coding session (from target project directory): `/path/to/free-inference/scripts/opencode-attested`
 - Launch unattended sandboxed worker (Rung 1 or Rung 3):

@@ -2596,7 +2596,7 @@ class RegistryAndToolsTests(unittest.TestCase):
 
         self.assertEqual(est_ds["worst_input_tokens_per_req"], 43691)
         self.assertAlmostEqual(est_gpt["worst_total_usd"], 0.194561, places=4)
-        self.assertAlmostEqual(est_ds["worst_total_usd"], 0.784219, places=4)
+        self.assertAlmostEqual(est_ds["worst_total_usd"], 0.729605, places=4)
         self.assertAlmostEqual(est_glm["worst_total_usd"], 2.260495, places=4)
         self.assertAlmostEqual(est_kimi["worst_total_usd"], 5.3931, places=4)
 

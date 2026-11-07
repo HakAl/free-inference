@@ -27,17 +27,40 @@ def safe_dump(data: Any) -> str:
     return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
 
 
+def parse_yaml_with_flow_sequences(text: str) -> Any:
+    stripped = text.lstrip()
+    if stripped.startswith(("{", "[")):
+        return json.loads(stripped)
+    return _MiniYamlParser(text, allow_flow_sequences=True).parse()
+
+
 class _MiniYamlParser:
-    def __init__(self, text: str) -> None:
+    def __init__(self, text: str, *, allow_flow_sequences: bool = False) -> None:
         self.raw_lines = text.splitlines()
         self.anchors: dict[str, Any] = {}
         self.pos = 0
+        self.allow_flow_sequences = allow_flow_sequences
 
     @staticmethod
-    def _strip_comment(line: str) -> str:
+    def _can_start_flow_sequence_at(line: str, idx: int) -> bool:
+        if idx == 0:
+            return True
+        if not line[idx - 1].isspace():
+            return False
+        prefix = line[:idx].rstrip(" ")
+        if prefix == "-" or prefix.endswith(":"):
+            return True
+        parts = prefix.rsplit(None, 1)
+        if len(parts) == 2 and parts[1].startswith("&") and len(parts[1]) > 1:
+            head = parts[0].rstrip(" ")
+            return head == "-" or head.endswith(":")
+        return False
+
+    def _strip_comment(self, line: str, *, in_flow_sequence: bool = False) -> str:
         in_single = False
         in_double = False
         escaped = False
+        flow_depth = 1 if (self.allow_flow_sequences and in_flow_sequence) else 0
         idx = 0
         while idx < len(line):
             ch = line[idx]
@@ -61,9 +84,23 @@ class _MiniYamlParser:
             else:
                 if ch == "\t":
                     raise ValueError(f"Tab characters are not allowed in YAML indentation or unquoted tokens: {line!r}")
-                if ch == "'" and (idx == 0 or line[idx - 1].isspace()):
+                if self.allow_flow_sequences:
+                    if ch == "[":
+                        if (
+                            flow_depth > 0
+                            and (idx == 0 or line[idx - 1].isspace() or line[idx - 1] in ("[", ","))
+                        ) or (flow_depth == 0 and self._can_start_flow_sequence_at(line, idx)):
+                            flow_depth += 1
+                    elif ch == "]" and flow_depth > 0:
+                        flow_depth -= 1
+                can_open_quote = (
+                    idx == 0
+                    or line[idx - 1].isspace()
+                    or (flow_depth > 0 and line[idx - 1] in ("[", ","))
+                )
+                if ch == "'" and can_open_quote:
                     in_single = True
-                elif ch == '"' and (idx == 0 or line[idx - 1].isspace()):
+                elif ch == '"' and can_open_quote:
                     in_double = True
                 elif ch == "#" and (idx == 0 or line[idx - 1].isspace()):
                     return line[:idx].rstrip()
@@ -72,7 +109,7 @@ class _MiniYamlParser:
             raise ValueError(f"Unterminated or multi-line quoted scalar is not supported: {line!r}")
         return line.rstrip()
 
-    def _skip_ignorable(self) -> None:
+    def _skip_ignorable(self, *, in_flow_sequence: bool = False) -> None:
         while self.pos < len(self.raw_lines):
             raw = self.raw_lines[self.pos]
             if "\t" in raw[: len(raw) - len(raw.lstrip(" \t"))]:
@@ -81,7 +118,7 @@ class _MiniYamlParser:
             if not stripped or stripped.startswith("#"):
                 self.pos += 1
                 continue
-            content = self._strip_comment(stripped)
+            content = self._strip_comment(stripped, in_flow_sequence=in_flow_sequence)
             if not content:
                 self.pos += 1
                 continue
@@ -113,6 +150,9 @@ class _MiniYamlParser:
         if peeked is None:
             return None
         indent, content = peeked
+        if self.allow_flow_sequences and content.startswith("["):
+            self.pos += 1
+            return self._collect_and_parse_flow_sequence(content, indent)
         if content.startswith("- ") or content == "-":
             return self._parse_list(indent)
         return self._parse_mapping(indent)
@@ -216,10 +256,148 @@ class _MiniYamlParser:
                 self.anchors[anchor] = val
             return val
 
+        if self.allow_flow_sequences and val_str.startswith("[") and val_str != "[]":
+            val = self._collect_and_parse_flow_sequence(val_str, parent_indent)
+            if anchor:
+                self.anchors[anchor] = val
+            return val
+
         val = self._parse_scalar(val_str)
         if anchor:
             self.anchors[anchor] = val
         return val
+
+    def _collect_and_parse_flow_sequence(self, initial_text: str, min_indent: int) -> list[Any]:
+        chunks = [initial_text]
+
+        def _is_balanced(text: str) -> bool:
+            in_single = False
+            in_double = False
+            escaped = False
+            depth = 0
+            idx = 0
+            while idx < len(text):
+                ch = text[idx]
+                if escaped:
+                    escaped = False
+                    idx += 1
+                    continue
+                if ch == "\\" and in_double:
+                    escaped = True
+                    idx += 1
+                    continue
+                if in_single:
+                    if ch == "'":
+                        if idx + 1 < len(text) and text[idx + 1] == "'":
+                            idx += 2
+                            continue
+                        in_single = False
+                elif in_double:
+                    if ch == '"':
+                        in_double = False
+                else:
+                    if ch == "'":
+                        in_single = True
+                    elif ch == '"':
+                        in_double = True
+                    elif ch == "[":
+                        depth += 1
+                    elif ch == "]":
+                        depth -= 1
+                        if depth == 0:
+                            trailing = text[idx + 1 :].strip()
+                            if trailing:
+                                raise ValueError(
+                                    f"Unexpected trailing content after YAML flow sequence: {trailing!r}"
+                                )
+                            return True
+                        if depth < 0:
+                            raise ValueError(f"Unbalanced closing bracket in YAML flow sequence: {text!r}")
+                idx += 1
+            if in_single or in_double or escaped:
+                raise ValueError(f"Unterminated quoted string in YAML flow sequence: {text!r}")
+            return False
+
+        combined = " ".join(chunks)
+        while not _is_balanced(combined):
+            self._skip_ignorable(in_flow_sequence=True)
+            if self.pos >= len(self.raw_lines):
+                raise ValueError(f"Unterminated YAML flow sequence: {combined!r}")
+            raw = self.raw_lines[self.pos]
+            stripped = raw.lstrip(" ")
+            indent = len(raw) - len(stripped)
+            if indent <= min_indent and not stripped.startswith("]"):
+                raise ValueError(
+                    f"Multiline YAML flow sequence line at indent {indent} must be indented beyond {min_indent}: {raw!r}"
+                )
+            content = self._strip_comment(stripped, in_flow_sequence=True)
+            self.pos += 1
+            chunks.append(content)
+            combined = " ".join(chunks)
+
+        combined = combined.strip()
+        if not (combined.startswith("[") and combined.endswith("]")):
+            raise ValueError(f"Malformed YAML flow sequence: {combined!r}")
+        inner = combined[1:-1].strip()
+        if not inner:
+            return []
+
+        raw_items: list[str] = []
+        cur: list[str] = []
+        in_single = False
+        in_double = False
+        escaped = False
+        idx = 0
+        while idx < len(inner):
+            ch = inner[idx]
+            if escaped:
+                cur.append(ch)
+                escaped = False
+                idx += 1
+                continue
+            if ch == "\\" and in_double:
+                cur.append(ch)
+                escaped = True
+                idx += 1
+                continue
+            if in_single:
+                cur.append(ch)
+                if ch == "'":
+                    if idx + 1 < len(inner) and inner[idx + 1] == "'":
+                        cur.append("'")
+                        idx += 2
+                        continue
+                    in_single = False
+            elif in_double:
+                cur.append(ch)
+                if ch == '"':
+                    in_double = False
+            else:
+                if ch == "'":
+                    in_single = True
+                    cur.append(ch)
+                elif ch == '"':
+                    in_double = True
+                    cur.append(ch)
+                elif ch in ("[", "]", "{", "}"):
+                    raise ValueError(f"Nested flow collections are not supported in YAML flow sequence: {combined!r}")
+                elif ch == ",":
+                    item_str = "".join(cur).strip()
+                    if not item_str:
+                        raise ValueError(f"Empty item before comma in YAML flow sequence: {combined!r}")
+                    raw_items.append(item_str)
+                    cur = []
+                else:
+                    cur.append(ch)
+            idx += 1
+
+        tail_str = "".join(cur).strip()
+        if tail_str:
+            raw_items.append(tail_str)
+        elif not raw_items:
+            raise ValueError(f"Empty YAML flow sequence with comma: {combined!r}")
+
+        return [self._parse_scalar(item) for item in raw_items]
 
     def _collect_block_scalar(self, indicator: str, parent_indent: int) -> str:
         block_lines: list[str] = []
