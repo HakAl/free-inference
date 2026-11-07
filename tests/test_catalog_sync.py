@@ -2101,12 +2101,12 @@ containers:
         steps = job["steps"]
         self.assertEqual(
             steps[0]["uses"],
-            "actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683",
+            "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1",
         )
         self.assertEqual(steps[0]["with"], {"persist-credentials": False})
         self.assertEqual(
             steps[1]["uses"],
-            "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065",
+            "actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0",
         )
         # GH_TOKEN is confined strictly to the reconciliation step (step 3), not the check step (step 2)
         self.assertNotIn("GH_TOKEN", steps[2].get("env") or {})
