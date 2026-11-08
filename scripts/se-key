@@ -17,15 +17,17 @@ sys.path.insert(0, str(ROOT))
 
 from local_assist.registry import KEYCHAIN_SERVICE_RE
 from local_assist.se_key import (
+    DEFAULT_ENVELOPE_ACCOUNT,
     SEKeyIntegrityError,
     build_se_key_proxy,
+    ensure_envelope_available_or_migrate,
     verify_se_key_proxy_binary,
 )
 
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
-        description="Manage Secure Enclave + macOS Keychain sealed API keys for free-inference."
+        description="Manage Secure Enclave ECIES sealed API keys for free-inference."
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -37,14 +39,45 @@ def main(argv: list[str]) -> int:
         help="Also compile bin/se-key-proxy-test (-D SE_KEY_TESTING) for automated unit tests.",
     )
 
-    p_store = sub.add_parser("store", help="Seal an API key with Secure Enclave ECIES and store in macOS Keychain.")
-    p_store.add_argument("service", help="Keychain service identifier (e.g. free-inference.tinfoil).")
+    p_store = sub.add_parser(
+        "store",
+        aliases=["seal"],
+        help="Seal an API key with Secure Enclave ECIES into ~/.config/free-inference/se-envelopes/.",
+    )
+    p_store.add_argument("service", help="Service identifier (e.g. free-inference.tinfoil).")
 
-    p_status = sub.add_parser("status", help="Inspect Keychain envelope status without triggering Touch ID.")
-    p_status.add_argument("service", help="Keychain service identifier.")
+    p_status = sub.add_parser("status", help="Inspect sealed envelope status without triggering Touch ID.")
+    p_status.add_argument("service", help="Service identifier.")
 
-    p_delete = sub.add_parser("delete", help="Delete a sealed API key from macOS Keychain.")
-    p_delete.add_argument("service", help="Keychain service identifier.")
+    p_delete = sub.add_parser("delete", help="Delete a sealed API key envelope and record a deletion tombstone.")
+    p_delete.add_argument("service", help="Service identifier.")
+
+    p_migrate = sub.add_parser(
+        "migrate",
+        help="Migrate an existing legacy Keychain envelope into ~/.config/free-inference/se-envelopes/ using Touch ID.",
+    )
+    p_migrate.add_argument(
+        "service",
+        nargs="?",
+        default="free-inference.tinfoil",
+        help="Service identifier (default: free-inference.tinfoil).",
+    )
+    p_migrate.add_argument(
+        "--account",
+        default=DEFAULT_ENVELOPE_ACCOUNT,
+        help=f"Account identifier (default: {DEFAULT_ENVELOPE_ACCOUNT}).",
+    )
+    p_migrate.add_argument(
+        "--legacy-binary",
+        default=None,
+        help="Optional explicit path to the legacy se-key-proxy binary.",
+    )
+    p_migrate.add_argument(
+        "--force",
+        action="store_true",
+        default=False,
+        help="Force re-import from legacy Keychain even if an envelope or deletion tombstone exists.",
+    )
 
     sub.add_parser("selftest", help="Run the non-interactive Secure Enclave + ECIES behavioral selftest.")
 
@@ -56,7 +89,7 @@ def main(argv: list[str]) -> int:
             print(json.dumps(info, indent=2, sort_keys=True))
             return 0
 
-        if args.cmd in ("store", "status", "delete"):
+        if args.cmd in ("store", "seal", "status", "delete", "migrate"):
             if not KEYCHAIN_SERVICE_RE.match(args.service):
                 print(
                     f"Invalid Keychain service identifier '{args.service}': must be 1-128 ASCII chars in [A-Za-z0-9._-]",
@@ -66,7 +99,7 @@ def main(argv: list[str]) -> int:
 
         bin_path = verify_se_key_proxy_binary()
 
-        if args.cmd == "store":
+        if args.cmd in ("store", "seal"):
             cp = subprocess.run([str(bin_path), "seal", "--service", args.service], check=False)
             return cp.returncode
         if args.cmd == "status":
@@ -75,6 +108,21 @@ def main(argv: list[str]) -> int:
         if args.cmd == "delete":
             cp = subprocess.run([str(bin_path), "delete", "--service", args.service], check=False)
             return cp.returncode
+        if args.cmd == "migrate":
+            leg_bin = Path(args.legacy_binary) if args.legacy_binary else None
+            ok, msg, payload = ensure_envelope_available_or_migrate(
+                args.service,
+                account=args.account,
+                se_proxy_bin=bin_path,
+                legacy_bin=leg_bin,
+                force=bool(args.force),
+            )
+            if payload is not None:
+                print(json.dumps(payload, indent=2, sort_keys=True))
+            if not ok:
+                print(msg, file=sys.stderr)
+                return 1
+            return 0
         if args.cmd == "selftest":
             cp = subprocess.run([str(bin_path), "selftest"], check=False)
             return cp.returncode

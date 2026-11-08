@@ -90,10 +90,12 @@ cd /path/to/your/project
 
 ### 3. Rung 3: Attested Enclave Coding & Cross-Family Review (`private-attested`)
 
-Seal your [Tinfoil](https://tinfoil.sh) API key into the Apple Silicon Secure Enclave once on your Mac:
+Seal your [Tinfoil](https://tinfoil.sh) API key into the Apple Silicon Secure Enclave once on your Mac (or migrate an existing pre-`v0.1.4` Keychain envelope with a single Touch ID tap and no password or API key re-entry via `./scripts/se-key migrate free-inference.tinfoil`):
 
 ```bash
 ./scripts/se-key store free-inference.tinfoil
+# Or migrate an existing legacy Keychain entry into ~/.config/free-inference/se-envelopes/:
+./scripts/se-key migrate free-inference.tinfoil
 ```
 
 Then launch OpenCode from your target project workspace against the default cleared Rung 3 enclave model (`tinfoil-deepseek-v4-1-flash`, 1M token context window):
@@ -105,6 +107,9 @@ cd /path/to/your/project
 
 # Interactive TUI session (prompts Touch ID once to start a 12-hour proxy session)
 /path/to/free-inference/scripts/opencode-attested
+
+# Renew/restart the 12-hour proxy session at any time (prompts Touch ID once for a fresh 12h TTL)
+/path/to/free-inference/scripts/opencode-attested --refresh-session
 
 # Interactive session with an explicit $5.00 worst-case spend ceiling
 /path/to/free-inference/scripts/opencode-attested --max-session-usd 5.00 --max-chat-requests 100 --max-request-bytes 262144 --max-tokens-cap 4096
@@ -159,31 +164,34 @@ See [`SECURITY.md`](SECURITY.md) for the full threat model. Key operational boun
 |---|---|
 | `./scripts/models` | List all models in `models.yaml` with data-control rung, status, and usage policy |
 | `./scripts/sync-model-catalog` | `--check` or `--apply` upstream model catalog drift against live enclave and Hugging Face sources |
-| `./scripts/serve-model <id>` | Start a local MLX server (`127.0.0.1:8080`) or dual attested proxy (`:8081` + `:9081`) |
+| `./scripts/serve-model <id>` | Start a local MLX server (`127.0.0.1:8080`) or dual attested proxy (`:8081` + `:9081`; `--refresh-session` restarts) |
 | `./scripts/verify-served-model <id>` | Verify active PID records (`pid_lstart`), `/v1/models`, and OS listener `--model` flags (`--require-offline` for Rung 1) |
 | `./scripts/stop-model <id>` | Stop a running model server or proxy after verifying `pid_lstart` (`--all` stops all) |
-| `./scripts/opencode-local` | Launch OpenCode locked to Rung 1 (`private-local`) with isolated state and Rung 1 MCP |
-| `./scripts/opencode-attested` | Launch OpenCode locked to Rung 2/3 (`private-attested`) with spend caps (`--max-session-usd`) and Rung 1 MCP |
+| `./scripts/opencode-local` | Launch OpenCode locked to Rung 1 (`private-local`) with isolated state and Rung 1 MCP (`--refresh-session` restarts) |
+| `./scripts/opencode-attested` | Launch OpenCode locked to Rung 2/3 (`private-attested`) with spend caps (`--max-session-usd`, `--refresh-session`) and Rung 1 MCP |
 | `./scripts/delegate-local <tool>` | Delegate bounded subtasks (`delegate_task`, `compress_context`, `extract_fields`, `propose_eval_prompts`) to Rung 1 |
-| `./scripts/se-key <cmd> <service>` | Build `bin/se-key-proxy`, run `selftest`, or `store` / `status` / `delete` Secure Enclave keys |
+| `./scripts/se-key <cmd> <service>` | Build `bin/se-key-proxy` (also buildable standalone via `swift build --package-path tools/se_key_proxy -c release`), run `selftest`, or `store` / `migrate` / `status` / `delete` Secure Enclave keys |
 | `./scripts/eval <suite> <id>` | Run `sanity`, `v1`, or `tools` promptfoo suites plus streaming TTFT probe |
 | `./scripts/generate-eval-manifest` | Generate or `--check` (`--offline-ci`) committed evaluation evidence manifests in `docs/evals/` |
 
-### Key Rotation & Clean Uninstall
+### Key Rotation, Session Refresh & Clean Uninstall
 
 ```bash
+# Refresh an active 12-hour attested enclave session (or restart after TTL expiry)
+./scripts/opencode-attested --refresh-session
+
 # Rotate a sealed API key (stop any active proxy first since a running session holds the old key in memory,
-# then run store, which replaces the existing Keychain envelope with a fresh Secure Enclave keypair)
+# then run store, which replaces the existing envelope in ~/.config/free-inference/se-envelopes/ with a fresh Secure Enclave keypair)
 ./scripts/stop-model --all
 ./scripts/se-key store free-inference.tinfoil
 
-# Delete a sealed API key from the macOS login Keychain
+# Delete a sealed API key envelope (writes a deleted tombstone so legacy Keychain items are not auto-reimported)
 ./scripts/se-key delete free-inference.tinfoil
 
-# Full local cleanup (stop servers, delete Keychain item, remove build/venv/isolated-home directories)
+# Full local cleanup (stop servers, delete sealed envelope store, remove build/venv/isolated-home directories)
 ./scripts/stop-model --all
 ./scripts/se-key delete free-inference.tinfoil
-rm -rf .venv node_modules bin .home
+rm -rf ~/.config/free-inference/se-envelopes .venv node_modules bin .home
 ```
 
 ### Common Troubleshooting

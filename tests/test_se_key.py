@@ -108,7 +108,13 @@ class _ThreadedHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 class SEKeyTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
-        if not RELEASE_BINARY_PATH.exists() or not STAMP_PATH.exists() or not TEST_BINARY_PATH.exists():
+        release_valid = False
+        try:
+            verify_se_key_proxy_binary()
+            release_valid = True
+        except SEKeyIntegrityError:
+            release_valid = False
+        if not release_valid or not TEST_BINARY_PATH.exists():
             build_se_key_proxy(include_test_binary=True)
 
     def test_se_key_selftest_and_live_biometric_gate(self) -> None:
@@ -2861,6 +2867,649 @@ class SEKeyTests(unittest.TestCase):
                 self.assertEqual(sha256_file(rel_path), res_force["binary_sha256"])
             finally:
                 os.close(open_fd)
+
+    def test_file_backed_envelope_store_migration_and_concur_delete(self) -> None:
+        from local_assist.se_key import ensure_envelope_available_or_migrate, sha256_file
+
+        selftest_cp = subprocess.run(
+            [str(TEST_BINARY_PATH), "selftest"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        if selftest_cp.returncode == 77:
+            self.skipTest("Hardware Secure Enclave / Touch ID unavailable for live seal/migrate test")
+        self.assertEqual(selftest_cp.returncode, 0, selftest_cp.stderr or selftest_cp.stdout)
+
+        with tempfile.TemporaryDirectory() as td:
+            tmp_dir = Path(td)
+            env_dir = tmp_dir / "se-envelopes"
+            test_env = dict(os.environ)
+            test_env["FREE_INFERENCE_SE_ENVELOPE_DIR"] = str(env_dir)
+
+            svc = "free-inference.unit-envelope-test"
+            acct = "se-ecies-v1"
+            stem = hashlib.sha256(f"{svc}\0{acct}".encode("utf-8")).hexdigest()
+            env_file = env_dir / f"{stem}.json"
+            state_file = env_dir / f"{stem}.state.json"
+
+            # 1. Seal a secret via --secret-fd and verify 0700 dir, 0600 file, envelope_sha256, and state="sealed"
+            secret_1 = "tf-unit-secret-alpha-1111"
+            r_fd, w_fd = os.pipe()
+            os.write(w_fd, (secret_1 + "\n").encode("utf-8"))
+            os.close(w_fd)
+            try:
+                seal_cp = subprocess.run(
+                    [str(TEST_BINARY_PATH), "seal", "--service", svc, "--account", acct, "--secret-fd", str(r_fd)],
+                    pass_fds=(r_fd,),
+                    env=test_env,
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    check=False,
+                )
+            finally:
+                os.close(r_fd)
+            self.assertEqual(seal_cp.returncode, 0, seal_cp.stderr)
+            seal_out = json.loads(seal_cp.stdout.strip())
+            self.assertEqual(seal_out.get("status"), "sealed")
+            env_disk_1 = json.loads(env_file.read_text(encoding="utf-8"))
+            pub_x963_1 = __import__("base64").b64decode(
+                env_disk_1["ephemeral_public_key_x963"].encode("ascii")
+            )
+            self.assertEqual(len(pub_x963_1), 65)
+            expected_fp_1 = str(seal_out.get("key_fingerprint") or "")
+            self.assertRegex(expected_fp_1, r"^[0-9a-f]{16}$")
+            self.assertEqual(env_disk_1.get("key_fingerprint"), expected_fp_1)
+            self.assertEqual(os.lstat(env_dir).st_mode & 0o777, 0o700)
+            self.assertEqual(os.lstat(env_file).st_mode & 0o777, 0o600)
+            self.assertEqual(os.lstat(state_file).st_mode & 0o777, 0o600)
+            state_data = json.loads(state_file.read_text(encoding="utf-8"))
+            self.assertEqual(state_data.get("state"), "sealed")
+
+            # 2. Status succeeds and reports envelope_integrity_ok=True, sep_key_recognized=True, lifecycle_state="sealed"
+            st_cp = subprocess.run(
+                [str(TEST_BINARY_PATH), "status", "--service", svc, "--account", acct],
+                env=test_env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertEqual(st_cp.returncode, 0, st_cp.stderr)
+            st_payload = json.loads(st_cp.stdout.strip())
+            self.assertIs(st_payload.get("exists"), True)
+            self.assertIs(st_payload.get("envelope_integrity_ok"), True)
+            self.assertIs(st_payload.get("sep_key_recognized"), True)
+            self.assertEqual(st_payload.get("key_fingerprint"), expected_fp_1)
+
+            # 3. Re-signing a copy of the binary with a different CDHash still reads the file-backed envelope without Keychain prompts
+            resigned_bin = tmp_dir / "se-key-proxy-resigned"
+            shutil.copy2(TEST_BINARY_PATH, resigned_bin)
+            subprocess.run(
+                [
+                    "codesign",
+                    "-f",
+                    "-s",
+                    "-",
+                    "--identifier",
+                    "com.free-inference.resigned-test-cdhash",
+                    str(resigned_bin),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(sha256_file(resigned_bin), sha256_file(TEST_BINARY_PATH))
+            st_resigned = subprocess.run(
+                [str(resigned_bin), "status", "--service", svc, "--account", acct],
+                env=test_env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertEqual(st_resigned.returncode, 0, st_resigned.stderr)
+            self.assertIs(json.loads(st_resigned.stdout.strip()).get("exists"), True)
+
+            # 4. Single-byte mutation of aes_gcm_combined while preserving structural fields and se_private_key_blob is rejected by status (R2-PLAN-MAJOR-1)
+            orig_env_bytes = env_file.read_bytes()
+            env_json = json.loads(orig_env_bytes.decode("utf-8"))
+            raw_ct = bytearray(
+                __import__("base64").b64decode(env_json["aes_gcm_combined"].encode("ascii"))
+            )
+            raw_ct[-1] ^= 0x01
+            env_json["aes_gcm_combined"] = __import__("base64").b64encode(bytes(raw_ct)).decode("ascii")
+            env_file.write_text(json.dumps(env_json), encoding="utf-8")
+            os.chmod(env_file, 0o600)
+            st_tampered = subprocess.run(
+                [str(TEST_BINARY_PATH), "status", "--service", svc, "--account", acct],
+                env=test_env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertNotEqual(st_tampered.returncode, 0)
+            tampered_payload = json.loads(st_tampered.stdout.strip())
+            self.assertIs(tampered_payload.get("exists"), False)
+            self.assertIn("integrity digest mismatch", str(tampered_payload.get("error", "")))
+
+            # 5. Wrong service name in envelope metadata is rejected by status
+            env_json_wrong_svc = json.loads(orig_env_bytes.decode("utf-8"))
+            env_json_wrong_svc["service"] = "free-inference.other-service"
+            env_file.write_text(json.dumps(env_json_wrong_svc), encoding="utf-8")
+            os.chmod(env_file, 0o600)
+            st_wrong_svc = subprocess.run(
+                [str(TEST_BINARY_PATH), "status", "--service", svc, "--account", acct],
+                env=test_env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertNotEqual(st_wrong_svc.returncode, 0)
+
+            # 6. Symlinked envelope file is rejected by status and delete
+            env_file.unlink()
+            dummy_target = tmp_dir / "dummy.json"
+            dummy_target.write_bytes(orig_env_bytes)
+            env_file.symlink_to(dummy_target)
+            st_sym = subprocess.run(
+                [str(TEST_BINARY_PATH), "status", "--service", svc, "--account", acct],
+                env=test_env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertNotEqual(st_sym.returncode, 0)
+            del_sym = subprocess.run(
+                [str(TEST_BINARY_PATH), "delete", "--service", svc, "--account", acct],
+                env=test_env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertNotEqual(del_sym.returncode, 0)
+            env_file.unlink()
+
+            # Restore valid envelope and test seal -> delete -> ensure_envelope_available_or_migrate (R2-PLAN-MAJOR-3)
+            env_file.write_bytes(orig_env_bytes)
+            os.chmod(env_file, 0o600)
+            del_cp = subprocess.run(
+                [str(TEST_BINARY_PATH), "delete", "--service", svc, "--account", acct],
+                env=test_env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertEqual(del_cp.returncode, 0, del_cp.stderr)
+            self.assertFalse(env_file.exists())
+            self.assertEqual(json.loads(state_file.read_text(encoding="utf-8")).get("state"), "deleted")
+
+            # Mock legacy binary that tracks invocations and serves a migrated key
+            legacy_invocations = tmp_dir / "legacy_invocations.log"
+            legacy_secret = "tf-migrated-legacy-secret-2222"
+            expected_legacy_fp = hashlib.sha256(legacy_secret.encode("utf-8")).hexdigest()[:16]
+            pause_flag = tmp_dir / "pause_legacy"
+            legacy_entered = tmp_dir / "legacy_entered"
+            spoof_log = tmp_dir / "spoof_result.json"
+
+            mock_legacy = tmp_dir / "mock_legacy_proxy.py"
+            mock_legacy.write_text(
+                f"#!{sys.executable}\n"
+                f"import http.server, json, os, pathlib, socket, subprocess, sys, threading, time, urllib.request\n"
+                f"inv_log = pathlib.Path({str(legacy_invocations)!r})\n"
+                f"with inv_log.open('a', encoding='utf-8') as f:\n"
+                f"    f.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+                f"cmd = sys.argv[1] if len(sys.argv) > 1 else ''\n"
+                f"if cmd == 'status':\n"
+                f"    print(json.dumps({{'exists': True, 'service': 'mock', 'key_fingerprint': {expected_legacy_fp!r}}}))\n"
+                f"    sys.exit(0)\n"
+                f"if cmd == 'proxy':\n"
+                f"    args = sys.argv[2:]\n"
+                f"    lport = int(args[args.index('--listen-port') + 1])\n"
+                f"    up_url = args[args.index('--upstream-url') + 1]\n"
+                f"    tok_fd = int(args[args.index('--session-token-fd') + 1])\n"
+                f"    ready_fd = int(args[args.index('--ready-fd') + 1])\n"
+                f"    tok = os.read(tok_fd, 256).decode('utf-8').strip()\n"
+                f"    os.close(tok_fd)\n"
+                f"    up_port = int(up_url.split(':')[2].split('/')[0])\n"
+                f"    class H(http.server.BaseHTTPRequestHandler):\n"
+                f"        def log_message(self, *a): pass\n"
+                f"        def do_GET(self):\n"
+                f"            if self.headers.get('Authorization') != f'Bearer {{tok}}':\n"
+                f"                self.send_response(401); self.end_headers(); return\n"
+                f"            # R2-PLAN-MAJOR-2: While se-key-proxy is actively in its collector accept() loop on up_port,\n"
+                f"            # first spawn a separate process (different PID) that sends a spoofed Bearer key to up_port,\n"
+                f"            # and also send a wrong-nonce request from this child PID before forwarding the real request.\n"
+                f"            spoofer = subprocess.Popen([\n"
+                f"                sys.executable, '-c',\n"
+                f"                f\"import pathlib, socket\\n\"\n"
+                f"                f\"try:\\n\"\n"
+                f"                f\"    s = socket.create_connection(('127.0.0.1', {{up_port}}), timeout=2)\\n\"\n"
+                f"                f\"    s.sendall(f'GET {{self.path}} HTTP/1.1\\\\r\\\\nHost: 127.0.0.1\\\\r\\\\nAuthorization: Bearer SPOOFED_OTHER_PID_KEY\\\\r\\\\n\\\\r\\\\n'.encode('utf-8'))\\n\"\n"
+                f"                f\"    data = s.recv(1024).decode('utf-8', errors='replace')\\n\"\n"
+                f"                f\"    s.close()\\n\"\n"
+                f"                f\"except OSError:\\n\"\n"
+                f"                f\"    data = ''\\n\"\n"
+                f"                f\"pathlib.Path({str(spoof_log)!r}).write_text(data)\\n\"\n"
+                f"            ])\n"
+                f"            spoofer.wait(timeout=5)\n"
+                f"            try:\n"
+                f"                with socket.create_connection(('127.0.0.1', up_port), timeout=2) as bad_s:\n"
+                f"                    bad_s.sendall(b'GET /v1/models?nonce=wrongnonce HTTP/1.1\\r\\nHost: 127.0.0.1\\r\\nAuthorization: Bearer SPOOFED_WRONG_NONCE_KEY\\r\\n\\r\\n')\n"
+                f"                    _ = bad_s.recv(1024)\n"
+                f"            except OSError:\n"
+                f"                pass\n"
+                f"            p_flag = pathlib.Path({str(pause_flag)!r})\n"
+                f"            if p_flag.exists():\n"
+                f"                pathlib.Path({str(legacy_entered)!r}).write_text('1')\n"
+                f"                deadline = time.time() + 10.0\n"
+                f"                while p_flag.exists() and time.time() < deadline:\n"
+                f"                    time.sleep(0.02)\n"
+                f"            req = urllib.request.Request(\n"
+                f"                f'http://127.0.0.1:{{up_port}}{{self.path}}',\n"
+                f"                headers={{'Authorization': 'Bearer ' + {legacy_secret!r}}},\n"
+                f"                method='GET',\n"
+                f"            )\n"
+                f"            with urllib.request.urlopen(req, timeout=5) as r:\n"
+                f"                body = r.read()\n"
+                f"            self.send_response(200)\n"
+                f"            self.send_header('Content-Type', 'application/json')\n"
+                f"            self.send_header('Content-Length', str(len(body)))\n"
+                f"            self.end_headers()\n"
+                f"            self.wfile.write(body)\n"
+                f"    srv = http.server.HTTPServer(('127.0.0.1', lport), H)\n"
+                f"    t = threading.Thread(target=srv.serve_forever, daemon=True)\n"
+                f"    t.start()\n"
+                f"    os.write(ready_fd, json.dumps({{'status': 'ready', 'listen_port': lport}}).encode('utf-8') + b'\\n')\n"
+                f"    os.close(ready_fd)\n"
+                f"    time.sleep(30)\n",
+                encoding="utf-8",
+            )
+            os.chmod(mock_legacy, 0o700)
+
+            def _run_with_test_env(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+                merged_env = dict(test_env)
+                if "env" in kwargs and kwargs["env"] is not None:
+                    merged_env.update(kwargs["env"])
+                kwargs["env"] = merged_env
+                return subprocess.run(cmd, **kwargs)
+
+            # 7. Because state is "deleted", ensure_envelope_available_or_migrate with force=False must NOT invoke mock_legacy
+            ok_del, msg_del, _ = ensure_envelope_available_or_migrate(
+                svc,
+                account=acct,
+                se_proxy_bin=TEST_BINARY_PATH,
+                legacy_bin=mock_legacy,
+                force=False,
+                run_cmd=_run_with_test_env,
+            )
+            self.assertFalse(ok_del)
+            self.assertIn("lifecycle_state='deleted'", msg_del)
+            self.assertFalse(legacy_invocations.exists())
+
+            # Direct migrate-from-legacy without --force also refuses when state == "deleted", "sealed", or "migrated" and envelope is absent (WORK-MINOR-1)
+            mig_refused = _run_with_test_env(
+                [
+                    str(TEST_BINARY_PATH),
+                    "migrate-from-legacy",
+                    "--service",
+                    svc,
+                    "--account",
+                    acct,
+                    "--legacy-binary",
+                    str(mock_legacy),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertNotEqual(mig_refused.returncode, 0)
+            self.assertIn("explicitly deleted", mig_refused.stderr)
+            self.assertFalse(legacy_invocations.exists())
+
+            for prior_st in ("sealed", "migrated"):
+                state_Obj = json.loads(state_file.read_text(encoding="utf-8"))
+                state_Obj["state"] = prior_st
+                state_file.write_text(json.dumps(state_Obj), encoding="utf-8")
+                os.chmod(state_file, 0o600)
+                mig_prior_refused = _run_with_test_env(
+                    [
+                        str(TEST_BINARY_PATH),
+                        "migrate-from-legacy",
+                        "--service",
+                        svc,
+                        "--account",
+                        acct,
+                        "--legacy-binary",
+                        str(mock_legacy),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    check=False,
+                )
+                self.assertNotEqual(mig_prior_refused.returncode, 0)
+                self.assertIn(f"missing after prior '{prior_st}' state", mig_prior_refused.stderr)
+                self.assertFalse(legacy_invocations.exists())
+
+            # 8. Remove tombstone to simulate a fresh pre-migration workspace, then run ensure_envelope_available_or_migrate:
+            # verifies R2-PLAN-MAJOR-2 (spoofed PID and wrong-nonce connections rejected, real child secret migrated)
+            state_file.unlink()
+
+            # 8a. R2-PLAN-MAJOR-2 negative control: a legacy helper that ONLY sends the spoofed-PID and wrong-nonce requests
+            # (and fails to forward the real collectorNonce request) is rejected by migrate-from-legacy and writes no envelope.
+            spoof_only_flag = tmp_dir / "spoof_only"
+            spoof_only_flag.write_text("1", encoding="utf-8")
+            mock_legacy_text = mock_legacy.read_text(encoding="utf-8")
+            mock_legacy.write_text(
+                mock_legacy_text.replace(
+                    "            p_flag = pathlib.Path(",
+                    f"            if pathlib.Path({str(spoof_only_flag)!r}).exists():\n"
+                    f"                self.send_response(502); self.end_headers(); os._exit(1)\n"
+                    "            p_flag = pathlib.Path(",
+                ),
+                encoding="utf-8",
+            )
+            os.chmod(mock_legacy, 0o700)
+            mig_spoof_only = _run_with_test_env(
+                [
+                    str(TEST_BINARY_PATH),
+                    "migrate-from-legacy",
+                    "--service",
+                    svc,
+                    "--account",
+                    acct,
+                    "--legacy-binary",
+                    str(mock_legacy),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertNotEqual(mig_spoof_only.returncode, 0)
+            self.assertFalse(env_file.exists())
+            spoof_only_flag.unlink(missing_ok=True)
+            spoof_log.unlink(missing_ok=True)
+
+            # 8b. Positive control: with spoof_only_flag removed, spoofed-PID and wrong-nonce connections are rejected
+            # and the subsequent authenticated child connection succeeds.
+            ok_mig, status_mig, mig_payload = ensure_envelope_available_or_migrate(
+                svc,
+                account=acct,
+                se_proxy_bin=TEST_BINARY_PATH,
+                legacy_bin=mock_legacy,
+                force=False,
+                run_cmd=_run_with_test_env,
+            )
+            self.assertTrue(ok_mig, msg=status_mig)
+            self.assertEqual(status_mig, "migrated")
+            assert isinstance(mig_payload, dict)
+            self.assertRegex(str(mig_payload.get("key_fingerprint") or ""), r"^[0-9a-f]{16}$")
+            self.assertTrue(spoof_log.exists())
+            self.assertEqual(spoof_log.read_text(encoding="utf-8"), "")
+            self.assertTrue(env_file.exists())
+            self.assertEqual(json.loads(state_file.read_text(encoding="utf-8")).get("state"), "migrated")
+
+            # 9. Calling migrate-from-legacy again without --force returns already_migrated without invoking mock_legacy
+            inv_count_before = len(legacy_invocations.read_text(encoding="utf-8").splitlines())
+            mig_again = _run_with_test_env(
+                [
+                    str(TEST_BINARY_PATH),
+                    "migrate-from-legacy",
+                    "--service",
+                    svc,
+                    "--account",
+                    acct,
+                    "--legacy-binary",
+                    str(mock_legacy),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertEqual(mig_again.returncode, 0, mig_again.stderr)
+            self.assertEqual(json.loads(mig_again.stdout.strip()).get("status"), "already_migrated")
+            self.assertEqual(len(legacy_invocations.read_text(encoding="utf-8").splitlines()), inv_count_before)
+
+            # 10. migrate -> delete -> ensure_envelope_available_or_migrate respects "deleted" tombstone (R2-PLAN-MAJOR-3)
+            del_after_mig = _run_with_test_env(
+                [str(TEST_BINARY_PATH), "delete", "--service", svc, "--account", acct],
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertEqual(del_after_mig.returncode, 0)
+            ok_after_del, msg_after_del, _ = ensure_envelope_available_or_migrate(
+                svc,
+                account=acct,
+                se_proxy_bin=TEST_BINARY_PATH,
+                legacy_bin=mock_legacy,
+                force=False,
+                run_cmd=_run_with_test_env,
+            )
+            self.assertFalse(ok_after_del)
+            self.assertIn("lifecycle_state='deleted'", msg_after_del)
+            self.assertEqual(len(legacy_invocations.read_text(encoding="utf-8").splitlines()), inv_count_before)
+
+            # 11. R3-PLAN-MAJOR-1: Overlapping migration + concurrent delete test:
+            # Start migrate-from-legacy on a clean stem, pause inside mock_legacy after initial eligibility check,
+            # run `delete` to completion while migration is in flight, resume mock_legacy, and verify migrate-from-legacy
+            # aborts publication with a concurrent-modification error, leaving <stem>.json absent and state == "deleted".
+            state_file.unlink(missing_ok=True)
+            env_file.unlink(missing_ok=True)
+            pause_flag.write_text("1", encoding="utf-8")
+            legacy_entered.unlink(missing_ok=True)
+
+            mig_proc = subprocess.Popen(
+                [
+                    str(TEST_BINARY_PATH),
+                    "migrate-from-legacy",
+                    "--service",
+                    svc,
+                    "--account",
+                    acct,
+                    "--legacy-binary",
+                    str(mock_legacy),
+                ],
+                env=test_env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            try:
+                deadline = time.monotonic() + 10.0
+                while not legacy_entered.exists() and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertTrue(legacy_entered.exists(), "mock_legacy did not reach pause point")
+
+                # Execute concurrent delete while migrate-from-legacy is waiting on mock_legacy
+                concur_del = _run_with_test_env(
+                    [str(TEST_BINARY_PATH), "delete", "--service", svc, "--account", acct],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+                self.assertEqual(concur_del.returncode, 0, concur_del.stderr)
+                self.assertEqual(json.loads(state_file.read_text(encoding="utf-8")).get("state"), "deleted")
+
+                # Resume mock_legacy and wait for migrate-from-legacy to finish
+                pause_flag.unlink(missing_ok=True)
+                mig_out, mig_err = mig_proc.communicate(timeout=15)
+            finally:
+                pause_flag.unlink(missing_ok=True)
+                if mig_proc.poll() is None:
+                    mig_proc.kill()
+                    mig_proc.wait(timeout=3)
+
+            self.assertNotEqual(mig_proc.returncode, 0, f"Expected failure, got stdout={mig_out} stderr={mig_err}")
+            self.assertIn("concurrent seal or delete modified envelope state", mig_err)
+            self.assertFalse(env_file.exists())
+            self.assertEqual(json.loads(state_file.read_text(encoding="utf-8")).get("state"), "deleted")
+
+            # 12. WORK-MINOR-2: Directory synchronization failure reports partial publication error rather than success
+            fsync_fail_env = {**test_env, "SE_KEY_TEST_FAIL_FSYNC_DIR": "1"}
+            seal_fsync_fail = subprocess.run(
+                [str(TEST_BINARY_PATH), "seal", "--service", svc, "--account", acct, "--secret-fd", "0"],
+                input="sk-fsync-fail\n",
+                env=fsync_fail_env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertNotEqual(seal_fsync_fail.returncode, 0)
+            self.assertIn("partial publication", seal_fsync_fail.stderr)
+
+            del_fsync_fail = subprocess.run(
+                [str(TEST_BINARY_PATH), "delete", "--service", svc, "--account", acct],
+                env=fsync_fail_env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+                check=False,
+            )
+            self.assertNotEqual(del_fsync_fail.returncode, 0)
+            self.assertIn("partial publication", del_fsync_fail.stderr)
+
+            # 13. WORK-MAJOR-2: Preserving a verified legacy backup is a prerequisite to replacing a release matching EXPECTED_LEGACY_BINARY_SHA256
+            leg_test_dir = tmp_dir / "leg_bin_dir"
+            leg_test_dir.mkdir(mode=0o755)
+            fake_legacy_bytes = b"fake-v010-legacy-binary"
+            fake_legacy_sha = hashlib.sha256(fake_legacy_bytes).hexdigest()
+            rel_in_dir = leg_test_dir / "se-key-proxy"
+            rel_in_dir.write_bytes(fake_legacy_bytes)
+            os.chmod(rel_in_dir, 0o755)
+            leg_backup_in_dir = leg_test_dir / ".se-key-proxy-legacy"
+
+            with unittest.mock.patch("local_assist.se_key.EXPECTED_LEGACY_BINARY_SHA256", fake_legacy_sha):
+                # 13a. Symlink or directory at .se-key-proxy-legacy aborts before replacing release_bin
+                leg_backup_in_dir.symlink_to(tmp_dir / "nonexistent")
+                with unittest.mock.patch("local_assist.se_key._compile_and_install_binary_atomically") as mock_compile:
+                    with self.assertRaisesRegex(SEKeyIntegrityError, "not a regular file"):
+                        build_se_key_proxy(bin_dir=leg_test_dir, force=True)
+                    mock_compile.assert_not_called()
+                self.assertEqual(rel_in_dir.read_bytes(), fake_legacy_bytes)
+                leg_backup_in_dir.unlink()
+
+                # 13b. Fault-injected os.replace failure during backup preservation aborts before replacing release_bin
+                with (
+                    unittest.mock.patch("local_assist.se_key.os.replace", side_effect=OSError("disk error preserving backup")),
+                    unittest.mock.patch("local_assist.se_key._compile_and_install_binary_atomically") as mock_compile,
+                ):
+                    with self.assertRaisesRegex(SEKeyIntegrityError, "failed to preserve verified backup"):
+                        build_se_key_proxy(bin_dir=leg_test_dir, force=True)
+                    mock_compile.assert_not_called()
+                self.assertEqual(rel_in_dir.read_bytes(), fake_legacy_bytes)
+
+                # 13c. Corrupt existing .se-key-proxy-legacy is overwritten with a verified copy before _compile_and_install_binary_atomically runs
+                leg_backup_in_dir.write_bytes(b"corrupt-backup")
+                os.chmod(leg_backup_in_dir, 0o755)
+                with unittest.mock.patch(
+                    "local_assist.se_key._compile_and_install_binary_atomically",
+                    return_value="a" * 64,
+                ) as mock_compile:
+                    build_se_key_proxy(bin_dir=leg_test_dir, force=True)
+                    mock_compile.assert_called_once()
+                self.assertEqual(leg_backup_in_dir.read_bytes(), fake_legacy_bytes)
+
+    def test_swiftpm_package_manifest_and_build_probe(self) -> None:
+        pkg_dir = ROOT / "tools" / "se_key_proxy"
+        pkg_manifest = pkg_dir / "Package.swift"
+        self.assertTrue(pkg_manifest.is_file(), f"Missing SwiftPM manifest: {pkg_manifest}")
+        had_repo_dot_build = (pkg_dir / ".build").exists()
+
+        dump_cp = subprocess.run(
+            ["swift", "package", "--package-path", str(pkg_dir), "dump-package"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        self.assertEqual(dump_cp.returncode, 0, dump_cp.stderr)
+        pkg_json = json.loads(dump_cp.stdout)
+        self.assertEqual(pkg_json.get("name"), "se-key-proxy")
+        targets = pkg_json.get("targets") or []
+        self.assertEqual(len(targets), 1)
+        self.assertEqual(targets[0].get("name"), "se-key-proxy")
+        self.assertEqual(targets[0].get("type"), "executable")
+        self.assertEqual(targets[0].get("sources"), ["main.swift"])
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            isolated_pkg_dir = tmp_path / "pkg"
+            isolated_pkg_dir.mkdir(mode=0o755)
+            shutil.copy2(pkg_manifest, isolated_pkg_dir / "Package.swift")
+            shutil.copy2(pkg_dir / "main.swift", isolated_pkg_dir / "main.swift")
+
+            # R3-WORK-MINOR-1: Verify pre-existing .build directory in package path is preserved untouched when using --scratch-path
+            preexisting_build_dir = isolated_pkg_dir / ".build"
+            preexisting_build_dir.mkdir(mode=0o755)
+            sentinel_file = preexisting_build_dir / "operator-sentinel.txt"
+            sentinel_file.write_text("preserve-me\n", encoding="utf-8")
+
+            scratch_dir = tmp_path / "swiftpm-build"
+            build_cp = subprocess.run(
+                [
+                    "swift",
+                    "build",
+                    "--package-path",
+                    str(isolated_pkg_dir),
+                    "--scratch-path",
+                    str(scratch_dir),
+                    "-c",
+                    "release",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                check=False,
+            )
+            self.assertEqual(build_cp.returncode, 0, build_cp.stderr)
+            bin_path_cp = subprocess.run(
+                [
+                    "swift",
+                    "build",
+                    "--package-path",
+                    str(isolated_pkg_dir),
+                    "--scratch-path",
+                    str(scratch_dir),
+                    "-c",
+                    "release",
+                    "--show-bin-path",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            self.assertEqual(bin_path_cp.returncode, 0, bin_path_cp.stderr)
+            built_bin = Path(bin_path_cp.stdout.strip()) / "se-key-proxy"
+            self.assertTrue(built_bin.is_file(), f"Built SwiftPM executable missing at {built_bin}")
+
+            smoke_cp = subprocess.run(
+                [str(built_bin)],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            self.assertEqual(smoke_cp.returncode, 2, smoke_cp.stderr)
+            self.assertIn("usage: se-key-proxy", smoke_cp.stderr)
+            self.assertEqual(sentinel_file.read_text(encoding="utf-8"), "preserve-me\n")
+            self.assertEqual(list(preexisting_build_dir.iterdir()), [sentinel_file])
+            self.assertEqual((pkg_dir / ".build").exists(), had_repo_dot_build)
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+from datetime import datetime
 import hashlib
 import json
 import math
@@ -398,13 +399,31 @@ def format_session_banner(
         if max_session_usd is not None
         else "no pre-flight --max-session-usd cap set"
     )
+    ttl_val = session_meta["ttl_seconds"]
+    ttl_str = str(ttl_val)
+    started_at = session_meta.get("started_at")
+    if session_meta.get("attached") and isinstance(started_at, str) and started_at.strip():
+        try:
+            started_dt = datetime.strptime(started_at.strip(), "%Y-%m-%dT%H:%M:%S%z")
+            now_dt = datetime.now(started_dt.tzinfo)
+            elapsed = max(0, int(now_dt.timestamp() - started_dt.timestamp()))
+            rem_sec = max(0, int(ttl_val) - elapsed)
+            rem_h = rem_sec // 3600
+            rem_m = (rem_sec % 3600) // 60
+            ttl_str = f"{ttl_val} (~{rem_h}h {rem_m}m remaining)"
+        except Exception:
+            ttl_str = str(ttl_val)
     lines = [
         f"[private-attested] Model: {endpoint.model_id} (served_model_id={endpoint.served_model_id}, {mode_str} at {endpoint.api_base_url})",
         f"[private-attested] Data-control rung: Rung {endpoint.data_control_rung} ({endpoint.trust_tier}, attestation={endpoint.attestation_method}, usage_policy={endpoint.usage_policy})",
         f"[private-attested] Data-control notice: workspace files read by the agent, approved bash outputs, conversation history, and local_assist MCP tool outputs (auto-allowed via 'local_assist*: allow' without an interactive prompt) returned to the planner are sent to the attested enclave under Rung {endpoint.data_control_rung} and {endpoint.usage_policy}.",
-        f"[private-attested] Session caps: max_chat_requests={session_meta['max_chat_requests']} (includes small_model title requests), max_tokens_cap={session_meta['max_tokens_cap']}, max_request_bytes={session_meta['max_request_bytes']}, ttl_seconds={session_meta['ttl_seconds']}",
+        f"[private-attested] Session caps: max_chat_requests={session_meta['max_chat_requests']} (includes small_model title requests), max_tokens_cap={session_meta['max_tokens_cap']}, max_request_bytes={session_meta['max_request_bytes']}, ttl_seconds={ttl_str}",
         f"[private-attested] Pricing: ${session_meta['input_price_per_m']:.2f}/1M input, ${session_meta['output_price_per_m']:.2f}/1M output ({ceiling_str})",
     ]
+    if session_meta.get("attached"):
+        lines.append(
+            "[private-attested] To refresh the 12h session: ./scripts/opencode-attested --refresh-session"
+        )
     return "\n".join(lines)
 
 
@@ -499,6 +518,7 @@ def ensure_model_served(
     endpoint: EndpointConfig,
     *,
     no_serve: bool = False,
+    refresh_session: bool = False,
     wait_seconds: float = DEFAULT_WAIT_SECONDS,
     max_chat_requests: int = DEFAULT_MAX_CHAT_REQUESTS,
     max_tokens_cap: int = DEFAULT_MAX_TOKENS_CAP,
@@ -509,6 +529,13 @@ def ensure_model_served(
     runs_dir: Path | None = None,
     run_cmd: Any = subprocess.run,
 ) -> tuple[bool, str | None, dict[str, Any] | None]:
+    if refresh_session and no_serve:
+        return (
+            False,
+            "Refusing --refresh-session (--restart) with --no-serve: refreshing a session requires starting a server/proxy.",
+            None,
+        )
+
     # Validate requested caps against spend ceiling before touching any server or Touch ID
     try:
         cli_est = check_session_spend_ceiling(
@@ -524,6 +551,7 @@ def ensure_model_served(
 
     verify_script = str(ROOT / "scripts" / "verify-served-model")
     serve_script = str(ROOT / "scripts" / "serve-model")
+    stop_script = str(ROOT / "scripts" / "stop-model")
 
     initial = run_cmd(
         [verify_script, endpoint.model_id],
@@ -532,7 +560,7 @@ def ensure_model_served(
         text=True,
         check=False,
     )
-    if initial.returncode == 0:
+    if initial.returncode == 0 and not refresh_session:
         active_rec = read_pid_record_for_model(endpoint.model_id, runs_dir)
         try:
             rec_max_reqs, rec_max_bytes, rec_max_tokens, rec_ttl = (
@@ -595,6 +623,7 @@ def ensure_model_served(
                 **attached_est,
                 "attached": True,
                 "ttl_seconds": rec_ttl,
+                "started_at": (active_rec or {}).get("started_at"),
             },
         )
 
@@ -607,6 +636,24 @@ def ensure_model_served(
             "with ./scripts/stop-model <active-model-id>.",
             None,
         )
+
+    if refresh_session and (
+        initial.returncode == 0 or read_pid_record_for_model(endpoint.model_id, runs_dir) is not None
+    ):
+        stop_res = run_cmd(
+            [stop_script, endpoint.model_id],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if stop_res.returncode != 0:
+            stop_err = (stop_res.stderr or stop_res.stdout or "").strip()
+            return (
+                False,
+                f"Failed to stop active session for '{endpoint.model_id}' during --refresh-session: {stop_err}",
+                None,
+            )
 
     if no_serve:
         return (
@@ -630,6 +677,8 @@ def ensure_model_served(
         "--stream-timeout-seconds",
         str(stream_timeout_seconds),
     ]
+    if refresh_session:
+        serve_cmd.append("--refresh-session")
     serve_res = run_cmd(
         serve_cmd,
         cwd=str(ROOT),
@@ -912,6 +961,7 @@ def main(argv: list[str]) -> int:
     ok, err_msg, session_meta = ensure_model_served(
         endpoint_pre,
         no_serve=effective_no_serve,
+        refresh_session=bool(getattr(args, "refresh_session", False)),
         wait_seconds=args.wait,
         max_chat_requests=eff_max_reqs,
         max_tokens_cap=eff_max_tokens,

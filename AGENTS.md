@@ -22,7 +22,7 @@ Read these documents before making changes:
    - `scripts/opencode-attested` never exports `LOCAL_ASSIST_ALLOW_ATTESTED_TEE` into child environments, keeping `local_assist` MCP sub-calls pinned to Rung 1 (`http://127.0.0.1:8080/v1`).
 3. **Loopback-only servers and hardware-backed key sealing**:
    - All local servers and proxies bind explicitly to `127.0.0.1`, `localhost`, or `[::1]`.
-   - Remote API keys on Rungs 2-5 use `promptfoo_provider.apiKeyKeychainService` (`free-inference.<service>` sealed in the Apple Silicon Secure Enclave via `./scripts/se-key store <service>`) and are unsealed into `bin/se-key-proxy` memory via a single live Touch ID tap per session. Plaintext `apiKey` and `apiKeyEnvar` are rejected on non-local rungs.
+   - Remote API keys on Rungs 2-5 use `promptfoo_provider.apiKeyKeychainService` (`free-inference.<service>` sealed in the Apple Silicon Secure Enclave via `./scripts/se-key store <service>` or migrated via `./scripts/se-key migrate <service>`, with the outer ECIES ciphertext envelope stored in `~/.config/free-inference/se-envelopes/` at mode `0700`/`0600`) and are unsealed into `bin/se-key-proxy` memory via a single live Touch ID tap per session. Plaintext `apiKey` and `apiKeyEnvar` are rejected on non-local rungs.
 4. **Process-identity and offline verification**:
    - Active servers record `pid` and `pid_lstart` (plus `upstream_pid` and `upstream_pid_lstart` for dual proxies) in `runs/.serve*.pid`.
    - `scripts/verify-served-model` verifies `pid_lstart`, `/v1/models`, and live OS listener `--model` flags (`lsof` + `ps`) before any chat call can hot-swap `mlx_lm.server`, and `--require-offline` enforces `hf_offline: true` (`HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`) for Rung 1 coding sessions.
@@ -34,11 +34,11 @@ Read these documents before making changes:
 
 - Bootstrap & verify dependencies: `./scripts/setup`
 - List registered models: `./scripts/models`
-- Check or heal upstream model catalog drift (also tracked weekly via `.github/workflows/catalog-sync.yml` issues on `https://github.com/HakAl/free-inference/issues`):
+- Check or heal upstream model catalog drift (also tracked weekly via `.github/workflows/catalog-sync.yml` issues on `https://github.com/HakAl/free-inference/issues` or `gh issue list --repo HakAl/free-inference --state open`):
   - `./scripts/sync-model-catalog --check`
   - `./scripts/sync-model-catalog --apply`
-- Launch Rung 1 local coding session (from target project directory): `/path/to/free-inference/scripts/opencode-local`
-- Launch Rung 3 attested enclave coding session (from target project directory): `/path/to/free-inference/scripts/opencode-attested`
+- Launch Rung 1 local coding session (from target project directory): `/path/to/free-inference/scripts/opencode-local` (pass `--refresh-session` to restart the server)
+- Launch Rung 3 attested enclave coding session (from target project directory): `/path/to/free-inference/scripts/opencode-attested` (pass `--refresh-session` to renew the 12h Touch ID proxy session)
 - Launch unattended sandboxed worker (Rung 1 or Rung 3):
   - `/path/to/free-inference/scripts/opencode-local --unattended-worker -- run --format json "<prompt>"`
   - `/path/to/free-inference/scripts/opencode-attested --security-profile <profile.yaml> --max-session-usd 0.50 -- run --format json "<prompt>"`

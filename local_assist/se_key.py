@@ -16,9 +16,12 @@ SWIFT_SOURCE_PATH = ROOT / "tools" / "se_key_proxy" / "main.swift"
 BIN_DIR = ROOT / "bin"
 RELEASE_BINARY_PATH = BIN_DIR / "se-key-proxy"
 TEST_BINARY_PATH = BIN_DIR / "se-key-proxy-test"
+LEGACY_BINARY_PATH = BIN_DIR / ".se-key-proxy-legacy"
 STAMP_PATH = BIN_DIR / ".se-key-proxy.stamp"
 
-EXPECTED_SWIFT_SOURCE_SHA256 = "6d5ded2f446ae3ab873e5be61325a9ffad2457a9289f85264f9def7b81858947"
+EXPECTED_SWIFT_SOURCE_SHA256 = "0b549dce5ee1cba2d772714bd02558b0313f0d5b154163b594e408c6ac412e18"
+EXPECTED_LEGACY_BINARY_SHA256 = "012f4414ad3c9889915aaf9318e77d28d145b3a973ecf190fe7b017342fe04c2"
+DEFAULT_ENVELOPE_ACCOUNT = "free-inference"
 SKIP_EXIT_CODE = 77
 SESSION_TOKEN_REDACT_RE = re.compile(r"se-session-[A-Za-z0-9_-]{16,}")
 SESSION_TOKEN_BYTES_RE = re.compile(rb"se-session-[A-Za-z0-9_-]{16,}")
@@ -375,6 +378,64 @@ def build_se_key_proxy(
     if reuse_existing_release:
         release_sha = sha256_file(release_bin)
     else:
+        legacy_bin = target_dir / ".se-key-proxy-legacy"
+        if release_bin.is_file() and not release_bin.is_symlink():
+            try:
+                current_rel_sha = sha256_file(release_bin)
+            except OSError as exc:
+                raise SEKeyIntegrityError(
+                    f"Failed to read existing release binary {release_bin} before build: {exc}"
+                ) from exc
+            if current_rel_sha == EXPECTED_LEGACY_BINARY_SHA256:
+                backup_valid = False
+                if legacy_bin.is_symlink() or (legacy_bin.exists() and not legacy_bin.is_file()):
+                    raise SEKeyIntegrityError(
+                        f"Refusing to replace legacy se-key-proxy release at {release_bin}: "
+                        f"existing backup path {legacy_bin} is not a regular file."
+                    )
+                if legacy_bin.is_file():
+                    try:
+                        if (
+                            sha256_file(legacy_bin) == EXPECTED_LEGACY_BINARY_SHA256
+                            and os.access(legacy_bin, os.X_OK)
+                        ):
+                            backup_valid = True
+                    except OSError:
+                        backup_valid = False
+                if not backup_valid:
+                    tmp_leg: Path | None = None
+                    try:
+                        fd_leg, tmp_leg_str = tempfile.mkstemp(
+                            prefix=".se-key-proxy-leg-", dir=str(target_dir)
+                        )
+                        tmp_leg = Path(tmp_leg_str)
+                        data_bytes = release_bin.read_bytes()
+                        with os.fdopen(fd_leg, "wb") as leg_handle:
+                            leg_handle.write(data_bytes)
+                            leg_handle.flush()
+                            os.fsync(leg_handle.fileno())
+                        os.chmod(tmp_leg, 0o755)
+                        os.replace(str(tmp_leg), str(legacy_bin))
+                        if (
+                            not legacy_bin.is_file()
+                            or legacy_bin.is_symlink()
+                            or sha256_file(legacy_bin) != EXPECTED_LEGACY_BINARY_SHA256
+                            or not os.access(legacy_bin, os.X_OK)
+                        ):
+                            raise SEKeyIntegrityError(
+                                f"Failed to verify preserved legacy binary at {legacy_bin} before replacing {release_bin}."
+                            )
+                    except OSError as exc:
+                        raise SEKeyIntegrityError(
+                            f"Refusing to replace legacy se-key-proxy release at {release_bin}: "
+                            f"failed to preserve verified backup at {legacy_bin}: {exc}"
+                        ) from exc
+                    finally:
+                        if tmp_leg is not None and tmp_leg.exists():
+                            try:
+                                tmp_leg.unlink()
+                            except OSError:
+                                pass
         release_sha = _compile_and_install_binary_atomically(
             ["swiftc", "-O", str(src)],
             release_bin,
@@ -495,3 +556,131 @@ def verify_se_key_proxy_binary(
             f"codesign verification failed for {target_bin}: {(cs.stderr or cs.stdout).strip()}"
         )
     return target_bin.resolve()
+
+
+def ensure_envelope_available_or_migrate(
+    service: str,
+    *,
+    account: str = DEFAULT_ENVELOPE_ACCOUNT,
+    se_proxy_bin: Path | None = None,
+    legacy_bin: Path | None = None,
+    force: bool = False,
+    run_cmd: Any = subprocess.run,
+) -> tuple[bool, str, dict[str, Any] | None]:
+    """Verify file-backed envelope availability or migrate from legacy Keychain helper.
+
+    Discovery order:
+    1. When force=False, check new file-backed `se-key-proxy status` first (never touches Keychain).
+       If exit 0, return (True, "ready", payload).
+    2. If lifecycle_state != "none" (e.g. "deleted", "sealed", "migrated"), do not auto-migrate;
+       fail closed so deliberate deletions or prior states are never auto-overwritten.
+    3. Only when lifecycle_state == "none" (or force=True), check `legacy_bin` status first and
+       then invoke `se-key-proxy migrate-from-legacy` so raw key custody stays inside the
+       PT_DENY_ATTACH Swift helper.
+    """
+    target_bin = se_proxy_bin if se_proxy_bin is not None else verify_se_key_proxy_binary()
+    status_payload: dict[str, Any] | None = None
+
+    if not force:
+        st_cp = run_cmd(
+            [str(target_bin), "status", "--service", service, "--account", account],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        raw_out = (st_cp.stdout or "").strip()
+        if raw_out:
+            try:
+                parsed = json.loads(raw_out)
+                if isinstance(parsed, dict):
+                    status_payload = parsed
+            except json.JSONDecodeError:
+                status_payload = None
+
+        if st_cp.returncode == 0 and isinstance(status_payload, dict) and status_payload.get("exists") is True:
+            return True, "ready", status_payload
+
+        lifecycle_state = (
+            str(status_payload.get("lifecycle_state") or "none")
+            if isinstance(status_payload, dict)
+            else "unknown"
+        )
+        if lifecycle_state != "none":
+            err_detail = (
+                str(status_payload.get("error") or "")
+                if isinstance(status_payload, dict)
+                else (st_cp.stderr or st_cp.stdout or "").strip()
+            )
+            return (
+                False,
+                f"Envelope for '{service}' is not available (lifecycle_state='{lifecycle_state}': {err_detail}). "
+                f"Run './scripts/se-key store {service}' to seal a key or './scripts/se-key migrate {service} --force' to re-import from legacy Keychain.",
+                status_payload,
+            )
+
+    leg_path = legacy_bin if legacy_bin is not None else LEGACY_BINARY_PATH
+    if not leg_path.is_file() or leg_path.is_symlink():
+        return (
+            False,
+            f"No sealed envelope found for '{service}'. Run './scripts/se-key store {service}' first.",
+            status_payload,
+        )
+    if legacy_bin is None:
+        actual_leg_sha = sha256_file(leg_path)
+        if actual_leg_sha != EXPECTED_LEGACY_BINARY_SHA256:
+            return (
+                False,
+                f"Legacy Keychain helper at {leg_path} failed SHA-256 verification "
+                f"(expected {EXPECTED_LEGACY_BINARY_SHA256}, got {actual_leg_sha}). "
+                f"Run './scripts/se-key store {service}' to seal your API key directly.",
+                status_payload,
+            )
+
+    leg_st = run_cmd(
+        [str(leg_path), "status", "--service", service, "--account", account],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if leg_st.returncode != 0:
+        return (
+            False,
+            f"No sealed envelope found for '{service}'. Run './scripts/se-key store {service}' first.",
+            status_payload,
+        )
+
+    mig_cmd = [
+        str(target_bin),
+        "migrate-from-legacy",
+        "--service",
+        service,
+        "--account",
+        account,
+        "--legacy-binary",
+        str(leg_path.resolve()),
+    ]
+    if force:
+        mig_cmd.append("--force")
+
+    mig_cp = run_cmd(
+        mig_cmd,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    mig_out = (mig_cp.stdout or "").strip()
+    mig_payload: dict[str, Any] | None = None
+    if mig_out:
+        try:
+            parsed_mig = json.loads(mig_out)
+            if isinstance(parsed_mig, dict):
+                mig_payload = parsed_mig
+        except json.JSONDecodeError:
+            mig_payload = None
+
+    if mig_cp.returncode == 0 and isinstance(mig_payload, dict):
+        mig_status = str(mig_payload.get("status") or "migrated")
+        return True, mig_status, mig_payload
+
+    mig_err = (mig_cp.stderr or mig_cp.stdout or "migration failed").strip()
+    return False, f"Legacy Keychain envelope migration failed for '{service}': {mig_err}", mig_payload

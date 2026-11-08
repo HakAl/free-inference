@@ -94,6 +94,7 @@ DEFAULT_CREDENTIAL_DENY_RELPATHS: tuple[str, ...] = (
     ".ssh",
     ".aws",
     ".azure",
+    ".config/free-inference",
     ".config/gcloud",
     ".config/gh",
     ".codex",

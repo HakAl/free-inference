@@ -176,11 +176,20 @@ def ensure_model_served(
     endpoint: EndpointConfig,
     *,
     no_serve: bool = False,
+    refresh_session: bool = False,
     wait_seconds: float = DEFAULT_WAIT_SECONDS,
+    runs_dir: Path | None = None,
     run_cmd: Any = subprocess.run,
 ) -> tuple[bool, str | None]:
+    if refresh_session and no_serve:
+        return (
+            False,
+            "Refusing --refresh-session (--restart) with --no-serve: refreshing a session requires starting a server/proxy.",
+        )
+
     verify_script = str(ROOT / "scripts" / "verify-served-model")
     serve_script = str(ROOT / "scripts" / "serve-model")
+    stop_script = str(ROOT / "scripts" / "stop-model")
 
     initial = run_cmd(
         [verify_script, endpoint.model_id, "--require-offline"],
@@ -189,7 +198,7 @@ def ensure_model_served(
         text=True,
         check=False,
     )
-    if initial.returncode == 0:
+    if initial.returncode == 0 and not refresh_session:
         return True, None
 
     initial_err = (initial.stderr or initial.stdout or "").strip()
@@ -202,6 +211,23 @@ def ensure_model_served(
             "with ./scripts/stop-model <active-model-id>.",
         )
 
+    if refresh_session and (
+        initial.returncode == 0 or read_pid_record_for_model(endpoint.model_id, runs_dir) is not None
+    ):
+        stop_res = run_cmd(
+            [stop_script, endpoint.model_id],
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if stop_res.returncode != 0:
+            stop_err = (stop_res.stderr or stop_res.stdout or "").strip()
+            return (
+                False,
+                f"Failed to stop active server for '{endpoint.model_id}' during --refresh-session: {stop_err}",
+            )
+
     if no_serve:
         return (
             False,
@@ -209,8 +235,11 @@ def ensure_model_served(
             f"and --no-serve was set ({initial_err}).",
         )
 
+    serve_cmd = [serve_script, endpoint.model_id]
+    if refresh_session:
+        serve_cmd.append("--refresh-session")
     serve_res = run_cmd(
-        [serve_script, endpoint.model_id],
+        serve_cmd,
         cwd=str(ROOT),
         capture_output=True,
         text=True,
@@ -344,6 +373,7 @@ def main(argv: list[str]) -> int:
     ok, err_msg = ensure_model_served(
         endpoint,
         no_serve=args.no_serve,
+        refresh_session=bool(getattr(args, "refresh_session", False)),
         wait_seconds=args.wait,
     )
     if not ok:

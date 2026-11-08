@@ -37,6 +37,7 @@ from local_assist.registry import (
     load_model,
     pid_file_for_model,
     pid_is_alive,
+    pid_is_zombie,
     pid_matches_record,
     read_pid_record_for_model,
     resolve_endpoint,
@@ -45,6 +46,7 @@ from local_assist.registry import (
 )
 from local_assist.se_key import (
     SEKeyIntegrityError,
+    ensure_envelope_available_or_migrate,
     verify_se_key_proxy_binary,
 )
 
@@ -79,6 +81,98 @@ def _require_process_lstart(pid: int) -> str:
     if not lstart:
         raise RuntimeError(f"Could not determine process start time (lstart) for pid={pid}")
     return lstart
+
+
+def _classify_pid_state(pid: Any, expected_lstart: Any) -> str:
+    if (
+        not isinstance(pid, int)
+        or isinstance(pid, bool)
+        or pid <= 0
+        or not _pid_is_alive(pid)
+        or pid_is_zombie(pid)
+    ):
+        return "dead"
+    if not isinstance(expected_lstart, str) or not expected_lstart.strip():
+        return "unavailable"
+    actual_lstart = get_process_lstart(pid)
+    if not isinstance(actual_lstart, str) or not actual_lstart.strip():
+        if not _pid_is_alive(pid) or pid_is_zombie(pid):
+            return "dead"
+        return "unavailable"
+    if actual_lstart.strip() == expected_lstart.strip():
+        return "matched"
+    return "reused"
+
+
+def _terminate_verified_pid(
+    pid: int,
+    expected_lstart: str | None,
+    *,
+    timeout_sec: float = 5.0,
+) -> tuple[bool, str | None]:
+    state = _classify_pid_state(pid, expected_lstart)
+    if state in ("dead", "reused"):
+        return True, None
+    if state == "unavailable":
+        return False, f"process identity (lstart) unavailable for pid={pid}"
+
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True, None
+    except OSError as exc:
+        return False, f"failed to send SIGTERM to pid={pid}: {exc}"
+
+    deadline = time.monotonic() + max(0.05, timeout_sec)
+    while time.monotonic() < deadline:
+        st = _classify_pid_state(pid, expected_lstart)
+        if st in ("dead", "reused"):
+            return True, None
+        if st == "unavailable":
+            return (
+                False,
+                f"process identity (lstart) became unavailable for pid={pid} before exit could be confirmed",
+            )
+        time.sleep(0.05)
+
+    st = _classify_pid_state(pid, expected_lstart)
+    if st in ("dead", "reused"):
+        return True, None
+    if st == "unavailable":
+        return (
+            False,
+            f"process identity (lstart) became unavailable for pid={pid} before SIGKILL",
+        )
+
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return True, None
+    except OSError as exc:
+        return False, f"failed to send SIGKILL to pid={pid}: {exc}"
+
+    kill_deadline = time.monotonic() + 1.0
+    while time.monotonic() < kill_deadline:
+        st2 = _classify_pid_state(pid, expected_lstart)
+        if st2 in ("dead", "reused"):
+            return True, None
+        if st2 == "unavailable":
+            return (
+                False,
+                f"process identity (lstart) became unavailable for pid={pid} after SIGKILL",
+            )
+        time.sleep(0.05)
+
+    return False, f"process pid={pid} did not exit after SIGTERM/SIGKILL"
+
+
+def _wait_for_port_unbind(host: str, port: int, timeout_sec: float = 5.0) -> bool:
+    deadline = time.monotonic() + max(0.05, timeout_sec)
+    while time.monotonic() < deadline:
+        if not _port_is_bound(host, port):
+            return True
+        time.sleep(0.05)
+    return not _port_is_bound(host, port)
 
 
 def _port_is_bound(host: str, port: int) -> bool:
@@ -408,6 +502,14 @@ def main(argv: list[str]) -> int:
         default=300,
         help="Maximum total duration in seconds for a single proxied request/stream in se-key-proxy (default: 300).",
     )
+    parser.add_argument(
+        "--refresh-session",
+        "--restart",
+        dest="refresh_session",
+        action="store_true",
+        default=False,
+        help="Stop any active server/proxy session for this model on the target port and start a fresh session.",
+    )
     args = parser.parse_args(argv[1:])
 
     chat_template_args_override = None
@@ -518,40 +620,77 @@ def main(argv: list[str]) -> int:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         same_model_record: dict[str, Any] | None = None
         legacy_port_record: dict[str, Any] | None = None
+        orphaned_same_model_records: list[dict[str, Any]] = []
         for _, rec in list_pid_records(RUNS):
             rec_pid = rec.get("pid")
             rec_up_pid = rec.get("upstream_pid")
             rec_port = rec.get("port", DEFAULT_PORT)
+            rec_up_port = rec.get("upstream_port")
             rec_model_id = rec.get("model_id")
-            if isinstance(rec_pid, int) and rec_port == port and rec_pid > 0:
-                rec_lstart = rec.get("pid_lstart")
-                rec_up_lstart = rec.get("upstream_pid_lstart")
-                if _pid_is_alive(rec_pid) and (
-                    not (isinstance(rec_lstart, str) and rec_lstart.strip())
-                    or (
-                        isinstance(rec_up_pid, int)
-                        and _pid_is_alive(rec_up_pid)
-                        and not (isinstance(rec_up_lstart, str) and rec_up_lstart.strip())
-                    )
-                ):
-                    legacy_port_record = rec
-                alive = _pid_is_alive(rec_pid) and pid_matches_record(rec_pid, rec_lstart)
-                if alive and isinstance(rec_up_pid, int) and not (
-                    _pid_is_alive(rec_up_pid) and pid_matches_record(rec_up_pid, rec_up_lstart)
-                ):
-                    alive = False
-                if alive and rec_model_id:
-                    if rec_model_id != endpoint.model_id:
-                        print(
-                            f"Refusing to start '{endpoint.model_id}' on port {port}: "
-                            f"another model ('{rec_model_id}', pid={rec_pid}) is already active on port {port}. "
-                            f"Run ./scripts/stop-model {rec_model_id} first.",
-                            file=sys.stderr,
-                        )
-                        return 3
-                    same_model_record = rec
+            if rec_port != port and (upstream_port is None or rec_up_port != upstream_port):
+                continue
 
-        if same_model_record is not None:
+            rec_lstart = rec.get("pid_lstart")
+            rec_up_lstart = rec.get("upstream_pid_lstart")
+            pid_state = _classify_pid_state(rec_pid, rec_lstart)
+            has_up_pid = isinstance(rec_up_pid, int) and not isinstance(rec_up_pid, bool) and rec_up_pid > 0
+            up_state = _classify_pid_state(rec_up_pid, rec_up_lstart) if has_up_pid else "dead"
+
+            if pid_state == "unavailable" or up_state == "unavailable":
+                legacy_port_record = rec
+                continue
+
+            if pid_state == "matched" and (not has_up_pid or up_state == "matched"):
+                if not rec_model_id:
+                    print(
+                        f"Refusing to start '{endpoint.model_id}' on port {port}: "
+                        f"active PID record on port {rec_port} (pid={rec_pid}, upstream_pid={rec_up_pid}) "
+                        f"has a missing or empty model_id. Preserving existing PID record.",
+                        file=sys.stderr,
+                    )
+                    return 1
+                if rec_model_id != endpoint.model_id:
+                    print(
+                        f"Refusing to start '{endpoint.model_id}' on port {port}: "
+                        f"another model ('{rec_model_id}', pid={rec_pid}) is already active on port {port}. "
+                        f"Run ./scripts/stop-model {rec_model_id} first.",
+                        file=sys.stderr,
+                    )
+                    return 3
+                same_model_record = rec
+            elif pid_state == "matched" or up_state == "matched":
+                if not rec_model_id:
+                    print(
+                        f"Refusing to start '{endpoint.model_id}' on port {port}: "
+                        f"partially active PID record on port {rec_port} (pid={rec_pid}, upstream_pid={rec_up_pid}) "
+                        f"has a missing or empty model_id; refusing automatic cleanup. Preserving existing PID record.",
+                        file=sys.stderr,
+                    )
+                    return 1
+                if rec_model_id != endpoint.model_id:
+                    print(
+                        f"Refusing to start '{endpoint.model_id}' on port {port}: "
+                        f"another model ('{rec_model_id}', pid={rec_pid}, upstream_pid={rec_up_pid}) "
+                        f"still has an active process on port {rec_port}. "
+                        f"Run ./scripts/stop-model {rec_model_id} first.",
+                        file=sys.stderr,
+                    )
+                    return 3
+                orphaned_same_model_records.append(rec)
+
+        if legacy_port_record is not None:
+            leg_model = str(legacy_port_record.get("model_id") or endpoint.model_id)
+            print(
+                f"Refusing to reuse or overwrite server on port {port} ({api_base_url}): "
+                f"legacy PID record for '{leg_model}' (pid={legacy_port_record.get('pid')}, "
+                f"upstream_pid={legacy_port_record.get('upstream_pid')}) lacks verified process start-time metadata (pid_lstart). "
+                f"Inspect with './scripts/stop-model {leg_model}', then run './scripts/stop-model --force-legacy {leg_model}' (if it is your old server) "
+                f"or './scripts/stop-model --discard-legacy {leg_model}' (if the PID was reused by another process).",
+                file=sys.stderr,
+            )
+            return 1
+
+        if same_model_record is not None and not args.refresh_session:
             print(
                 f"Server for '{endpoint.model_id}' is already active (or starting) on port {port} "
                 f"(pid={same_model_record.get('pid')}, {api_base_url})."
@@ -559,16 +698,63 @@ def main(argv: list[str]) -> int:
             print(json.dumps(same_model_record, indent=2))
             return 0
 
-        if legacy_port_record is not None:
-            leg_model = str(legacy_port_record.get("model_id") or endpoint.model_id)
-            print(
-                f"Refusing to reuse or overwrite server on port {port} ({api_base_url}): "
-                f"legacy PID record for '{leg_model}' (pid={legacy_port_record.get('pid')}) lacks process start-time metadata (pid_lstart). "
-                f"Inspect with './scripts/stop-model {leg_model}', then run './scripts/stop-model --force-legacy {leg_model}' (if it is your old server) "
-                f"or './scripts/stop-model --discard-legacy {leg_model}' (if the PID was reused by another process).",
-                file=sys.stderr,
-            )
-            return 1
+        records_to_stop: list[dict[str, Any]] = []
+        if same_model_record is not None and args.refresh_session:
+            records_to_stop.append(same_model_record)
+        records_to_stop.extend(orphaned_same_model_records)
+
+        if records_to_stop:
+            seen_stop_keys: set[tuple[Any, Any, Any]] = set()
+            for srec in records_to_stop:
+                skey = (srec.get("pid"), srec.get("upstream_pid"), srec.get("startup_nonce"))
+                if skey in seen_stop_keys:
+                    continue
+                seen_stop_keys.add(skey)
+
+                spid = srec.get("pid")
+                if isinstance(spid, int) and not isinstance(spid, bool) and spid > 0:
+                    ok_p, err_p = _terminate_verified_pid(spid, srec.get("pid_lstart"))
+                    if not ok_p:
+                        print(
+                            f"Refusing to start '{endpoint.model_id}': could not safely terminate previous "
+                            f"server/proxy process pid={spid} ({err_p}). Preserving existing PID record.",
+                            file=sys.stderr,
+                        )
+                        return 1
+
+                sup_pid = srec.get("upstream_pid")
+                if isinstance(sup_pid, int) and not isinstance(sup_pid, bool) and sup_pid > 0:
+                    ok_u, err_u = _terminate_verified_pid(sup_pid, srec.get("upstream_pid_lstart"))
+                    if not ok_u:
+                        print(
+                            f"Refusing to start '{endpoint.model_id}': could not safely terminate previous "
+                            f"upstream process pid={sup_pid} ({err_u}). Preserving existing PID record.",
+                            file=sys.stderr,
+                        )
+                        return 1
+
+            if not _wait_for_port_unbind("127.0.0.1", port, timeout_sec=5.0):
+                print(
+                    f"Refusing to start '{endpoint.model_id}': port {port} remained bound on 127.0.0.1 after stopping previous session.",
+                    file=sys.stderr,
+                )
+                return 1
+            if upstream_port is not None and not _wait_for_port_unbind("127.0.0.1", upstream_port, timeout_sec=5.0):
+                print(
+                    f"Refusing to start '{endpoint.model_id}': upstream port {upstream_port} remained bound on 127.0.0.1 after stopping previous session.",
+                    file=sys.stderr,
+                )
+                return 1
+
+            with _pid_lock(RUNS):
+                for srec in records_to_stop:
+                    _unlink_pid_files_if_matching(
+                        pid_file_for_model(endpoint.model_id, RUNS),
+                        legacy_pid_file(RUNS),
+                        endpoint.model_id,
+                        str(srec.get("startup_nonce") or ""),
+                    )
+                session_token_file_for_model(endpoint.model_id, RUNS).unlink(missing_ok=True)
 
         if health(api_base_url, endpoint.api_key):
             print(
@@ -611,6 +797,22 @@ def main(argv: list[str]) -> int:
                         file=sys.stderr,
                     )
                     return 1
+
+                if not os.environ.get("FREE_INFERENCE_SE_PROXY_BIN"):
+                    svc_name = str(endpoint.api_key_keychain_service)
+                    ok_env, env_msg, env_payload = ensure_envelope_available_or_migrate(
+                        svc_name,
+                        se_proxy_bin=se_proxy_bin,
+                    )
+                    if not ok_env:
+                        lstate = (
+                            str(env_payload.get("lifecycle_state") or "none")
+                            if isinstance(env_payload, dict)
+                            else "none"
+                        )
+                        if lstate != "none" or "migration failed" in env_msg.lower():
+                            print(env_msg, file=sys.stderr)
+                            return 1
 
                 token_path = session_token_file_for_model(endpoint.model_id, RUNS)
                 session_token = f"se-session-{secrets.token_hex(32)}"

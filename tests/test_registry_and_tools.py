@@ -4262,6 +4262,359 @@ class RegistryAndToolsTests(unittest.TestCase):
                 )
         self.assertEqual(checked_count, 35)
 
+    def test_orphaned_upstream_cleanup_and_refresh_session_ux(self) -> None:
+        import time
+        from local_assist.registry import get_process_lstart, session_token_file_for_model
+
+        serve_mod = _load_script_module("serve_orphan_and_refresh_test", "scripts/serve-model")
+        oc_att = _load_script_module("oc_att_refresh_test", "scripts/opencode-attested")
+        oc_loc = _load_script_module("oc_loc_refresh_test", "scripts/opencode-local")
+
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            patch.object(serve_mod, "verify_se_key_proxy_binary", return_value=Path("/usr/bin/true")),
+        ):
+            runs_dir = Path(tmp)
+            serve_mod.RUNS = runs_dir
+            port = 28081
+            up_port = port + 1000
+            model_id = "tinfoil-deepseek-v4-1-flash"
+            model_pid_path = pid_file_for_model(model_id, runs_dir)
+            tok_path = session_token_file_for_model(model_id, runs_dir)
+
+            # 1. Orphaned upstream_pid for a DIFFERENT model_id on the port fails closed with exit code 3 (EXIT_MODEL_MISMATCH)
+            other_up_proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+            try:
+                other_up_lstart = get_process_lstart(other_up_proc.pid)
+                self.assertTrue(other_up_lstart)
+                other_pid_path = pid_file_for_model("tinfoil-glm-5-3", runs_dir)
+                other_pid_path.write_text(
+                    json.dumps(
+                        {
+                            "model_id": "tinfoil-glm-5-3",
+                            "repo": "glm-5-3",
+                            "port": port,
+                            "upstream_port": up_port,
+                            "pid": 999999,
+                            "pid_lstart": "Thu Jan  1 00:00:00 1970",
+                            "upstream_pid": other_up_proc.pid,
+                            "upstream_pid_lstart": other_up_lstart,
+                            "startup_nonce": "other123",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                rc_other = serve_mod.main(["scripts/serve-model", model_id, "--port", str(port)])
+                self.assertEqual(rc_other, 3)
+                self.assertIsNone(other_up_proc.poll())
+                other_pid_path.unlink(missing_ok=True)
+            finally:
+                if other_up_proc.poll() is None:
+                    other_up_proc.kill()
+                    other_up_proc.wait(timeout=3)
+
+            # 2. R2-PLAN-MINOR-1: Orphaned upstream_pid with missing upstream_pid_lstart OR get_process_lstart returning None ("unavailable")
+            # fails closed with exit code 1 and preserves PID record + token file even when upstream_port is unbound.
+            unavail_proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+            try:
+                unavail_lstart = get_process_lstart(unavail_proc.pid)
+                self.assertTrue(unavail_lstart)
+                tok_path.write_text("se-session-" + ("a" * 64) + "\n", encoding="utf-8")
+                os.chmod(tok_path, 0o600)
+
+                # 2a. Missing upstream_pid_lstart -> legacy_port_record -> exit 1, preserves record and token
+                model_pid_path.write_text(
+                    json.dumps(
+                        {
+                            "model_id": model_id,
+                            "repo": "deepseek-v4-1-flash",
+                            "port": port,
+                            "upstream_port": up_port,
+                            "pid": 999999,
+                            "pid_lstart": "Thu Jan  1 00:00:00 1970",
+                            "upstream_pid": unavail_proc.pid,
+                            "upstream_pid_lstart": None,
+                            "session_token_file": str(tok_path),
+                            "startup_nonce": "leg123",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                rc_no_lstart = serve_mod.main(["scripts/serve-model", model_id, "--port", str(port)])
+                self.assertEqual(rc_no_lstart, 1)
+                self.assertIsNone(unavail_proc.poll())
+                self.assertTrue(model_pid_path.exists())
+                self.assertTrue(tok_path.exists())
+
+                # 2b. _terminate_verified_pid encounters get_process_lstart returning None ("unavailable") during termination poll
+                # -> fails closed with exit 1 and preserves PID record + token file even when port is unbound.
+                model_pid_path.write_text(
+                    json.dumps(
+                        {
+                            "model_id": model_id,
+                            "repo": "deepseek-v4-1-flash",
+                            "port": port,
+                            "upstream_port": up_port,
+                            "pid": 999999,
+                            "pid_lstart": "Thu Jan  1 00:00:00 1970",
+                            "upstream_pid": unavail_proc.pid,
+                            "upstream_pid_lstart": unavail_lstart,
+                            "session_token_file": str(tok_path),
+                            "startup_nonce": "unavail123",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                with (
+                    patch.object(
+                        serve_mod,
+                        "_classify_pid_state",
+                        side_effect=["dead", "matched", "matched", "unavailable"],
+                    ),
+                    patch.object(serve_mod.os, "kill"),
+                ):
+                    rc_unavail_poll = serve_mod.main(["scripts/serve-model", model_id, "--port", str(port)])
+                self.assertEqual(rc_unavail_poll, 1)
+                self.assertTrue(model_pid_path.exists())
+                self.assertTrue(tok_path.exists())
+
+                # 2c. Orphaned upstream_pid terminated, but upstream_port remains bound -> fails closed with exit 1 and preserves record
+                with (
+                    patch.object(serve_mod, "_terminate_verified_pid", return_value=(True, None)),
+                    patch.object(serve_mod, "_wait_for_port_unbind", side_effect=[True, False]),
+                ):
+                    rc_port_stuck = serve_mod.main(["scripts/serve-model", model_id, "--port", str(port)])
+                self.assertEqual(rc_port_stuck, 1)
+                self.assertTrue(model_pid_path.exists())
+                self.assertTrue(tok_path.exists())
+            finally:
+                if unavail_proc.poll() is None:
+                    unavail_proc.kill()
+                    unavail_proc.wait(timeout=3)
+
+            # 3. Same model_id orphaned upstream_pid with verified upstream_pid_lstart is automatically terminated,
+            # stale PID/token files are removed, and serve-model proceeds cleanly to start the new session.
+            orphan_up = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+            try:
+                orphan_lstart = get_process_lstart(orphan_up.pid)
+                self.assertTrue(orphan_lstart)
+                tok_path.write_text("se-session-" + ("b" * 64) + "\n", encoding="utf-8")
+                model_pid_path.write_text(
+                    json.dumps(
+                        {
+                            "model_id": model_id,
+                            "repo": "deepseek-v4-1-flash",
+                            "port": port,
+                            "upstream_port": up_port,
+                            "pid": 999999,
+                            "pid_lstart": "Thu Jan  1 00:00:00 1970",
+                            "upstream_pid": orphan_up.pid,
+                            "upstream_pid_lstart": orphan_lstart,
+                            "session_token_file": str(tok_path),
+                            "startup_nonce": "orphan_ok",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                # Let health() return True after orphan cleanup so serve-model stops right after cleaning up orphan_up
+                with patch.object(serve_mod, "health", return_value=True):
+                    rc_cleaned = serve_mod.main(["scripts/serve-model", model_id, "--port", str(port)])
+                self.assertEqual(rc_cleaned, 1)
+                self.assertIsNotNone(orphan_up.poll())
+                self.assertFalse(model_pid_path.exists())
+                self.assertFalse(tok_path.exists())
+            finally:
+                if orphan_up.poll() is None:
+                    orphan_up.kill()
+                    orphan_up.wait(timeout=3)
+
+            # 4. serve-model --refresh-session stops an active session (where both pid and upstream_pid are live) before starting fresh
+            active_p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+            active_u = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+            try:
+                lp = get_process_lstart(active_p.pid)
+                lu = get_process_lstart(active_u.pid)
+                tok_path.write_text("se-session-" + ("c" * 64) + "\n", encoding="utf-8")
+                model_pid_path.write_text(
+                    json.dumps(
+                        {
+                            "model_id": model_id,
+                            "repo": "deepseek-v4-1-flash",
+                            "port": port,
+                            "upstream_port": up_port,
+                            "pid": active_p.pid,
+                            "pid_lstart": lp,
+                            "upstream_pid": active_u.pid,
+                            "upstream_pid_lstart": lu,
+                            "session_token_file": str(tok_path),
+                            "startup_nonce": "active_refresh",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                # Without --refresh-session, serve-model reuses the active session and returns 0
+                rc_reuse = serve_mod.main(["scripts/serve-model", model_id, "--port", str(port)])
+                self.assertEqual(rc_reuse, 0)
+                self.assertIsNone(active_p.poll())
+                self.assertIsNone(active_u.poll())
+
+                # With --refresh-session, serve-model terminates both active_p and active_u and unlinks old PID/token files
+                with patch.object(serve_mod, "health", return_value=True):
+                    rc_ref = serve_mod.main(
+                        ["scripts/serve-model", model_id, "--port", str(port), "--refresh-session"]
+                    )
+                self.assertEqual(rc_ref, 1)
+                self.assertIsNotNone(active_p.poll())
+                self.assertIsNotNone(active_u.poll())
+                self.assertFalse(model_pid_path.exists())
+                self.assertFalse(tok_path.exists())
+            finally:
+                for p in (active_p, active_u):
+                    if p.poll() is None:
+                        p.kill()
+                        p.wait(timeout=3)
+
+            # 4b. WORK-MAJOR-1: Missing or empty model_id on a partially-active or active PID record fails closed (exit 1),
+            # does NOT terminate the live process, and retains the PID record file.
+            anon_up = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+            try:
+                anon_lstart = serve_mod.get_process_lstart(anon_up.pid)
+                self.assertIsNotNone(anon_lstart)
+                for bad_model_val in (None, ""):
+                    rec_payload: dict[str, object] = {
+                        "pid": 999997,
+                        "pid_lstart": "Mon Jan  1 00:00:00 2024",
+                        "upstream_pid": anon_up.pid,
+                        "upstream_pid_lstart": anon_lstart,
+                        "port": port,
+                        "upstream_port": up_port,
+                        "startup_nonce": "nonce-missing-model-id",
+                    }
+                    if bad_model_val is not None:
+                        rec_payload["model_id"] = bad_model_val
+                    model_pid_path.write_text(json.dumps(rec_payload), encoding="utf-8")
+                    with unittest.mock.patch.object(serve_mod, "RUNS", runs_dir):
+                        rc_missing = serve_mod.main(["scripts/serve-model", model_id, "--port", str(port)])
+                    self.assertEqual(rc_missing, 1)
+                    self.assertIsNone(anon_up.poll(), "Live process with missing/empty model_id must not be killed")
+                    self.assertTrue(model_pid_path.exists())
+                model_pid_path.unlink(missing_ok=True)
+            finally:
+                if anon_up.poll() is None:
+                    anon_up.kill()
+                    anon_up.wait(timeout=3)
+
+        # 5. opencode-attested and opencode-local --refresh-session behavior & flag validation
+        ep_att = resolve_endpoint(load_model("tinfoil-deepseek-v4-1-flash"), require_api_key=False)
+        ep_loc = resolve_endpoint(load_model("qwen3-30b-a3b-2507-mlx-4bit"), require_api_key=False)
+
+        # 5a. Reject --refresh-session with --no-serve or --unattended-worker
+        for mod in (oc_att, oc_loc):
+            self.assertEqual(mod.main(["scripts/opencode", "--refresh-session", "--no-serve"]), 1)
+            self.assertEqual(
+                mod.main(
+                    [
+                        "scripts/opencode",
+                        "--refresh-session",
+                        "--unattended-worker",
+                        "--",
+                        "run",
+                        "--format",
+                        "json",
+                        "hi",
+                    ]
+                ),
+                1,
+            )
+
+        # 5b. opencode-attested ensure_model_served(refresh_session=True) runs verify -> stop-model -> serve-model --refresh-session -> verify --wait
+        att_cmds: list[list[str]] = []
+
+        def fake_att_refresh(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            att_cmds.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+
+        ok_ar, err_ar, started_ar = oc_att.ensure_model_served(
+            ep_att,
+            no_serve=False,
+            refresh_session=True,
+            run_cmd=fake_att_refresh,
+        )
+        self.assertTrue(ok_ar, msg=err_ar)
+        self.assertTrue(started_ar)
+        self.assertEqual(len(att_cmds), 4)
+        self.assertIn("verify-served-model", att_cmds[0][0])
+        self.assertIn("stop-model", att_cmds[1][0])
+        self.assertIn("serve-model", att_cmds[2][0])
+        self.assertIn("--refresh-session", att_cmds[2])
+        self.assertIn("verify-served-model", att_cmds[3][0])
+
+        # Fail closed if stop-model fails during refresh_session
+        def fake_stop_fail(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            if cmd and "stop-model" in cmd[0]:
+                return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="stop failed")
+            return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+
+        ok_af, err_af, _ = oc_att.ensure_model_served(
+            ep_att,
+            no_serve=False,
+            refresh_session=True,
+            run_cmd=fake_stop_fail,
+        )
+        self.assertFalse(ok_af)
+        self.assertIn("Failed to stop active", str(err_af))
+
+        # 5c. opencode-local ensure_model_served(refresh_session=True) runs verify -> stop-model -> serve-model --refresh-session -> verify --wait
+        loc_cmds: list[list[str]] = []
+
+        def fake_loc_refresh(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+            loc_cmds.append(cmd)
+            return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+
+        ok_lr, err_lr = oc_loc.ensure_model_served(
+            ep_loc,
+            no_serve=False,
+            refresh_session=True,
+            run_cmd=fake_loc_refresh,
+        )
+        self.assertTrue(ok_lr, msg=err_lr)
+        self.assertEqual(len(loc_cmds), 4)
+        self.assertIn("verify-served-model", loc_cmds[0][0])
+        self.assertIn("stop-model", loc_cmds[1][0])
+        self.assertIn("serve-model", loc_cmds[2][0])
+        self.assertIn("--refresh-session", loc_cmds[2])
+        self.assertIn("verify-served-model", loc_cmds[3][0])
+
+        ok_lf, err_lf = oc_loc.ensure_model_served(
+            ep_loc,
+            no_serve=False,
+            refresh_session=True,
+            run_cmd=fake_stop_fail,
+        )
+        self.assertFalse(ok_lf)
+        self.assertIn("Failed to stop active", str(err_lf))
+
+        # 5d. format_session_banner includes remaining TTL when attached and shows --refresh-session instruction
+        recent_start = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+        session_meta = {
+            **oc_att.compute_worst_case_session_usd(
+                ep_att,
+                max_chat_requests=1000,
+                max_request_bytes=8388608,
+                max_tokens_cap=16384,
+            ),
+            "attached": True,
+            "ttl_seconds": 43200,
+            "started_at": recent_start,
+        }
+        banner = oc_att.format_session_banner(
+            ep_att,
+            session_meta,
+            max_session_usd=None,
+        )
+        self.assertIn("remaining)", banner)
+        self.assertIn("--refresh-session", banner)
+
 
 if __name__ == "__main__":
     unittest.main()

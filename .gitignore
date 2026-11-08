@@ -31,3 +31,5 @@ models/
 .local
 .models.yaml.lock
 .models-sync-*.yaml
+tools/se_key_proxy/.build/
+tools/se_key_proxy/.swiftpm/

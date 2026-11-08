@@ -190,7 +190,7 @@ private func readSecretFromTTY(prompt: String) throws -> Data {
     return out
 }
 
-// MARK: - ECIES Envelope & Keychain
+// MARK: - ECIES Envelope & Protected File Store
 
 private struct SealedEnvelope: Codable {
     let version: Int
@@ -200,13 +200,44 @@ private struct SealedEnvelope: Codable {
     let se_private_key_blob: String
     let ephemeral_public_key_x963: String
     let aes_gcm_combined: String
+    let envelope_sha256: String
 }
 
-private func sealPayloadWithPublicKey(
+private struct EnvelopeStateRecord: Codable {
+    let state: String
+    let service: String
+    let account: String
+    let updated_at: String
+}
+
+private func computeEnvelopeDigest(
+    version: Int,
+    service: String,
+    createdAt: String,
+    keyFingerprint: String,
+    sePrivateKeyBlob: String,
+    ephemeralPublicKeyX963: String,
+    aesGcmCombined: String
+) -> String {
+    let canonical =
+        "\(version)\0\(service)\0\(createdAt)\0\(keyFingerprint)\0\(sePrivateKeyBlob)\0\(ephemeralPublicKeyX963)\0\(aesGcmCombined)"
+    return sha256Hex(Data(canonical.utf8))
+}
+
+private func randomHexBytes(_ byteCount: Int) -> String {
+    var bytes = [UInt8](repeating: 0, count: byteCount)
+    _ = SecRandomCopyBytes(kSecRandomDefault, byteCount, &bytes)
+    defer {
+        for idx in 0..<bytes.count { bytes[idx] = 0 }
+    }
+    return bytes.map { String(format: "%02x", $0) }.joined()
+}
+
+private func sealPayloadWithPublicKeyAndSecret(
     secret: Data,
     recipientPublicKeyX963: Data,
     service: String
-) throws -> (ephemeralPubX963: Data, combinedCiphertext: Data) {
+) throws -> (ephemeralPubX963: Data, combinedCiphertext: Data, sharedSecret: SharedSecret) {
     let pubKey = try P256.KeyAgreement.PublicKey(x963Representation: recipientPublicKeyX963)
     let ephPriv = P256.KeyAgreement.PrivateKey()
     let ephPubData = ephPriv.publicKey.x963Representation
@@ -226,6 +257,19 @@ private func sealPayloadWithPublicKey(
             userInfo: [NSLocalizedDescriptionKey: "AES.GCM.seal produced nil combined representation"]
         )
     }
+    return (ephPubData, combined, shared)
+}
+
+private func sealPayloadWithPublicKey(
+    secret: Data,
+    recipientPublicKeyX963: Data,
+    service: String
+) throws -> (ephemeralPubX963: Data, combinedCiphertext: Data) {
+    let (ephPubData, combined, _) = try sealPayloadWithPublicKeyAndSecret(
+        secret: secret,
+        recipientPublicKeyX963: recipientPublicKeyX963,
+        service: service
+    )
     return (ephPubData, combined)
 }
 
@@ -246,69 +290,648 @@ private func unsealPayloadWithSharedSecret(
     return try AES.GCM.open(box, using: symKey, authenticating: contextData)
 }
 
-private func storeKeychainEnvelope(service: String, account: String, envelopeData: Data) throws {
-    let query: [String: Any] = [
-        kSecClass as String: kSecClassGenericPassword,
-        kSecAttrService as String: service,
-        kSecAttrAccount as String: account,
-    ]
-    SecItemDelete(query as CFDictionary)
-
-    let addAttrs: [String: Any] = [
-        kSecClass as String: kSecClassGenericPassword,
-        kSecAttrService as String: service,
-        kSecAttrAccount as String: account,
-        kSecAttrLabel as String: service,
-        kSecValueData as String: envelopeData,
-    ]
-    let status = SecItemAdd(addAttrs as CFDictionary, nil)
-    guard status == errSecSuccess else {
+private func ensureOwnedDirectoryComponent(
+    path: String,
+    createIfMissing: Bool,
+    requireMode0700: Bool
+) throws {
+    let uid = geteuid()
+    var st = stat()
+    if Darwin.lstat(path, &st) != 0 {
+        guard errno == ENOENT, createIfMissing else {
+            throw NSError(
+                domain: NSPOSIXErrorDomain,
+                code: Int(errno),
+                userInfo: [NSLocalizedDescriptionKey: "Envelope directory component missing or inaccessible: \(path)"]
+            )
+        }
+        if Darwin.mkdir(path, 0o700) != 0 && errno != EEXIST {
+            throw NSError(
+                domain: NSPOSIXErrorDomain,
+                code: Int(errno),
+                userInfo: [NSLocalizedDescriptionKey: "mkdir(\(path)) failed with errno \(errno)"]
+            )
+        }
+        guard Darwin.lstat(path, &st) == 0 else {
+            throw NSError(
+                domain: NSPOSIXErrorDomain,
+                code: Int(errno),
+                userInfo: [NSLocalizedDescriptionKey: "lstat(\(path)) failed after mkdir"]
+            )
+        }
+    }
+    if (st.st_mode & S_IFMT) == S_IFLNK {
         throw NSError(
-            domain: NSOSStatusErrorDomain,
-            code: Int(status),
-            userInfo: [NSLocalizedDescriptionKey: "SecItemAdd failed with OSStatus \(status)"]
+            domain: "SEKeyProxy",
+            code: 10,
+            userInfo: [NSLocalizedDescriptionKey: "Refusing symlinked directory component: \(path)"]
+        )
+    }
+    guard (st.st_mode & S_IFMT) == S_IFDIR else {
+        throw NSError(
+            domain: "SEKeyProxy",
+            code: 11,
+            userInfo: [NSLocalizedDescriptionKey: "Expected directory at \(path)"]
+        )
+    }
+    guard st.st_uid == uid else {
+        throw NSError(
+            domain: "SEKeyProxy",
+            code: 12,
+            userInfo: [NSLocalizedDescriptionKey: "Directory \(path) must be owned by uid \(uid), got \(st.st_uid)"]
+        )
+    }
+    if requireMode0700 && (st.st_mode & 0o077) != 0 {
+        throw NSError(
+            domain: "SEKeyProxy",
+            code: 13,
+            userInfo: [NSLocalizedDescriptionKey: "Directory \(path) must not have group/other permissions (mode=\(String(st.st_mode & 0o777, radix: 8)))"]
+        )
+    }
+    if !requireMode0700 && (st.st_mode & 0o022) != 0 {
+        throw NSError(
+            domain: "SEKeyProxy",
+            code: 14,
+            userInfo: [NSLocalizedDescriptionKey: "Directory \(path) must not be group/world-writable"]
         )
     }
 }
 
-private func loadKeychainEnvelope(service: String, account: String) throws -> SealedEnvelope {
-    let query: [String: Any] = [
-        kSecClass as String: kSecClassGenericPassword,
-        kSecAttrService as String: service,
-        kSecAttrAccount as String: account,
-        kSecReturnData as String: true,
-        kSecMatchLimit as String: kSecMatchLimitOne,
-    ]
-    var item: CFTypeRef?
-    let status = SecItemCopyMatching(query as CFDictionary, &item)
-    guard status == errSecSuccess, let data = item as? Data else {
+private func resolveEnvelopeDirectory(createIfMissing: Bool) throws -> String {
+    #if SE_KEY_TESTING
+    if let rawOverride = ProcessInfo.processInfo.environment["FREE_INFERENCE_SE_ENVELOPE_DIR"]?
+        .trimmingCharacters(in: .whitespacesAndNewlines),
+       !rawOverride.isEmpty {
+        let segments = rawOverride.split(separator: "/", omittingEmptySubsequences: true)
+        guard rawOverride.hasPrefix("/"), !segments.contains(".."), !segments.contains(".") else {
+            throw NSError(
+                domain: "SEKeyProxy",
+                code: 15,
+                userInfo: [NSLocalizedDescriptionKey: "FREE_INFERENCE_SE_ENVELOPE_DIR must be an absolute normalized path"]
+            )
+        }
+        let cleanOverride = "/" + segments.joined(separator: "/")
+        try ensureOwnedDirectoryComponent(
+            path: cleanOverride,
+            createIfMissing: createIfMissing,
+            requireMode0700: true
+        )
+        return cleanOverride
+    }
+    #endif
+
+    let uid = geteuid()
+    guard let pw = getpwuid(uid), let pwDirPtr = pw.pointee.pw_dir else {
         throw NSError(
-            domain: NSOSStatusErrorDomain,
-            code: Int(status),
-            userInfo: [NSLocalizedDescriptionKey: "Keychain entry not found for service '\(service)' (OSStatus \(status))"]
+            domain: "SEKeyProxy",
+            code: 16,
+            userInfo: [NSLocalizedDescriptionKey: "Could not resolve user home directory via getpwuid(\(uid))"]
         )
     }
-    return try JSONDecoder().decode(SealedEnvelope.self, from: data)
+    let homeRaw = String(cString: pwDirPtr)
+    let homeSegments = homeRaw.split(separator: "/", omittingEmptySubsequences: true)
+    guard homeRaw.hasPrefix("/"), !homeSegments.isEmpty, !homeSegments.contains(".."), !homeSegments.contains(".") else {
+        throw NSError(
+            domain: "SEKeyProxy",
+            code: 17,
+            userInfo: [NSLocalizedDescriptionKey: "Invalid user home directory from getpwuid: \(homeRaw)"]
+        )
+    }
+    let homeDir = "/" + homeSegments.joined(separator: "/")
+    try ensureOwnedDirectoryComponent(path: homeDir, createIfMissing: false, requireMode0700: false)
+    let dotConfig = homeDir + "/.config"
+    try ensureOwnedDirectoryComponent(path: dotConfig, createIfMissing: createIfMissing, requireMode0700: false)
+    let freeInfDir = dotConfig + "/free-inference"
+    try ensureOwnedDirectoryComponent(path: freeInfDir, createIfMissing: createIfMissing, requireMode0700: true)
+    let envDir = freeInfDir + "/se-envelopes"
+    try ensureOwnedDirectoryComponent(path: envDir, createIfMissing: createIfMissing, requireMode0700: true)
+    return envDir
 }
 
-private func deleteKeychainEnvelope(service: String, account: String) throws -> Bool {
-    let query: [String: Any] = [
-        kSecClass as String: kSecClassGenericPassword,
-        kSecAttrService as String: service,
-        kSecAttrAccount as String: account,
-    ]
-    let status = SecItemDelete(query as CFDictionary)
-    if status == errSecSuccess {
-        return true
+private func envelopeStem(service: String, account: String) -> String {
+    return sha256Hex(Data((service + "\0" + account).utf8))
+}
+
+private func fsyncDirectory(_ dirPath: String, context: String) throws {
+    let dirFD = Darwin.open(dirPath, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+    guard dirFD >= 0 else {
+        throw NSError(
+            domain: NSPOSIXErrorDomain,
+            code: Int(errno),
+            userInfo: [
+                NSLocalizedDescriptionKey:
+                    "partial publication (\(context)): failed to open directory '\(dirPath)' for fsync (errno \(errno))"
+            ]
+        )
     }
-    if status == errSecItemNotFound {
-        return false
+    defer { _ = Darwin.close(dirFD) }
+    #if SE_KEY_TESTING
+    if ProcessInfo.processInfo.environment["SE_KEY_TEST_FAIL_FSYNC_DIR"] == "1" {
+        throw NSError(
+            domain: NSPOSIXErrorDomain,
+            code: Int(EIO),
+            userInfo: [
+                NSLocalizedDescriptionKey:
+                    "partial publication (\(context)): simulated directory fsync failure on '\(dirPath)' after filesystem update"
+            ]
+        )
     }
-    throw NSError(
-        domain: NSOSStatusErrorDomain,
-        code: Int(status),
-        userInfo: [NSLocalizedDescriptionKey: "SecItemDelete failed with OSStatus \(status)"]
+    #endif
+    guard Darwin.fsync(dirFD) == 0 else {
+        throw NSError(
+            domain: NSPOSIXErrorDomain,
+            code: Int(errno),
+            userInfo: [
+                NSLocalizedDescriptionKey:
+                    "partial publication (\(context)): directory fsync failed on '\(dirPath)' after filesystem update (errno \(errno))"
+            ]
+        )
+    }
+}
+
+private func readOwnedRegularFile0600(path: String) throws -> Data {
+    let uid = geteuid()
+    let fd = Darwin.open(path, O_RDONLY | O_NOFOLLOW)
+    guard fd >= 0 else {
+        throw NSError(
+            domain: NSPOSIXErrorDomain,
+            code: Int(errno),
+            userInfo: [NSLocalizedDescriptionKey: "Could not open file '\(path)' (errno \(errno))"]
+        )
+    }
+    defer { _ = Darwin.close(fd) }
+
+    var st = stat()
+    guard Darwin.fstat(fd, &st) == 0 else {
+        throw NSError(
+            domain: NSPOSIXErrorDomain,
+            code: Int(errno),
+            userInfo: [NSLocalizedDescriptionKey: "fstat failed on '\(path)' (errno \(errno))"]
+        )
+    }
+    guard (st.st_mode & S_IFMT) == S_IFREG else {
+        throw NSError(
+            domain: "SEKeyProxy",
+            code: 18,
+            userInfo: [NSLocalizedDescriptionKey: "Refusing non-regular file '\(path)'"]
+        )
+    }
+    guard st.st_uid == uid else {
+        throw NSError(
+            domain: "SEKeyProxy",
+            code: 19,
+            userInfo: [NSLocalizedDescriptionKey: "File '\(path)' must be owned by uid \(uid), got \(st.st_uid)"]
+        )
+    }
+    guard (st.st_mode & 0o077) == 0 else {
+        throw NSError(
+            domain: "SEKeyProxy",
+            code: 20,
+            userInfo: [NSLocalizedDescriptionKey: "File '\(path)' must have 0600 permissions (got mode \(String(st.st_mode & 0o777, radix: 8)))"]
+        )
+    }
+    guard st.st_size >= 0 && st.st_size <= 65536 else {
+        throw NSError(
+            domain: "SEKeyProxy",
+            code: 21,
+            userInfo: [NSLocalizedDescriptionKey: "File '\(path)' exceeds maximum envelope size"]
+        )
+    }
+
+    var result = Data()
+    var buf = [UInt8](repeating: 0, count: 4096)
+    while true {
+        let n = Darwin.read(fd, &buf, buf.count)
+        if n > 0 {
+            result.append(contentsOf: buf[0..<n])
+        } else if n == 0 {
+            break
+        } else {
+            if errno == EINTR { continue }
+            throw NSError(
+                domain: NSPOSIXErrorDomain,
+                code: Int(errno),
+                userInfo: [NSLocalizedDescriptionKey: "read failed on '\(path)' (errno \(errno))"]
+            )
+        }
+    }
+    return result
+}
+
+private func writeStageFile0600(dir: String, prefix: String, data: Data) throws -> String {
+    let tmpPath = "\(dir)/.\(prefix)-\(getpid())-\(randomHexBytes(8)).tmp"
+    let fd = Darwin.open(tmpPath, O_CREAT | O_EXCL | O_WRONLY | O_NOFOLLOW, 0o600)
+    guard fd >= 0 else {
+        throw NSError(
+            domain: NSPOSIXErrorDomain,
+            code: Int(errno),
+            userInfo: [NSLocalizedDescriptionKey: "Failed to create staging file '\(tmpPath)' (errno \(errno))"]
+        )
+    }
+    var ok = false
+    defer {
+        if fd >= 0 {
+            _ = Darwin.close(fd)
+        }
+        if !ok {
+            _ = Darwin.unlink(tmpPath)
+        }
+    }
+    guard Darwin.fchmod(fd, 0o600) == 0 else {
+        throw NSError(
+            domain: NSPOSIXErrorDomain,
+            code: Int(errno),
+            userInfo: [NSLocalizedDescriptionKey: "fchmod(0600) failed on '\(tmpPath)'"]
+        )
+    }
+    guard writeAllToFD(fd, data: data) else {
+        throw NSError(
+            domain: NSPOSIXErrorDomain,
+            code: Int(errno),
+            userInfo: [NSLocalizedDescriptionKey: "Failed writing bytes to '\(tmpPath)'"]
+        )
+    }
+    guard Darwin.fsync(fd) == 0 else {
+        throw NSError(
+            domain: NSPOSIXErrorDomain,
+            code: Int(errno),
+            userInfo: [NSLocalizedDescriptionKey: "fsync failed on '\(tmpPath)'"]
+        )
+    }
+    ok = true
+    return tmpPath
+}
+
+private func ensureDestinationNotSymlink(path: String) throws {
+    var st = stat()
+    if Darwin.lstat(path, &st) == 0 {
+        if (st.st_mode & S_IFMT) == S_IFLNK || (st.st_mode & S_IFMT) != S_IFREG {
+            throw NSError(
+                domain: "SEKeyProxy",
+                code: 22,
+                userInfo: [NSLocalizedDescriptionKey: "Refusing non-regular or symlinked destination file '\(path)'"]
+            )
+        }
+    } else if errno != ENOENT {
+        throw NSError(
+            domain: NSPOSIXErrorDomain,
+            code: Int(errno),
+            userInfo: [NSLocalizedDescriptionKey: "lstat failed on '\(path)' (errno \(errno))"]
+        )
+    }
+}
+
+private func atomicPublishStageFile(dir: String, stagePath: String, targetPath: String) throws {
+    try ensureDestinationNotSymlink(path: targetPath)
+    guard Darwin.rename(stagePath, targetPath) == 0 else {
+        _ = Darwin.unlink(stagePath)
+        throw NSError(
+            domain: NSPOSIXErrorDomain,
+            code: Int(errno),
+            userInfo: [NSLocalizedDescriptionKey: "rename('\(stagePath)' -> '\(targetPath)') failed (errno \(errno))"]
+        )
+    }
+    try fsyncDirectory(dir, context: "renamed '\(stagePath)' -> '\(targetPath)'")
+}
+
+private func withStemLock<T>(dir: String, stem: String, body: () throws -> T) throws -> T {
+    let lockPath = "\(dir)/\(stem).lock"
+    let fd = Darwin.open(lockPath, O_CREAT | O_RDWR | O_NOFOLLOW, 0o600)
+    guard fd >= 0 else {
+        throw NSError(
+            domain: NSPOSIXErrorDomain,
+            code: Int(errno),
+            userInfo: [NSLocalizedDescriptionKey: "Could not open lock file '\(lockPath)' (errno \(errno))"]
+        )
+    }
+    defer { _ = Darwin.close(fd) }
+
+    var st = stat()
+    guard Darwin.fstat(fd, &st) == 0,
+          (st.st_mode & S_IFMT) == S_IFREG,
+          st.st_uid == geteuid(),
+          (st.st_mode & 0o077) == 0 else {
+        throw NSError(
+            domain: "SEKeyProxy",
+            code: 23,
+            userInfo: [NSLocalizedDescriptionKey: "Lock file '\(lockPath)' failed ownership or 0600 mode check"]
+        )
+    }
+
+    while true {
+        if flock(fd, LOCK_EX) == 0 {
+            break
+        }
+        if errno == EINTR {
+            continue
+        }
+        throw NSError(
+            domain: NSPOSIXErrorDomain,
+            code: Int(errno),
+            userInfo: [NSLocalizedDescriptionKey: "flock(LOCK_EX) failed on '\(lockPath)' (errno \(errno))"]
+        )
+    }
+    defer { _ = flock(fd, LOCK_UN) }
+    return try body()
+}
+
+private func optionalFileSHA256(path: String) throws -> String? {
+    var st = stat()
+    if Darwin.lstat(path, &st) != 0 {
+        if errno == ENOENT {
+            return nil
+        }
+        throw NSError(
+            domain: NSPOSIXErrorDomain,
+            code: Int(errno),
+            userInfo: [NSLocalizedDescriptionKey: "lstat failed on '\(path)' (errno \(errno))"]
+        )
+    }
+    let data = try readOwnedRegularFile0600(path: path)
+    return sha256Hex(data)
+}
+
+private func readStemSnapshot(dir: String, stem: String) throws -> (envSha: String?, stateSha: String?) {
+    let envPath = "\(dir)/\(stem).json"
+    let statePath = "\(dir)/\(stem).state.json"
+    return (
+        try optionalFileSHA256(path: envPath),
+        try optionalFileSHA256(path: statePath)
     )
+}
+
+private func loadStateRecord(dir: String, stem: String) throws -> EnvelopeStateRecord? {
+    let statePath = "\(dir)/\(stem).state.json"
+    var st = stat()
+    if Darwin.lstat(statePath, &st) != 0 {
+        if errno == ENOENT {
+            return nil
+        }
+        throw NSError(
+            domain: NSPOSIXErrorDomain,
+            code: Int(errno),
+            userInfo: [NSLocalizedDescriptionKey: "lstat failed on '\(statePath)'"]
+        )
+    }
+    let data = try readOwnedRegularFile0600(path: statePath)
+    return try JSONDecoder().decode(EnvelopeStateRecord.self, from: data)
+}
+
+private func writeStateRecord(
+    dir: String,
+    stem: String,
+    state: String,
+    service: String,
+    account: String,
+    updatedAt: String
+) throws {
+    let rec = EnvelopeStateRecord(
+        state: state,
+        service: service,
+        account: account,
+        updated_at: updatedAt
+    )
+    let bytes = try JSONEncoder().encode(rec)
+    let stage = try writeStageFile0600(dir: dir, prefix: "state-\(stem)", data: bytes)
+    try atomicPublishStageFile(dir: dir, stagePath: stage, targetPath: "\(dir)/\(stem).state.json")
+}
+
+private func verifySEPKeyBlobNonInteractive(seBlob: Data, ephemeralPubKey: P256.KeyAgreement.PublicKey) throws {
+    guard SecureEnclave.isAvailable else { return }
+    let nonInteractiveCtx = LAContext()
+    nonInteractiveCtx.interactionNotAllowed = true
+    nonInteractiveCtx.touchIDAuthenticationAllowableReuseDuration = 0
+
+    let allowedBlockDomainCodes: [(domain: String, code: Int)] = [
+        ("com.apple.LocalAuthentication", -1004),
+        (NSOSStatusErrorDomain, -25308),
+        (NSOSStatusErrorDomain, -25293),
+    ]
+    do {
+        let loadedKey = try SecureEnclave.P256.KeyAgreement.PrivateKey(
+            dataRepresentation: seBlob,
+            authenticationContext: nonInteractiveCtx
+        )
+        _ = try loadedKey.sharedSecretFromKeyAgreement(with: ephemeralPubKey)
+        throw NSError(
+            domain: "SEKeyProxy",
+            code: 24,
+            userInfo: [NSLocalizedDescriptionKey: "Secure Enclave key unsealed with interactionNotAllowed=true"]
+        )
+    } catch {
+        let chain = extractUnderlyingErrorCodes(error)
+        let matched = chain.contains { item in
+            allowedBlockDomainCodes.contains { $0.domain == item.domain && $0.code == item.code }
+        }
+        guard matched else {
+            throw NSError(
+                domain: "SEKeyProxy",
+                code: 25,
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "Secure Enclave key blob failed non-interactive recognition: \(error.localizedDescription)"
+                ]
+            )
+        }
+    }
+}
+
+private func loadAndValidateEnvelopeFromPath(
+    path: String,
+    expectedService: String,
+    checkSEPNonInteractive: Bool
+) throws -> SealedEnvelope {
+    let data = try readOwnedRegularFile0600(path: path)
+    let env = try JSONDecoder().decode(SealedEnvelope.self, from: data)
+    guard env.version == kEnvelopeVersion, env.service == expectedService else {
+        throw NSError(
+            domain: "SEKeyProxy",
+            code: 26,
+            userInfo: [NSLocalizedDescriptionKey: "Envelope version or service mismatch for '\(expectedService)'"]
+        )
+    }
+    let expectedDigest = computeEnvelopeDigest(
+        version: env.version,
+        service: env.service,
+        createdAt: env.created_at,
+        keyFingerprint: env.key_fingerprint,
+        sePrivateKeyBlob: env.se_private_key_blob,
+        ephemeralPublicKeyX963: env.ephemeral_public_key_x963,
+        aesGcmCombined: env.aes_gcm_combined
+    )
+    guard constantTimeEquals(Data(env.envelope_sha256.utf8), Data(expectedDigest.utf8)) else {
+        throw NSError(
+            domain: "SEKeyProxy",
+            code: 27,
+            userInfo: [NSLocalizedDescriptionKey: "Envelope integrity digest mismatch for '\(expectedService)'"]
+        )
+    }
+    guard
+        let seBlob = Data(base64Encoded: env.se_private_key_blob), !seBlob.isEmpty,
+        let ephPubData = Data(base64Encoded: env.ephemeral_public_key_x963),
+        let ephPubKey = try? P256.KeyAgreement.PublicKey(x963Representation: ephPubData),
+        let combined = Data(base64Encoded: env.aes_gcm_combined), combined.count > 28
+    else {
+        throw NSError(
+            domain: "SEKeyProxy",
+            code: 28,
+            userInfo: [NSLocalizedDescriptionKey: "Envelope cryptographic fields failed validation for '\(expectedService)'"]
+        )
+    }
+    if checkSEPNonInteractive {
+        try verifySEPKeyBlobNonInteractive(seBlob: seBlob, ephemeralPubKey: ephPubKey)
+    }
+    return env
+}
+
+private func loadEnvelope(
+    service: String,
+    account: String,
+    checkSEPNonInteractive: Bool = false
+) throws -> SealedEnvelope {
+    let dir = try resolveEnvelopeDirectory(createIfMissing: false)
+    let stem = envelopeStem(service: service, account: account)
+    let envPath = "\(dir)/\(stem).json"
+    return try loadAndValidateEnvelopeFromPath(
+        path: envPath,
+        expectedService: service,
+        checkSEPNonInteractive: checkSEPNonInteractive
+    )
+}
+
+private func sealAndPublishEnvelopeLocked(
+    dir: String,
+    stem: String,
+    service: String,
+    account: String,
+    secretData: Data,
+    stateLabel: String
+) throws -> SealedEnvelope {
+    var cfErr: Unmanaged<CFError>?
+    guard let ac = SecAccessControlCreateWithFlags(
+        nil,
+        kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+        [.privateKeyUsage, .biometryCurrentSet],
+        &cfErr
+    ) else {
+        throw NSError(
+            domain: "SEKeyProxy",
+            code: 29,
+            userInfo: [NSLocalizedDescriptionKey: "SecAccessControlCreateWithFlags failed: \(String(describing: cfErr))"]
+        )
+    }
+
+    let sePriv = try SecureEnclave.P256.KeyAgreement.PrivateKey(accessControl: ac)
+    let pubX963 = sePriv.publicKey.x963Representation
+    let keyFingerprint = String(sha256Hex(pubX963).prefix(16))
+
+    let (ephPub, combined, sharedSecret) = try sealPayloadWithPublicKeyAndSecret(
+        secret: secretData,
+        recipientPublicKeyX963: pubX963,
+        service: service
+    )
+
+    let createdAt = isoNow()
+    let seBlobB64 = sePriv.dataRepresentation.base64EncodedString()
+    let ephPubB64 = ephPub.base64EncodedString()
+    let combinedB64 = combined.base64EncodedString()
+    let digest = computeEnvelopeDigest(
+        version: kEnvelopeVersion,
+        service: service,
+        createdAt: createdAt,
+        keyFingerprint: keyFingerprint,
+        sePrivateKeyBlob: seBlobB64,
+        ephemeralPublicKeyX963: ephPubB64,
+        aesGcmCombined: combinedB64
+    )
+    let envelope = SealedEnvelope(
+        version: kEnvelopeVersion,
+        service: service,
+        created_at: createdAt,
+        key_fingerprint: keyFingerprint,
+        se_private_key_blob: seBlobB64,
+        ephemeral_public_key_x963: ephPubB64,
+        aes_gcm_combined: combinedB64,
+        envelope_sha256: digest
+    )
+    let envelopeBytes = try JSONEncoder().encode(envelope)
+    let stagePath = try writeStageFile0600(dir: dir, prefix: "env-\(stem)", data: envelopeBytes)
+
+    do {
+        let readBack = try loadAndValidateEnvelopeFromPath(
+            path: stagePath,
+            expectedService: service,
+            checkSEPNonInteractive: true
+        )
+        guard
+            let rbEphPub = Data(base64Encoded: readBack.ephemeral_public_key_x963),
+            let rbCombined = Data(base64Encoded: readBack.aes_gcm_combined)
+        else {
+            throw NSError(
+                domain: "SEKeyProxy",
+                code: 30,
+                userInfo: [NSLocalizedDescriptionKey: "Read-back envelope missing ciphertext fields"]
+            )
+        }
+        var openedReadBack = try unsealPayloadWithSharedSecret(
+            sharedSecret: sharedSecret,
+            ephemeralPubX963: rbEphPub,
+            combinedCiphertext: rbCombined,
+            service: service
+        )
+        defer { bestEffortZero(&openedReadBack) }
+        guard constantTimeEquals(openedReadBack, secretData) else {
+            throw NSError(
+                domain: "SEKeyProxy",
+                code: 31,
+                userInfo: [NSLocalizedDescriptionKey: "Read-back authenticated decryption mismatch"]
+            )
+        }
+    } catch {
+        _ = Darwin.unlink(stagePath)
+        throw error
+    }
+
+    let targetPath = "\(dir)/\(stem).json"
+    try atomicPublishStageFile(dir: dir, stagePath: stagePath, targetPath: targetPath)
+    try writeStateRecord(
+        dir: dir,
+        stem: stem,
+        state: stateLabel,
+        service: service,
+        account: account,
+        updatedAt: createdAt
+    )
+    return envelope
+}
+
+private func deleteEnvelope(service: String, account: String) throws -> Bool {
+    let dir = try resolveEnvelopeDirectory(createIfMissing: true)
+    let stem = envelopeStem(service: service, account: account)
+    return try withStemLock(dir: dir, stem: stem) {
+        let envPath = "\(dir)/\(stem).json"
+        try ensureDestinationNotSymlink(path: envPath)
+        var existed = false
+        if Darwin.unlink(envPath) == 0 {
+            existed = true
+        } else if errno != ENOENT {
+            throw NSError(
+                domain: NSPOSIXErrorDomain,
+                code: Int(errno),
+                userInfo: [NSLocalizedDescriptionKey: "unlink('\(envPath)') failed (errno \(errno))"]
+            )
+        }
+        try writeStateRecord(
+            dir: dir,
+            stem: stem,
+            state: "deleted",
+            service: service,
+            account: account,
+            updatedAt: isoNow()
+        )
+        try fsyncDirectory(dir, context: "unlinked '\(envPath)' and wrote deleted tombstone")
+        return existed
+    }
 }
 
 // MARK: - Strict Top-Level JSON Key Counter
@@ -1942,51 +2565,26 @@ private func runSeal(args: [String]) -> Int32 {
             return 1
         }
 
-        // CryptoKit's exported SecureEnclave.P256 key blob (sepk) requires
-        // kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly as the base AKS protection class
-        // for [.privateKeyUsage, .biometryCurrentSet] in CLI binaries without a Data Protection
-        // Keychain provisioning profile. The SE key is usable after first unlock since boot,
-        // and every unseal operation requires a live Touch ID biometric match.
-        var cfErr: Unmanaged<CFError>?
-        guard let ac = SecAccessControlCreateWithFlags(
-            nil,
-            kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
-            [.privateKeyUsage, .biometryCurrentSet],
-            &cfErr
-        ) else {
-            writeStderr("SecAccessControlCreateWithFlags failed: \(String(describing: cfErr))")
-            return 1
+        let dir = try resolveEnvelopeDirectory(createIfMissing: true)
+        let stem = envelopeStem(service: svc, account: account)
+        let envelope = try withStemLock(dir: dir, stem: stem) {
+            return try sealAndPublishEnvelopeLocked(
+                dir: dir,
+                stem: stem,
+                service: svc,
+                account: account,
+                secretData: secretData,
+                stateLabel: "sealed"
+            )
         }
-
-        let sePriv = try SecureEnclave.P256.KeyAgreement.PrivateKey(accessControl: ac)
-        let pubX963 = sePriv.publicKey.x963Representation
-        let keyFingerprint = String(sha256Hex(pubX963).prefix(16))
-
-        let (ephPub, combined) = try sealPayloadWithPublicKey(
-            secret: secretData,
-            recipientPublicKeyX963: pubX963,
-            service: svc
-        )
-
-        let createdAt = isoNow()
-        let envelope = SealedEnvelope(
-            version: kEnvelopeVersion,
-            service: svc,
-            created_at: createdAt,
-            key_fingerprint: keyFingerprint,
-            se_private_key_blob: sePriv.dataRepresentation.base64EncodedString(),
-            ephemeral_public_key_x963: ephPub.base64EncodedString(),
-            aes_gcm_combined: combined.base64EncodedString()
-        )
-        let envelopeBytes = try JSONEncoder().encode(envelope)
-        try storeKeychainEnvelope(service: svc, account: account, envelopeData: envelopeBytes)
 
         printJSON([
             "status": "sealed",
             "service": svc,
             "account": account,
-            "key_fingerprint": keyFingerprint,
-            "created_at": createdAt,
+            "key_fingerprint": envelope.key_fingerprint,
+            "created_at": envelope.created_at,
+            "envelope_sha256": envelope.envelope_sha256,
             "access_control": "biometryCurrentSet",
         ])
         return 0
@@ -2022,16 +2620,12 @@ private func runStatus(args: [String]) -> Int32 {
     }
 
     do {
-        let env = try loadKeychainEnvelope(service: svc, account: account)
+        let env = try loadEnvelope(service: svc, account: account, checkSEPNonInteractive: true)
         guard
-            env.version == kEnvelopeVersion,
-            env.service == svc,
-            let seBlob = Data(base64Encoded: env.se_private_key_blob), !seBlob.isEmpty,
-            let ephPub = Data(base64Encoded: env.ephemeral_public_key_x963),
-            (try? P256.KeyAgreement.PublicKey(x963Representation: ephPub)) != nil,
-            let combined = Data(base64Encoded: env.aes_gcm_combined), combined.count > 28
+            let seBlob = Data(base64Encoded: env.se_private_key_blob),
+            let combined = Data(base64Encoded: env.aes_gcm_combined)
         else {
-            writeStderr("Keychain envelope for '\(svc)' failed structural validation.")
+            writeStderr("Envelope for '\(svc)' failed structural validation.")
             return 1
         }
         printJSON([
@@ -2041,15 +2635,24 @@ private func runStatus(args: [String]) -> Int32 {
             "version": env.version,
             "key_fingerprint": env.key_fingerprint,
             "created_at": env.created_at,
+            "envelope_sha256": env.envelope_sha256,
+            "envelope_integrity_ok": true,
+            "sep_key_recognized": SecureEnclave.isAvailable,
             "se_blob_bytes": seBlob.count,
             "ciphertext_bytes": combined.count,
         ])
         return 0
     } catch {
+        var stateVal: String = "none"
+        if let dir = try? resolveEnvelopeDirectory(createIfMissing: false),
+           let stRec = try? loadStateRecord(dir: dir, stem: envelopeStem(service: svc, account: account)) {
+            stateVal = stRec.state
+        }
         printJSON([
             "exists": false,
             "service": svc,
             "account": account,
+            "lifecycle_state": stateVal,
             "error": error.localizedDescription,
         ])
         return 1
@@ -2082,15 +2685,628 @@ private func runDelete(args: [String]) -> Int32 {
     }
 
     do {
-        let deleted = try deleteKeychainEnvelope(service: svc, account: account)
+        let deleted = try deleteEnvelope(service: svc, account: account)
         printJSON([
             "deleted": deleted,
             "service": svc,
             "account": account,
+            "lifecycle_state": "deleted",
         ])
         return 0
     } catch {
         writeStderr("delete failed: \(error.localizedDescription)")
+        return 1
+    }
+}
+
+private func inspectProcessStartTimes(pid: pid_t) -> (startSec: UInt64, startUsec: UInt64)? {
+    guard pid > 1 else { return nil }
+    var bsdInfo = proc_bsdinfo()
+    let bsdSize = proc_pidinfo(
+        pid,
+        PROC_PIDTBSDINFO,
+        0,
+        &bsdInfo,
+        Int32(MemoryLayout<proc_bsdinfo>.size)
+    )
+    guard bsdSize == Int32(MemoryLayout<proc_bsdinfo>.size),
+          bsdInfo.pbi_status != UInt32(SZOMB) else {
+        return nil
+    }
+    return (bsdInfo.pbi_start_tvsec, bsdInfo.pbi_start_tvusec)
+}
+
+private func verifyChildOwnsOutboundTCPConnection(
+    pid: pid_t,
+    expectedStartSec: UInt64,
+    expectedStartUsec: UInt64,
+    localPort: UInt16,
+    remotePort: UInt16
+) -> Bool {
+    guard let times = inspectProcessStartTimes(pid: pid),
+          times.startSec == expectedStartSec,
+          times.startUsec == expectedStartUsec else {
+        return false
+    }
+    let byteCount = proc_pidinfo(pid, PROC_PIDLISTFDS, 0, nil, 0)
+    guard byteCount > 0 else { return false }
+    let count = Int(byteCount) / MemoryLayout<proc_fdinfo>.size + 16
+    var fds = [proc_fdinfo](repeating: proc_fdinfo(), count: count)
+    let actualBytes = proc_pidinfo(
+        pid,
+        PROC_PIDLISTFDS,
+        0,
+        &fds,
+        Int32(count * MemoryLayout<proc_fdinfo>.size)
+    )
+    guard actualBytes > 0 else { return false }
+    let actualCount = Int(actualBytes) / MemoryLayout<proc_fdinfo>.size
+    let expectedLoopback = inet_addr("127.0.0.1")
+
+    for i in 0..<actualCount where fds[i].proc_fdtype == PROX_FDTYPE_SOCKET {
+        var sinfo = socket_fdinfo()
+        let sz = proc_pidfdinfo(
+            pid,
+            fds[i].proc_fd,
+            PROC_PIDFDSOCKETINFO,
+            &sinfo,
+            Int32(MemoryLayout<socket_fdinfo>.size)
+        )
+        guard sz == Int32(MemoryLayout<socket_fdinfo>.size),
+              sinfo.psi.soi_kind == SOCKINFO_TCP else {
+            continue
+        }
+        let tcp = sinfo.psi.soi_proto.pri_tcp
+        let lport = UInt16(bigEndian: UInt16(truncatingIfNeeded: tcp.tcpsi_ini.insi_lport))
+        let fport = UInt16(bigEndian: UInt16(truncatingIfNeeded: tcp.tcpsi_ini.insi_fport))
+        let laddr = tcp.tcpsi_ini.insi_laddr.ina_46.i46a_addr4.s_addr
+        let faddr = tcp.tcpsi_ini.insi_faddr.ina_46.i46a_addr4.s_addr
+        if lport == localPort && fport == remotePort && laddr == expectedLoopback && faddr == expectedLoopback {
+            return true
+        }
+    }
+    return false
+}
+
+private func allocateEphemeralLoopbackListener() throws -> (fd: Int32, port: UInt16) {
+    let fd = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+    guard fd >= 0 else {
+        throw NSError(
+            domain: NSPOSIXErrorDomain,
+            code: Int(errno),
+            userInfo: [NSLocalizedDescriptionKey: "socket() failed (errno \(errno))"]
+        )
+    }
+    var reuse: Int32 = 1
+    _ = setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
+    var addr = sockaddr_in()
+    addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+    addr.sin_family = sa_family_t(AF_INET)
+    addr.sin_port = 0
+    addr.sin_addr.s_addr = inet_addr("127.0.0.1")
+
+    let bindRC = withUnsafePointer(to: &addr) { ptr in
+        ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saPtr in
+            Darwin.bind(fd, saPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
+        }
+    }
+    guard bindRC == 0, Darwin.listen(fd, 16) == 0 else {
+        let err = errno
+        _ = Darwin.close(fd)
+        throw NSError(
+            domain: NSPOSIXErrorDomain,
+            code: Int(err),
+            userInfo: [NSLocalizedDescriptionKey: "bind/listen on 127.0.0.1:0 failed (errno \(err))"]
+        )
+    }
+    var boundAddr = sockaddr_in()
+    var boundLen = socklen_t(MemoryLayout<sockaddr_in>.size)
+    let nameRC = withUnsafeMutablePointer(to: &boundAddr) { ptr in
+        ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saPtr in
+            Darwin.getsockname(fd, saPtr, &boundLen)
+        }
+    }
+    guard nameRC == 0 else {
+        let err = errno
+        _ = Darwin.close(fd)
+        throw NSError(
+            domain: NSPOSIXErrorDomain,
+            code: Int(err),
+            userInfo: [NSLocalizedDescriptionKey: "getsockname failed (errno \(err))"]
+        )
+    }
+    return (fd, UInt16(bigEndian: boundAddr.sin_port))
+}
+
+private func allocateFreeLoopbackPort(excluding: UInt16) throws -> UInt16 {
+    for _ in 0..<32 {
+        let (fd, port) = try allocateEphemeralLoopbackListener()
+        _ = Darwin.close(fd)
+        if port != excluding && port > 0 {
+            return port
+        }
+    }
+    throw NSError(
+        domain: "SEKeyProxy",
+        code: 32,
+        userInfo: [NSLocalizedDescriptionKey: "Failed to allocate free loopback port"]
+    )
+}
+
+private func runMigrateFromLegacy(args: [String]) -> Int32 {
+    disableDebuggerAttachment()
+
+    var service: String?
+    var account = kDefaultAccount
+    var legacyBinary: String?
+    var force = false
+
+    var i = 0
+    while i < args.count {
+        switch args[i] {
+        case "--service":
+            i += 1
+            if i < args.count { service = args[i] }
+        case "--account":
+            i += 1
+            if i < args.count { account = args[i] }
+        case "--legacy-binary":
+            i += 1
+            if i < args.count { legacyBinary = args[i] }
+        case "--force":
+            force = true
+        default:
+            writeStderr("Unknown migrate-from-legacy argument: \(args[i])")
+            return 2
+        }
+        i += 1
+    }
+
+    guard let svc = service, !svc.isEmpty, let legBinRaw = legacyBinary, !legBinRaw.isEmpty else {
+        writeStderr(
+            "usage: se-key-proxy migrate-from-legacy --service <service> [--account <account>] --legacy-binary <path> [--force]"
+        )
+        return 2
+    }
+
+    guard SecureEnclave.isAvailable else {
+        writeStderr("Secure Enclave is not available on this Mac.")
+        return 1
+    }
+
+    let legSegments = legBinRaw.split(separator: "/", omittingEmptySubsequences: true)
+    guard legBinRaw.hasPrefix("/"), !legSegments.contains(".."), !legSegments.contains(".") else {
+        writeStderr("Refusing relative or traversal --legacy-binary path: \(legBinRaw)")
+        return 2
+    }
+    let legBin = "/" + legSegments.joined(separator: "/")
+    var legSt = stat()
+    guard Darwin.lstat(legBin, &legSt) == 0,
+          (legSt.st_mode & S_IFMT) == S_IFREG,
+          (legSt.st_uid == geteuid() || legSt.st_uid == 0),
+          (legSt.st_mode & 0o022) == 0 else {
+        writeStderr("--legacy-binary must be a non-symlink regular file owned by current uid or root without group/world write permissions: \(legBin)")
+        return 1
+    }
+
+    do {
+        let dir = try resolveEnvelopeDirectory(createIfMissing: true)
+        let stem = envelopeStem(service: svc, account: account)
+
+        var preflightSnapshot: (envSha: String?, stateSha: String?) = (nil, nil)
+        var alreadyMigratedEnv: SealedEnvelope? = nil
+
+        try withStemLock(dir: dir, stem: stem) {
+            preflightSnapshot = try readStemSnapshot(dir: dir, stem: stem)
+            if !force {
+                if preflightSnapshot.envSha != nil {
+                    alreadyMigratedEnv = try loadEnvelope(
+                        service: svc,
+                        account: account,
+                        checkSEPNonInteractive: true
+                    )
+                    return
+                }
+                if let stRec = try loadStateRecord(dir: dir, stem: stem) {
+                    if stRec.state == "deleted" {
+                        throw NSError(
+                            domain: "SEKeyProxy",
+                            code: 33,
+                            userInfo: [
+                                NSLocalizedDescriptionKey:
+                                    "Refusing automatic migration for '\(svc)': envelope was explicitly deleted (pass --force to re-import from legacy Keychain)."
+                            ]
+                        )
+                    }
+                    throw NSError(
+                        domain: "SEKeyProxy",
+                        code: 33,
+                        userInfo: [
+                            NSLocalizedDescriptionKey:
+                                "Refusing automatic migration for '\(svc)': envelope file is missing after prior '\(stRec.state)' state (pass --force to recover from legacy Keychain or run './scripts/se-key seal')."
+                        ]
+                    )
+                }
+            }
+        }
+
+        if let existing = alreadyMigratedEnv {
+            printJSON([
+                "status": "already_migrated",
+                "service": svc,
+                "account": account,
+                "key_fingerprint": existing.key_fingerprint,
+                "created_at": existing.created_at,
+                "envelope_sha256": existing.envelope_sha256,
+            ])
+            return 0
+        }
+
+        // Verify legacy helper status before starting proxy
+        let statusProc = Process()
+        statusProc.executableURL = URL(fileURLWithPath: legBin)
+        statusProc.arguments = ["status", "--service", svc, "--account", account]
+        let statusErrPipe = Pipe()
+        statusProc.standardOutput = Pipe()
+        statusProc.standardError = statusErrPipe
+        try statusProc.run()
+        statusProc.waitUntilExit()
+        guard statusProc.terminationStatus == 0 else {
+            let errData = statusErrPipe.fileHandleForReading.readDataToEndOfFile()
+            let errText = String(data: errData, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            writeStderr("Legacy helper reported no accessible envelope for '\(svc)': \(errText)")
+            return 1
+        }
+
+        signal(SIGPIPE, SIG_IGN)
+        let (collectorListenFD, upPort) = try allocateEphemeralLoopbackListener()
+        defer { _ = Darwin.close(collectorListenFD) }
+        let proxyPort = try allocateFreeLoopbackPort(excluding: upPort)
+
+        let sessionToken = "se-session-" + randomHexBytes(32)
+        let collectorNonce = randomHexBytes(32)
+
+        var tokPipe: [Int32] = [-1, -1]
+        var readyPipe: [Int32] = [-1, -1]
+        guard Darwin.pipe(&tokPipe) == 0, Darwin.pipe(&readyPipe) == 0 else {
+            writeStderr("pipe() failed during migration setup")
+            return 1
+        }
+        defer {
+            for fd in [tokPipe[0], tokPipe[1], readyPipe[0], readyPipe[1]] where fd >= 0 {
+                _ = Darwin.close(fd)
+            }
+        }
+
+        guard let tokData = (sessionToken + "\n").data(using: .utf8),
+              writeAllToFD(tokPipe[1], data: tokData) else {
+            writeStderr("Failed writing session token to migration pipe")
+            return 1
+        }
+        _ = Darwin.close(tokPipe[1])
+        tokPipe[1] = -1
+
+        var fileActions: posix_spawn_file_actions_t? = nil
+        posix_spawn_file_actions_init(&fileActions)
+        defer { posix_spawn_file_actions_destroy(&fileActions) }
+        posix_spawn_file_actions_addclose(&fileActions, collectorListenFD)
+        posix_spawn_file_actions_addclose(&fileActions, readyPipe[0])
+
+        let childArgs = [
+            legBin,
+            "proxy",
+            "--service", svc,
+            "--account", account,
+            "--listen-host", "127.0.0.1",
+            "--listen-port", String(proxyPort),
+            "--upstream-url", "http://127.0.0.1:\(upPort)/v1",
+            "--upstream-pid", String(getpid()),
+            "--allowed-model", "migrate",
+            "--max-chat-requests", "1",
+            "--ttl-seconds", "30",
+            "--session-token-fd", String(tokPipe[0]),
+            "--ready-fd", String(readyPipe[1]),
+        ]
+        var cArgs: [UnsafeMutablePointer<CChar>?] = childArgs.map { strdup($0) }
+        cArgs.append(nil)
+        defer {
+            for ptr in cArgs where ptr != nil { free(ptr) }
+        }
+
+        var envPairs = [
+            "PATH=/usr/bin:/bin",
+            "HOME=\(NSHomeDirectory())",
+        ]
+        #if SE_KEY_TESTING
+        if let testEnvDir = ProcessInfo.processInfo.environment["FREE_INFERENCE_SE_ENVELOPE_DIR"] {
+            envPairs.append("FREE_INFERENCE_SE_ENVELOPE_DIR=\(testEnvDir)")
+        }
+        if let mockDir = ProcessInfo.processInfo.environment["FREE_INFERENCE_TEST_MOCK_STATE_DIR"] {
+            envPairs.append("FREE_INFERENCE_TEST_MOCK_STATE_DIR=\(mockDir)")
+        }
+        #endif
+        var cEnv: [UnsafeMutablePointer<CChar>?] = envPairs.map { strdup($0) }
+        cEnv.append(nil)
+        defer {
+            for ptr in cEnv where ptr != nil { free(ptr) }
+        }
+
+        var childPID: pid_t = 0
+        let spawnRC = posix_spawn(&childPID, legBin, &fileActions, nil, &cArgs, &cEnv)
+        _ = Darwin.close(tokPipe[0])
+        tokPipe[0] = -1
+        _ = Darwin.close(readyPipe[1])
+        readyPipe[1] = -1
+
+        guard spawnRC == 0, childPID > 1 else {
+            writeStderr("posix_spawn failed for legacy helper (rc=\(spawnRC))")
+            return 1
+        }
+        defer {
+            if childPID > 1 {
+                _ = Darwin.kill(childPID, SIGTERM)
+                var status: Int32 = 0
+                for _ in 0..<20 {
+                    if Darwin.waitpid(childPID, &status, WNOHANG) == childPID {
+                        childPID = 0
+                        break
+                    }
+                    usleep(25_000)
+                }
+                if childPID > 1 {
+                    _ = Darwin.kill(childPID, SIGKILL)
+                    _ = Darwin.waitpid(childPID, &status, 0)
+                    childPID = 0
+                }
+            }
+        }
+
+        guard let childStart = inspectProcessStartTimes(pid: childPID) else {
+            writeStderr("Could not inspect start time for spawned legacy helper pid=\(childPID)")
+            return 1
+        }
+
+        // Wait for readiness signal on readyPipe[0] (up to 60s for interactive Touch ID)
+        setNonBlocking(readyPipe[0])
+        let readyDeadline = DispatchTime.now().uptimeNanoseconds + 60_000_000_000
+        var readyBuf = Data()
+        var isReady = false
+        while DispatchTime.now().uptimeNanoseconds < readyDeadline {
+            var pfd = pollfd(fd: readyPipe[0], events: Int16(POLLIN), revents: 0)
+            let prc = Darwin.poll(&pfd, 1, 100)
+            if prc > 0 {
+                var tmp = [UInt8](repeating: 0, count: 512)
+                let n = Darwin.read(readyPipe[0], &tmp, tmp.count)
+                if n > 0 {
+                    readyBuf.append(contentsOf: tmp[0..<n])
+                    if let txt = String(data: readyBuf, encoding: .utf8), txt.contains("\"ready\"") {
+                        isReady = true
+                        break
+                    }
+                } else if n == 0 {
+                    break
+                }
+            }
+            var wstatus: Int32 = 0
+            if Darwin.waitpid(childPID, &wstatus, WNOHANG) == childPID {
+                childPID = 0
+                break
+            }
+        }
+        guard isReady else {
+            writeStderr("Legacy helper did not become ready within 60s during migration")
+            return 1
+        }
+
+        // Connect to legacy proxy and send GET /v1/models?nonce=<collectorNonce>
+        let reqFD = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+        guard reqFD >= 0 else {
+            writeStderr("socket() failed for migration client")
+            return 1
+        }
+        defer { _ = Darwin.close(reqFD) }
+        var proxyAddr = sockaddr_in()
+        proxyAddr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        proxyAddr.sin_family = sa_family_t(AF_INET)
+        proxyAddr.sin_port = proxyPort.bigEndian
+        proxyAddr.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let connRC = withUnsafePointer(to: &proxyAddr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saPtr in
+                Darwin.connect(reqFD, saPtr, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard connRC == 0 else {
+            writeStderr("connect() to legacy proxy failed (errno \(errno))")
+            return 1
+        }
+        let reqStr =
+            "GET /v1/models?nonce=\(collectorNonce) HTTP/1.1\r\n" +
+            "Host: 127.0.0.1:\(proxyPort)\r\n" +
+            "Authorization: Bearer \(sessionToken)\r\n" +
+            "Accept: application/json\r\n" +
+            "Connection: close\r\n\r\n"
+        guard let reqData = reqStr.data(using: .utf8), writeAllToFD(reqFD, data: reqData) else {
+            writeStderr("Failed sending request to legacy proxy")
+            return 1
+        }
+
+        // Accept and authenticate upstream connection on collectorListenFD
+        setNonBlocking(collectorListenFD)
+        let collectDeadline = DispatchTime.now().uptimeNanoseconds + 10_000_000_000
+        var collectedSecret = Data()
+        defer { bestEffortZero(&collectedSecret) }
+        let expectedPath1 = "/v1/models?nonce=\(collectorNonce)"
+        let expectedPath2 = "/models?nonce=\(collectorNonce)"
+
+        while DispatchTime.now().uptimeNanoseconds < collectDeadline && collectedSecret.isEmpty {
+            var pfd = pollfd(fd: collectorListenFD, events: Int16(POLLIN), revents: 0)
+            let prc = Darwin.poll(&pfd, 1, 100)
+            if prc <= 0 { continue }
+
+            var peerAddr = sockaddr_in()
+            var peerLen = socklen_t(MemoryLayout<sockaddr_in>.size)
+            let connFD = withUnsafeMutablePointer(to: &peerAddr) { ptr in
+                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { saPtr in
+                    Darwin.accept(collectorListenFD, saPtr, &peerLen)
+                }
+            }
+            if connFD < 0 { continue }
+            defer { _ = Darwin.close(connFD) }
+
+            let peerPort = UInt16(bigEndian: peerAddr.sin_port)
+            let peerIP = peerAddr.sin_addr.s_addr
+            guard peerIP == inet_addr("127.0.0.1"),
+                  verifyChildOwnsOutboundTCPConnection(
+                      pid: childPID,
+                      expectedStartSec: childStart.startSec,
+                      expectedStartUsec: childStart.startUsec,
+                      localPort: peerPort,
+                      remotePort: upPort
+                  ) else {
+                continue
+            }
+
+            // Read HTTP headers from authenticated legacy child socket
+            var hdrBuf = Data()
+            defer { bestEffortZero(&hdrBuf) }
+            let hdrSep = Data([0x0D, 0x0A, 0x0D, 0x0A])
+            let readLimit = DispatchTime.now().uptimeNanoseconds + 3_000_000_000
+            setNonBlocking(connFD)
+            while DispatchTime.now().uptimeNanoseconds < readLimit && hdrBuf.count < 16384 {
+                if hdrBuf.range(of: hdrSep) != nil { break }
+                var p = pollfd(fd: connFD, events: Int16(POLLIN), revents: 0)
+                if Darwin.poll(&p, 1, 50) > 0 {
+                    var chunk = [UInt8](repeating: 0, count: 1024)
+                    defer {
+                        for idx in 0..<chunk.count { chunk[idx] = 0 }
+                    }
+                    let n = Darwin.read(connFD, &chunk, chunk.count)
+                    if n > 0 {
+                        hdrBuf.append(contentsOf: chunk[0..<n])
+                    } else if n == 0 {
+                        break
+                    }
+                }
+            }
+            guard let sepRange = hdrBuf.range(of: hdrSep) else {
+                continue
+            }
+            let headerData = hdrBuf.subdata(in: 0..<sepRange.lowerBound)
+            let crlf = Data([0x0D, 0x0A])
+            guard let firstLineEnd = headerData.range(of: crlf),
+                  let reqLine = String(data: headerData.subdata(in: 0..<firstLineEnd.lowerBound), encoding: .utf8) else {
+                continue
+            }
+            let reqParts = reqLine.split(separator: " ")
+            guard reqParts.count >= 2,
+                  reqParts[0] == "GET",
+                  (reqParts[1] == expectedPath1 || reqParts[1] == expectedPath2) else {
+                continue
+            }
+
+            // Scan header lines for Authorization: Bearer <secret> in raw Data
+            var cursor = firstLineEnd.upperBound
+            let authPrefix = Data("authorization:".utf8)
+            let bearerPrefix = Data("bearer ".utf8)
+            var extracted = Data()
+            defer { bestEffortZero(&extracted) }
+
+            while cursor < headerData.count {
+                let lineEnd: Int
+                let nextCursor: Int
+                if let r = headerData.range(of: crlf, options: [], in: cursor..<headerData.count) {
+                    lineEnd = r.lowerBound
+                    nextCursor = r.upperBound
+                } else {
+                    lineEnd = headerData.count
+                    nextCursor = headerData.count
+                }
+                if lineEnd - cursor >= authPrefix.count {
+                    var prefixSlice = headerData.subdata(in: cursor..<(cursor + authPrefix.count))
+                    for idx in 0..<prefixSlice.count {
+                        if prefixSlice[idx] >= 0x41 && prefixSlice[idx] <= 0x5A {
+                            prefixSlice[idx] += 32
+                        }
+                    }
+                    if prefixSlice == authPrefix {
+                        var valSlice = headerData.subdata(in: (cursor + authPrefix.count)..<lineEnd)
+                        defer { bestEffortZero(&valSlice) }
+                        var trimmedVal = trimASCIIWhitespaceAndZero(&valSlice)
+                        defer { bestEffortZero(&trimmedVal) }
+                        if trimmedVal.count > bearerPrefix.count {
+                            var bCheck = trimmedVal.subdata(in: 0..<bearerPrefix.count)
+                            for idx in 0..<bCheck.count {
+                                if bCheck[idx] >= 0x41 && bCheck[idx] <= 0x5A {
+                                    bCheck[idx] += 32
+                                }
+                            }
+                            if bCheck == bearerPrefix {
+                                var rawBearer = trimmedVal.subdata(in: bearerPrefix.count..<trimmedVal.count)
+                                extracted = trimASCIIWhitespaceAndZero(&rawBearer)
+                                break
+                            }
+                        }
+                    }
+                }
+                cursor = nextCursor
+            }
+
+            guard !extracted.isEmpty else {
+                continue
+            }
+            collectedSecret = Data(extracted)
+            let okResp =
+                "HTTP/1.1 200 OK\r\n" +
+                "Content-Type: application/json\r\n" +
+                "Content-Length: 28\r\n" +
+                "Connection: close\r\n\r\n" +
+                "{\"object\":\"list\",\"data\":[]}\n"
+            if let okData = okResp.data(using: .utf8) {
+                _ = writeAllToFD(connFD, data: okData)
+            }
+            break
+        }
+
+        guard !collectedSecret.isEmpty else {
+            writeStderr("Failed to collect authenticated secret from legacy helper")
+            return 1
+        }
+
+        let publishedEnv = try withStemLock(dir: dir, stem: stem) { () -> SealedEnvelope in
+            let currentSnapshot = try readStemSnapshot(dir: dir, stem: stem)
+            guard currentSnapshot.envSha == preflightSnapshot.envSha,
+                  currentSnapshot.stateSha == preflightSnapshot.stateSha else {
+                throw NSError(
+                    domain: "SEKeyProxy",
+                    code: 34,
+                    userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "Aborted migration: concurrent seal or delete modified envelope state while migration was in flight"
+                    ]
+                )
+            }
+            return try sealAndPublishEnvelopeLocked(
+                dir: dir,
+                stem: stem,
+                service: svc,
+                account: account,
+                secretData: collectedSecret,
+                stateLabel: "migrated"
+            )
+        }
+
+        printJSON([
+            "status": "migrated",
+            "service": svc,
+            "account": account,
+            "key_fingerprint": publishedEnv.key_fingerprint,
+            "created_at": publishedEnv.created_at,
+            "envelope_sha256": publishedEnv.envelope_sha256,
+            "access_control": "biometryCurrentSet",
+        ])
+        return 0
+    } catch {
+        writeStderr("migrate-from-legacy failed: \(error.localizedDescription)")
         return 1
     }
 }
@@ -2682,7 +3898,7 @@ private func unsealFromKeychainAndSecureEnclave(
     maxChatRequests: Int,
     ttlSeconds: Int
 ) throws -> Data {
-    let env = try loadKeychainEnvelope(service: service, account: account)
+    let env = try loadEnvelope(service: service, account: account, checkSEPNonInteractive: false)
     guard
         env.version == kEnvelopeVersion,
         env.service == service,
@@ -2693,7 +3909,7 @@ private func unsealFromKeychainAndSecureEnclave(
         throw NSError(
             domain: "SEKeyProxy",
             code: 2,
-            userInfo: [NSLocalizedDescriptionKey: "Invalid Keychain envelope for service '\(service)'"]
+            userInfo: [NSLocalizedDescriptionKey: "Invalid envelope for service '\(service)'"]
         )
     }
 
@@ -2721,7 +3937,7 @@ private func unsealFromKeychainAndSecureEnclave(
 
 let rawArgs = Array(CommandLine.arguments.dropFirst())
 guard let subcmd = rawArgs.first else {
-    writeStderr("usage: se-key-proxy <seal|status|delete|selftest|proxy> [options]")
+    writeStderr("usage: se-key-proxy <seal|status|delete|migrate-from-legacy|selftest|proxy> [options]")
     Darwin.exit(2)
 }
 let subArgs = Array(rawArgs.dropFirst())
@@ -2733,11 +3949,15 @@ case "status":
     Darwin.exit(runStatus(args: subArgs))
 case "delete":
     Darwin.exit(runDelete(args: subArgs))
+case "migrate-from-legacy":
+    Darwin.exit(runMigrateFromLegacy(args: subArgs))
 case "selftest":
     Darwin.exit(runSelftest())
 case "proxy":
     Darwin.exit(runProxy(args: subArgs))
 default:
-    writeStderr("Unknown subcommand '\(subcmd)'. Expected seal, status, delete, selftest, or proxy.")
+    writeStderr(
+        "Unknown subcommand '\(subcmd)'. Expected seal, status, delete, migrate-from-legacy, selftest, or proxy."
+    )
     Darwin.exit(2)
 }

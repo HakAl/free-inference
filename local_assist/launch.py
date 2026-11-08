@@ -125,6 +125,14 @@ def add_common_launcher_arguments(
         help=no_serve_help,
     )
     parser.add_argument(
+        "--refresh-session",
+        "--restart",
+        dest="refresh_session",
+        action="store_true",
+        default=False,
+        help="Stop any active session for the target model and start a fresh session (for example a fresh 12-hour Touch ID session).",
+    )
+    parser.add_argument(
         "--preserve-host-home",
         action="store_true",
         default=False,
@@ -289,8 +297,12 @@ def validate_common_worker_flags(
     args: argparse.Namespace,
     active_profile: WorkerSecurityProfile | None,
 ) -> str | None:
+    if getattr(args, "refresh_session", False) and getattr(args, "no_serve", False):
+        return "Refusing --refresh-session (--restart) with --no-serve: refreshing a session requires starting a server/proxy."
     if active_profile is None:
         return None
+    if getattr(args, "refresh_session", False):
+        return "Refusing --refresh-session (--restart) in unattended worker mode: unattended workers require a pre-served model session."
     if getattr(args, "preserve_host_home", False):
         return "Refusing --preserve-host-home: host HOME cannot be preserved when a worker security profile is active."
     if getattr(args, "allow_uncleared_model", False) and not active_profile.allow_uncleared_model:
