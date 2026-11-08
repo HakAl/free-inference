@@ -29,3 +29,5 @@ models/
 *.pth
 
 .local
+.models.yaml.lock
+.models-sync-*.yaml

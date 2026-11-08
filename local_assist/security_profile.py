@@ -1655,6 +1655,12 @@ def compile_seatbelt_profile(
                     f'(allow network-outbound (remote unix-socket (path-literal "{_seatbelt_escape_literal(sock_var)}")))'
                 )
 
+    # opencode run --standalone spins up an internal Bun/Hono HTTP server on an ephemeral
+    # loopback port (127.0.0.1:0) and connects its CLI client to that ephemeral port as well
+    # as the inference endpoint (8080 or the parent _WorkerTokenRelay port). Direct access to
+    # se-key-proxy (8081), tinfoil-proxy (9081/9181), and profile-denied ports is blocked by
+    # the subsequent (deny network-outbound ...) rule below, and worker-shell child processes
+    # do not inherit this process-path grant.
     lines.extend(
         [
             "(allow network-bind",
@@ -2531,6 +2537,7 @@ class _WorkerTokenRelay:
         self.upstream_timeout_seconds = max(1.0, float(upstream_timeout_seconds))
         self.max_response_bytes = max(4096, int(max_response_bytes))
         self._lock = threading.Lock()
+        self._inflight_sem = threading.BoundedSemaphore(16)
         self.chat_requests_used = 0
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
@@ -2553,6 +2560,13 @@ class _WorkerTokenRelay:
 
         class _Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
+
+            def setup(self) -> None:
+                try:
+                    self.request.settimeout(min(30.0, relay.upstream_timeout_seconds))
+                except OSError:
+                    pass
+                super().setup()
 
             def log_message(self, format: str, *args: Any) -> None:
                 return
@@ -2661,10 +2675,19 @@ class _WorkerTokenRelay:
                     )
                     return
 
-                # Clamp max_tokens and max_completion_tokens on the forwarded payload.
+                # Clamp n (and best_of when present) to 1 so worst-case output spend is bounded to 1 completion per request.
+                if "n" in parsed_body:
+                    parsed_body["n"] = 1
+                if "best_of" in parsed_body:
+                    parsed_body["best_of"] = 1
+
+                # Clamp max_tokens and max_completion_tokens (and strip maxOutputTokens) on the forwarded payload.
                 req_max_tok = parsed_body.get("max_tokens")
+                req_max_out = parsed_body.pop("maxOutputTokens", None)
                 if isinstance(req_max_tok, int) and not isinstance(req_max_tok, bool):
                     parsed_body["max_tokens"] = min(max(1, req_max_tok), relay.max_tokens_cap)
+                elif isinstance(req_max_out, int) and not isinstance(req_max_out, bool):
+                    parsed_body["max_tokens"] = min(max(1, req_max_out), relay.max_tokens_cap)
                 else:
                     parsed_body["max_tokens"] = relay.max_tokens_cap
 
@@ -2708,6 +2731,13 @@ class _WorkerTokenRelay:
             def _forward_upstream(
                 self, method: str, path: str, body: bytes | None
             ) -> None:
+                if not relay._inflight_sem.acquire(timeout=5.0):
+                    self._send_json_error(
+                        429,
+                        "Too many concurrent worker relay requests.",
+                        "rate_limit_error",
+                    )
+                    return
                 conn = http.client.HTTPConnection(
                     relay.upstream_host,
                     relay.upstream_port,
@@ -2731,6 +2761,10 @@ class _WorkerTokenRelay:
                     self.send_response(resp.status)
                     headers_sent = True
                     self.send_header("Content-Type", content_type)
+                    for pass_hdr in ("Retry-After", "x-request-id"):
+                        hdr_val = resp.getheader(pass_hdr)
+                        if hdr_val is not None:
+                            self.send_header(pass_hdr, hdr_val)
                     if not is_sse:
                         up_cl = resp.getheader("Content-Length")
                         if up_cl is not None:
@@ -2748,6 +2782,11 @@ class _WorkerTokenRelay:
                             break
                         total_read += len(chunk)
                         if total_read > relay.max_response_bytes:
+                            if is_sse:
+                                self.wfile.write(
+                                    b'\ndata: {"error":{"message":"Response exceeded max_response_bytes","type":"response_truncated"}}\n\n'
+                                )
+                                self.wfile.flush()
                             break
                         self.wfile.write(chunk)
                         self.wfile.flush()
@@ -2765,6 +2804,7 @@ class _WorkerTokenRelay:
                         except Exception:
                             pass
                 finally:
+                    relay._inflight_sem.release()
                     try:
                         conn.close()
                     except Exception:

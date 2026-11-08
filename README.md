@@ -38,7 +38,7 @@ Every endpoint in [`models.yaml`](models.yaml) is ordered along five explicit da
 
 | Platform | Rung 1 Local | Rung 2/3 Attested | Offline Tests & CI |
 |---|---|---|---|
-| **macOS Apple Silicon (`arm64`) + Touch ID** | Supported (48 GB RAM rec. for 30B MLX) | Supported (Secure Enclave + Touch ID) | Supported (all 106 tests + hardware SE selftest) |
+| **macOS Apple Silicon (`arm64`) + Touch ID** | Supported (48 GB RAM rec. for 30B MLX) | Supported (Secure Enclave + Touch ID) | Supported (all 108 tests + hardware SE selftest) |
 | **macOS Apple Silicon (`arm64`) without Touch ID**<br>*(e.g. Mac mini / Studio without Magic Keyboard)* | Supported | Unsupported (`selftest` exits `77`; `setup` skips gracefully) | Supported (`test_se_key` skips biometric gate on exit `77`) |
 | **Linux (`x86_64` / `arm64`)** | N/A (requires Apple Metal) | N/A (requires Secure Enclave) | Supported (portable stdlib unit + `--offline-ci` manifest suite) |
 
@@ -48,13 +48,28 @@ Every endpoint in [`models.yaml`](models.yaml) is ordered along five explicit da
 
 ### 1. Bootstrap environment and verified proxy binaries
 
-Requires macOS on Apple Silicon (`Darwin arm64`; with Touch ID for Rung 2/3, while Rung 1 local inference works on all Apple Silicon Macs), `uv`, `python3` (`>= 3.11`), `node` (`^20.20.0 || >=22.22.0`) and `npm`, `curl`, `unzip`, Xcode Command Line Tools (`swiftc`, `codesign`), and [`opencode`](https://opencode.ai) (`v2.0.32+`). Optional: `gh` CLI (authenticated via `gh auth login`) for GitHub Sigstore SLSA provenance verification of `tinfoil-proxy`.
+Requires macOS on Apple Silicon (`Darwin arm64`; with Touch ID for Rung 2/3, while Rung 1 local inference works on all Apple Silicon Macs), `python3` (`>= 3.11`), `curl`, `unzip`, Xcode Command Line Tools (`swiftc`, `codesign`), and [`opencode`](https://opencode.ai) (`v2.0.32+`). Optional: `uv` (required for `--local-only` and full setup), `node` (`^20.20.0 || >=22.22.0`) and `npm` (required only for full evaluation setup), and `gh` CLI (authenticated via `gh auth login`) for GitHub Sigstore SLSA provenance verification of `tinfoil-proxy`.
+
+Choose the setup mode matching your workflow:
+
+| Mode | Command | Installed Packages | Disk Footprint (`.venv` + `node_modules`) | Cached Proxy Build/Verify Time |
+|---|---|---|---|---|
+| **Rung 2/3 Launcher Only** | `./scripts/setup --launcher-only` (`--proxy-only`) | `0` Python / `0` Node packages (uses stdlib Python 3.11+) | `0 MB` (`~61 MB` in `bin/` for `se-key-proxy` + `tinfoil-proxy`) | `~1.8s` |
+| **Rung 1 Local MLX + Launchers** | `./scripts/setup --local-only` | `35` pinned Python packages ([`requirements-local.txt`](requirements-local.txt)), `0` Node packages | `~279 MB` `.venv` (`0 MB` `node_modules`; saves `~1.76 GB`) | `~2.5s` (warm uv wheel cache) |
+| **Full Evaluation Workbench** | `./scripts/setup` | `71` pinned Python packages ([`requirements.txt`](requirements.txt)) + `promptfoo` (`0.121.11`) | `~706 MB` `.venv` + `~1,335 MB` `node_modules` (`~2.04 GB` total) | `~8-15s` (warm cache) |
 
 ```bash
+# Rung 2/3 attested enclave launcher only (0 Python/Node packages; builds se-key-proxy and verifies tinfoil-proxy)
+./scripts/setup --launcher-only
+
+# Rung 1 local MLX + Rung 2/3 launchers (35 pinned Python packages from requirements-local.txt; skips Node/promptfoo and VLM/audio/OpenCV)
+./scripts/setup --local-only
+
+# Full evaluation workbench + launchers (71 pinned Python packages from requirements.txt + promptfoo 0.121.11 via npm ci)
 ./scripts/setup
 ```
 
-`./scripts/setup` validates the platform (`Darwin arm64`), Python (`>= 3.11`), and Node.js (`^20.20.0 || >=22.22.0`) versions, creates `.venv`, installs the exact pinned Python transitive closure from [`requirements.txt`](requirements.txt) and pinned `promptfoo` (`0.121.11`) via `npm ci`, compiles [`tools/se_key_proxy/main.swift`](tools/se_key_proxy/main.swift) into `bin/se-key-proxy` and `bin/se-key-proxy-test` (running the hardware Secure Enclave non-interactive selftest when Touch ID hardware is present, or skipping `exit 77` on Macs without Touch ID), and downloads `bin/tinfoil-proxy` (`v0.2.9`) into a temporary staging directory, verifying its pinned SHA-256 (`6b526fe3...`), Apple Developer ID signature (`TeamIdentifier=8KSH668LZT`), and (when `gh` is authenticated) GitHub SLSA Sigstore provenance bundle via `gh attestation verify` before moving the binary into `bin/tinfoil-proxy` (set `FREE_INFERENCE_REQUIRE_GH_ATTESTATION=1` to require `gh` attestation in strict environments).
+`./scripts/setup` validates the platform (`Darwin arm64`) and Python (`>= 3.11`), provisions `.venv` when `--local-only` ([`requirements-local.txt`](requirements-local.txt), 35 packages) or full mode ([`requirements.txt`](requirements.txt), 71 packages + `promptfoo` `0.121.11` via `npm ci`) is selected, compiles [`tools/se_key_proxy/main.swift`](tools/se_key_proxy/main.swift) into `bin/se-key-proxy` and `bin/se-key-proxy-test` via atomic staging (running the hardware Secure Enclave non-interactive selftest when Touch ID hardware is present, or skipping `exit 77` on Macs without Touch ID), and downloads `bin/tinfoil-proxy` (`v0.2.9`) into a temporary staging directory, verifying its pinned SHA-256 (`6b526fe3...`), Apple Developer ID signature (`TeamIdentifier=8KSH668LZT`), and (when `gh` is authenticated) GitHub SLSA Sigstore provenance bundle via `gh attestation verify` before moving the binary into `bin/tinfoil-proxy` (set `FREE_INFERENCE_REQUIRE_GH_ATTESTATION=1` to require `gh` attestation in strict environments).
 
 ### 2. Rung 1: Local Private Coding (`private-local`)
 
@@ -98,7 +113,7 @@ cd /path/to/your/project
 /path/to/free-inference/scripts/opencode-attested -- run "Review the current git diff for security issues"
 ```
 
-To try another evaluated Rung 3 candidate (`tinfoil-kimi-k3-1-pro`, `tinfoil-glm-5-3`, `tinfoil-gpt-oss-120b`, or `tinfoil-kimi-k3` [scheduled for upstream deprecation `2026-11-12`]), stop the active proxy on port `8081` and pass `--model <id> --allow-uncleared-model`:
+To try another evaluated Rung 3 candidate (`tinfoil-kimi-k3-1-pro`, `tinfoil-glm-5-3`, or `tinfoil-gpt-oss-120b`), stop the active proxy on port `8081` and pass `--model <id> --allow-uncleared-model` (models with `deprecated: true` or a `deprecation_date` in `models.yaml`, such as `tinfoil-kimi-k3`, are blocked unless `--allow-deprecated-model` is also passed):
 
 ```bash
 ./scripts/stop-model tinfoil-deepseek-v4-1-flash
@@ -192,7 +207,8 @@ rm -rf .venv node_modules bin .home
 ├── CONTRIBUTING.md                  Contributor invariants and verification checklist
 ├── SECURITY.md                      Threat model, trust boundaries, and vulnerability reporting
 ├── models.yaml                      5-rung model registry, pricing, and routing gates
-├── requirements.txt                 Pinned Python transitive dependencies
+├── requirements-local.txt           Minimal pinned Python closure for Rung 1 mlx-lm (35 packages)
+├── requirements.txt                 Full pinned Python closure for evaluation workbench (71 packages)
 ├── config/
 │   ├── opencode-private-local.json.tmpl
 │   └── opencode-private-attested.json.tmpl
@@ -204,10 +220,10 @@ rm -rf .venv node_modules bin .home
 │   ├── plan.md                      Evaluation workflow and capability gates
 │   └── proposal.md                  5-rung architecture and design rationale
 ├── evals/{prompts,suites,rubrics,chat_templates,transforms}/
-├── local_assist/                    Registry, catalog sync, admission gates, MCP server, SE key & worker sandbox
+├── local_assist/                    Registry, catalog sync, launch helpers, admission gates, MCP server, SE key & worker sandbox
 ├── scripts/
-│   ├── setup                        Bootstrap .venv, npm, bin/se-key-proxy, bin/tinfoil-proxy
-│   ├── models                       List registered models with rung and usage policy
+│   ├── setup                        Bootstrap (--launcher-only, --local-only, or full), bin/se-key-proxy, bin/tinfoil-proxy
+│   ├── models                       List registered models with rung and usage policy (--version)
 │   ├── sync-model-catalog           Check/heal upstream catalog drift and reconcile [catalog-drift] issues
 │   ├── se-key                       Build, selftest, store, status, and delete SE keys
 │   ├── serve-model / stop-model     Start/stop local MLX servers or dual attested proxies
@@ -218,11 +234,11 @@ rm -rf .venv node_modules bin .home
 │   ├── delegate-local               CLI wrapper for Rung 1 local_assist tools
 │   ├── eval / timing / opencode-smoke
 │   └── *-e2e                        End-to-end verification harnesses
-├── tests/                           106 offline unit, catalog sync, Seatbelt, and SE selftests
+├── tests/                           108 offline unit, catalog sync, Seatbelt, and SE selftests
 └── tools/se_key_proxy/main.swift    Hardware-backed Secure Enclave + Touch ID proxy
 ```
 
-Run the offline unit, catalog sync, Seatbelt, and Secure Enclave selftest suite (106 tests, stdlib + Node):
+Run the offline unit, catalog sync, Seatbelt, and Secure Enclave selftest suite (108 tests, stdlib + Node):
 
 ```bash
 .venv/bin/python -B -m unittest discover -s tests -v

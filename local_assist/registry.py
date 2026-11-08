@@ -3,12 +3,13 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import math
 import os
 import re
 import shlex
 import subprocess
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -72,9 +73,36 @@ VALID_USAGE_POLICIES = {
     "unknown",
 }
 VALID_ROUTING_CLEARANCES = {"cleared", "blocked"}
+VALID_MODEL_STATUSES = {"active", "runnable", "reviewed", "candidate", "archived"}
 WEIGHTS_HASH_RE = re.compile(r"^(?:dmverity:)?sha256:[0-9a-f]{64}$")
-WEIGHTS_SOURCE_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+@[0-9a-f]{40}$")
+WEIGHTS_SOURCE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9][A-Za-z0-9._-]{0,99}@[0-9a-f]{40}$")
 ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def is_model_effectively_deprecated(
+    deprecated: bool,
+    deprecation_date: str | date | None,
+    *,
+    today: date | None = None,
+) -> bool:
+    if deprecated is True:
+        return True
+    if deprecation_date is None:
+        return False
+    if isinstance(deprecation_date, date) and not isinstance(deprecation_date, datetime):
+        parsed_date = deprecation_date
+    elif isinstance(deprecation_date, str):
+        clean_str = deprecation_date.strip()
+        if not ISO_DATE_RE.match(clean_str):
+            return False
+        try:
+            parsed_date = date.fromisoformat(clean_str)
+        except ValueError:
+            return False
+    else:
+        return False
+    ref_today = today or datetime.now(timezone.utc).date()
+    return parsed_date <= ref_today
 KEYCHAIN_SERVICE_RE = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
 
 
@@ -110,6 +138,9 @@ class EndpointConfig:
     pricing_per_m_tokens: dict[str, float] | None = None
     context_window: int | None = None
     eval_evidence_artifact: str | None = None
+    status: str = "candidate"
+    deprecated: bool = False
+    deprecation_date: str | None = None
 
     @property
     def data_control_rung(self) -> int:
@@ -730,6 +761,60 @@ def resolve_endpoint(
             "'eval_evidence_artifact' path under 'docs/evals/<model-id>.json'."
         )
 
+    raw_status = model.get("status")
+    if raw_status is None:
+        status = "candidate"
+    elif isinstance(raw_status, str) and raw_status.strip() in VALID_MODEL_STATUSES:
+        status = raw_status.strip()
+    else:
+        raise RegistryError(
+            f"Model {model_id}: invalid status {raw_status!r}. Must be one of {sorted(VALID_MODEL_STATUSES)}."
+        )
+
+    raw_deprecated = model.get("deprecated")
+    if raw_deprecated is None:
+        deprecated = False
+    elif isinstance(raw_deprecated, bool):
+        deprecated = raw_deprecated
+    else:
+        raise RegistryError(
+            f"Model {model_id}: 'deprecated' must be a boolean (true or false), got {raw_deprecated!r}."
+        )
+
+    raw_dep_date = model.get("deprecation_date")
+    if raw_dep_date is None:
+        deprecation_date: str | None = None
+    elif isinstance(raw_dep_date, date) and not isinstance(raw_dep_date, datetime):
+        deprecation_date = raw_dep_date.isoformat()
+    elif isinstance(raw_dep_date, str) and raw_dep_date.strip():
+        clean_dep_date = raw_dep_date.strip()
+        if not ISO_DATE_RE.match(clean_dep_date):
+            raise RegistryError(
+                f"Model {model_id}: 'deprecation_date' must be in YYYY-MM-DD format, got {raw_dep_date!r}."
+            )
+        try:
+            date.fromisoformat(clean_dep_date)
+        except ValueError as exc:
+            raise RegistryError(
+                f"Model {model_id}: invalid calendar date '{clean_dep_date}' for 'deprecation_date'."
+            ) from exc
+        deprecation_date = clean_dep_date
+    else:
+        raise RegistryError(
+            f"Model {model_id}: 'deprecation_date' must be null or a YYYY-MM-DD string, got {raw_dep_date!r}."
+        )
+
+    if routing_private_local == "cleared" or routing_private_attested == "cleared":
+        if status == "archived":
+            raise RegistryError(
+                f"Model {model_id}: archived models (status='archived') cannot have routing clearance ('cleared')."
+            )
+        if is_model_effectively_deprecated(deprecated, deprecation_date):
+            raise RegistryError(
+                f"Model {model_id}: deprecated models (deprecated={deprecated}, deprecation_date={deprecation_date!r}) "
+                "cannot have routing clearance ('cleared')."
+            )
+
     raw_remote_trust = model.get("remote_trust")
     pricing_per_m_tokens: dict[str, float] | None = None
     if isinstance(raw_remote_trust, dict):
@@ -743,9 +828,14 @@ def resolve_endpoint(
             for k in ("input", "output", "cached_input"):
                 val = raw_pricing.get(k)
                 if val is not None:
-                    if isinstance(val, bool) or not isinstance(val, (int, float)) or float(val) < 0:
+                    if (
+                        isinstance(val, bool)
+                        or not isinstance(val, (int, float))
+                        or not math.isfinite(float(val))
+                        or float(val) < 0
+                    ):
                         raise RegistryError(
-                            f"Model {model_id}: remote_trust.pricing_per_m_tokens.{k} must be a non-negative number."
+                            f"Model {model_id}: remote_trust.pricing_per_m_tokens.{k} must be a finite non-negative number."
                         )
                     parsed_pricing[k] = float(val)
             if parsed_pricing:
@@ -785,6 +875,9 @@ def resolve_endpoint(
         pricing_per_m_tokens=pricing_per_m_tokens,
         context_window=context_window,
         eval_evidence_artifact=eval_evidence_artifact,
+        status=status,
+        deprecated=deprecated,
+        deprecation_date=deprecation_date,
     )
 
 

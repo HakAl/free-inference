@@ -102,7 +102,7 @@ models:
       tool: mlx-lm
       tool_version: 0.26.3
     disk_gb_estimate: 17.2
-    ram_gb_estimate: null
+    ram_gb_estimate: 18
     context_window: 262144
     modalities:
       - text
@@ -121,8 +121,8 @@ models:
       fits the 48 GB Mac budget comfortably. mlx-lm 0.31.3 auto-detects
       the json_tools parser (<tool_call>...</tool_call>).
     review_notes: |
-      Provenance verified 2026-05-14 in prior local lab (DefenseSector/local-llm,
-      where it received a 4.6 avg human rubric score on v1; human rubric not
+      Provenance verified 2026-05-14 in an earlier local evaluation pass
+      (where it received a 4.6 avg human rubric score on v1; human rubric not
       re-scored in this fork). Evaluated in this fork on 2026-10-29 across sanity
       (1/1), automated v1 assertions (10/10), tools (4/4, buffered streaming
       tool_call_chunks=1), and locked-down opencode v2.0.32 standalone smoke test

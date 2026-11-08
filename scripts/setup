@@ -3,16 +3,55 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
+SETUP_MODE="full"
+for arg in "$@"; do
+  case "$arg" in
+    --launcher-only|--proxy-only)
+      SETUP_MODE="launcher-only"
+      ;;
+    --local-only)
+      SETUP_MODE="local-only"
+      ;;
+    -h|--help)
+      cat <<'EOF'
+Usage: ./scripts/setup [--launcher-only | --proxy-only | --local-only]
+
+Modes:
+  (default)        Full evaluation workbench: Python .venv (requirements.txt, 71 packages),
+                   Node promptfoo (npm ci), bin/se-key-proxy, and bin/tinfoil-proxy.
+  --launcher-only  Minimal Rung 3 attested-proxy launcher setup: stdlib Python >= 3.11,
+  (--proxy-only)   bin/se-key-proxy, and bin/tinfoil-proxy. Zero Python or Node packages.
+  --local-only     Rung 1 local MLX + Rung 3 attested-proxy setup: Python .venv
+                   (requirements-local.txt, 35 packages), bin/se-key-proxy, and
+                   bin/tinfoil-proxy. Skips Node/npm and multimodal/vision packages.
+EOF
+      exit 0
+      ;;
+    *)
+      echo "ERROR: Unknown argument '$arg'. Run ./scripts/setup --help for usage." >&2
+      exit 1
+      ;;
+  esac
+done
+
 export UV_CACHE_DIR="$PWD/.uv-cache"
 export PYTHONPYCACHEPREFIX="$PWD/.pycache"
 
-echo "Checking platform and base tools..."
+echo "Checking platform and base tools (mode: ${SETUP_MODE})..."
 if [ "$(uname -s)" != "Darwin" ] || [ "$(uname -m)" != "arm64" ]; then
   echo "ERROR: free-inference setup requires Apple Silicon macOS (Darwin arm64); got $(uname -s) $(uname -m)" >&2
   exit 1
 fi
 mkdir -p .home/.cache .home/.promptfoo .home/huggingface
-for req_tool in uv python3 node npm swiftc codesign shasum curl unzip lsof ps pgrep; do
+
+BASE_TOOLS=(python3 swiftc codesign shasum curl unzip lsof ps pgrep)
+if [ "$SETUP_MODE" = "local-only" ]; then
+  BASE_TOOLS+=(uv)
+elif [ "$SETUP_MODE" = "full" ]; then
+  BASE_TOOLS+=(uv node npm)
+fi
+
+for req_tool in "${BASE_TOOLS[@]}"; do
   command -v "$req_tool" >/dev/null || { echo "ERROR: $req_tool is required on PATH" >&2; exit 1; }
 done
 if ! command -v opencode >/dev/null 2>&1; then
@@ -24,7 +63,9 @@ if sys.version_info < (3, 11):
     sys.stderr.write(f"ERROR: Python {sys.version.split()[0]} is unsupported; Python >= 3.11 is required\n")
     raise SystemExit(1)
 '
-node -e '
+
+if [ "$SETUP_MODE" = "full" ]; then
+  node -e '
 const [maj, min] = process.versions.node.split(".").map(Number);
 const ok = (maj === 20 && min >= 20) || (maj >= 22 && (maj > 22 || min >= 22));
 if (!ok) {
@@ -32,17 +73,30 @@ if (!ok) {
   process.exit(1);
 }
 '
-
-echo "Creating Python environment..."
-if [ ! -d .venv ]; then
-  uv venv --python ">=3.11" .venv
-else
-  echo "Using existing .venv"
 fi
-uv pip install --python .venv/bin/python -r requirements.txt
 
-echo "Installing Node dependencies..."
-npm ci
+if [ "$SETUP_MODE" = "full" ] || [ "$SETUP_MODE" = "local-only" ]; then
+  echo "Creating Python environment..."
+  if [ ! -d .venv ]; then
+    uv venv --python ">=3.11" .venv
+  else
+    echo "Using existing .venv"
+  fi
+  if [ "$SETUP_MODE" = "local-only" ]; then
+    uv pip install --python .venv/bin/python -r requirements-local.txt
+  else
+    uv pip install --python .venv/bin/python -r requirements.txt
+  fi
+else
+  echo "Skipping Python .venv creation (--launcher-only uses stdlib Python 3.11+)."
+fi
+
+if [ "$SETUP_MODE" = "full" ]; then
+  echo "Installing Node dependencies..."
+  npm ci
+else
+  echo "Skipping Node dependencies (--${SETUP_MODE} does not install promptfoo)."
+fi
 
 echo "Building and verifying Secure Enclave key proxy (bin/se-key-proxy and bin/se-key-proxy-test)..."
 ./scripts/se-key build --include-test-binary
@@ -105,6 +159,11 @@ fi
 echo
 echo "Setup complete."
 echo "Next steps:"
-echo "  1. Rung 1 (local MLX on 127.0.0.1:8080):       ./scripts/opencode-local"
-echo "  2. Seal Tinfoil API key in Secure Enclave:     ./scripts/se-key store free-inference.tinfoil"
-echo "  3. Rung 3 (attested enclave on 127.0.0.1:8081): ./scripts/opencode-attested"
+if [ "$SETUP_MODE" = "launcher-only" ]; then
+  echo "  1. Seal Tinfoil API key in Secure Enclave:     ./scripts/se-key store free-inference.tinfoil"
+  echo "  2. Rung 3 (attested enclave on 127.0.0.1:8081): ./scripts/opencode-attested"
+else
+  echo "  1. Rung 1 (local MLX on 127.0.0.1:8080):       ./scripts/opencode-local"
+  echo "  2. Seal Tinfoil API key in Secure Enclave:     ./scripts/se-key store free-inference.tinfoil"
+  echo "  3. Rung 3 (attested enclave on 127.0.0.1:8081): ./scripts/opencode-attested"
+fi

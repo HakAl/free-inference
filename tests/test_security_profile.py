@@ -833,13 +833,16 @@ class WorkerTokenRelayTests(unittest.TestCase):
             ctx.exception.close()
             self.assertEqual(relay.chat_requests_used, 0)
 
-            # 6. First chat request clamps max_tokens and max_completion_tokens to 128
+            # 6. First chat request clamps max_tokens, max_completion_tokens, n, best_of, and removes maxOutputTokens
             chat_payload = json.dumps(
                 {
                     "model": "mock-model",
                     "messages": [{"role": "user", "content": "hi"}],
                     "max_tokens": 9999,
                     "max_completion_tokens": 4096,
+                    "maxOutputTokens": 99999,
+                    "n": 5,
+                    "best_of": 5,
                 }
             ).encode("utf-8")
             req_chat = Request(
@@ -857,6 +860,9 @@ class WorkerTokenRelayTests(unittest.TestCase):
             self.assertEqual(observed_requests[-1]["auth"], f"Bearer {secret_session_token}")
             self.assertEqual(observed_requests[-1]["body"]["max_tokens"], 128)
             self.assertEqual(observed_requests[-1]["body"]["max_completion_tokens"], 128)
+            self.assertEqual(observed_requests[-1]["body"]["n"], 1)
+            self.assertEqual(observed_requests[-1]["body"]["best_of"], 1)
+            self.assertNotIn("maxOutputTokens", observed_requests[-1]["body"])
 
             # 7. Second chat request streams SSE incrementally without 4 KiB buffering (WORK-MAJOR-7)
             sse_payload = json.dumps(

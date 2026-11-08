@@ -62,9 +62,40 @@ private func printJSON(_ dict: [String: Any]) {
     }
 }
 
+private func trimASCIIWhitespaceAndZero(_ raw: inout Data) -> Data {
+    defer { bestEffortZero(&raw) }
+    var start = 0
+    var end = raw.count
+    while start < end {
+        let b = raw[start]
+        if b == 0x20 || b == 0x09 || b == 0x0A || b == 0x0D || b == 0x0B || b == 0x0C {
+            start += 1
+        } else {
+            break
+        }
+    }
+    while end > start {
+        let b = raw[end - 1]
+        if b == 0x20 || b == 0x09 || b == 0x0A || b == 0x0D || b == 0x0B || b == 0x0C {
+            end -= 1
+        } else {
+            break
+        }
+    }
+    if start >= end {
+        return Data()
+    }
+    return Data(raw[start..<end])
+}
+
 private func readAllFromFD(_ fd: Int32, maxBytes: Int = 8192) throws -> Data {
     var result = Data()
     var buf = [UInt8](repeating: 0, count: 1024)
+    defer {
+        for idx in 0..<buf.count {
+            buf[idx] = 0
+        }
+    }
     while result.count < maxBytes {
         let n = Darwin.read(fd, &buf, min(buf.count, maxBytes - result.count))
         if n > 0 {
@@ -73,6 +104,7 @@ private func readAllFromFD(_ fd: Int32, maxBytes: Int = 8192) throws -> Data {
             break
         } else {
             if errno == EINTR { continue }
+            bestEffortZero(&result)
             throw NSError(
                 domain: NSPOSIXErrorDomain,
                 code: Int(errno),
@@ -148,6 +180,7 @@ private func readSecretFromTTY(prompt: String) throws -> Data {
 
     var out = Data()
     var byte: UInt8 = 0
+    defer { byte = 0 }
     while true {
         let n = Darwin.read(fd, &byte, 1)
         if n <= 0 { break }
@@ -1267,6 +1300,14 @@ private final class ProxyServer: @unchecked Sendable {
             chatRequestsUsed += 1
             lock.unlock()
 
+            // Clamp n (and best_of when present) to 1 so worst-case output spend is bounded to 1 completion per request
+            if jsonDict["n"] != nil {
+                jsonDict["n"] = 1
+            }
+            if jsonDict["best_of"] != nil {
+                jsonDict["best_of"] = 1
+            }
+
             // Clamp max_tokens and strip alternate token-limit keys when maxTokensCap > 0
             if maxTokensCap > 0 {
                 var effectiveMax = maxTokensCap
@@ -1850,6 +1891,8 @@ private final class ProxyServer: @unchecked Sendable {
 // MARK: - Subcommands
 
 private func runSeal(args: [String]) -> Int32 {
+    disableDebuggerAttachment()
+
     var service: String?
     var account = kDefaultAccount
     var secretFD: Int32?
@@ -1886,13 +1929,11 @@ private func runSeal(args: [String]) -> Int32 {
     do {
         var secretData: Data
         if let fd = secretFD {
-            let raw = try readAllFromFD(fd)
-            let trimmed = String(data: raw, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            secretData = Data(trimmed.utf8)
+            var raw = try readAllFromFD(fd)
+            secretData = trimASCIIWhitespaceAndZero(&raw)
         } else {
-            let raw = try readSecretFromTTY(prompt: "Enter API key for \(svc): ")
-            let trimmed = String(data: raw, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-            secretData = Data(trimmed.utf8)
+            var raw = try readSecretFromTTY(prompt: "Enter API key for \(svc): ")
+            secretData = trimASCIIWhitespaceAndZero(&raw)
         }
         defer { bestEffortZero(&secretData) }
 
@@ -2155,6 +2196,17 @@ private func runSelftest() -> Int32 {
         }
         guard tamperRejected else {
             writeStderr("selftest failed: tampered ciphertext was not rejected")
+            return 1
+        }
+
+        // Verify trimASCIIWhitespaceAndZero trims ASCII whitespace and zeros the raw buffer in place
+        var rawSecretSample = Data("  \t\r\nsk-test-secret-value\n\t  ".utf8)
+        let trimmedSecretSample = trimASCIIWhitespaceAndZero(&rawSecretSample)
+        guard
+            trimmedSecretSample == Data("sk-test-secret-value".utf8),
+            rawSecretSample.allSatisfy({ $0 == 0 })
+        else {
+            writeStderr("selftest failed: trimASCIIWhitespaceAndZero did not trim and zero raw buffer")
             return 1
         }
 

@@ -9,6 +9,7 @@ import json
 import math
 import os
 import re
+import stat
 import subprocess
 import tempfile
 import urllib.error
@@ -44,8 +45,21 @@ DEFAULT_IGNORED_SERVED_IDS: frozenset[str] = frozenset({"gemma4-31b", "llama3-3-
 MPK_DESCRIPTOR_RE = re.compile(
     r"^(?P<sha256>[0-9a-f]{64})_(?P<size_bytes>\d+)_[0-9a-fA-F-]{36}$"
 )
-ENCLAVE_REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
+ENCLAVE_REPO_RE = re.compile(r"^tinfoilsh/[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 ENCLAVE_TAG_RE = re.compile(r"^[A-Za-z0-9_+-][A-Za-z0-9_.+-]{0,63}$")
+SERVED_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+MAX_HOST_CODE_TAGS_PER_MODEL = 8
+MAX_ENCLAVE_CONFIG_FETCHES = 32
+MAX_GITHUB_ISSUE_BODY_CHARS = 60000
+
+_STATUS_RANK: dict[str, int] = {
+    "active": 0,
+    "runnable": 0,
+    "reviewed": 1,
+    "candidate": 1,
+    "archived": 2,
+}
 
 
 class CatalogSyncError(Exception):
@@ -70,6 +84,7 @@ class FeedDisagreementItem:
     in_openai_models: bool
     router_healthy: int | None
     reason: str
+    registered: bool = True
 
 
 @dataclass
@@ -131,6 +146,7 @@ class CatalogDriftReport:
                 {
                     "model_id": d.model_id,
                     "served_model_id": d.served_model_id,
+                    "registered": d.registered,
                     "in_router_manifest": d.in_router_manifest,
                     "in_openai_models": d.in_openai_models,
                     "router_healthy": d.router_healthy,
@@ -324,6 +340,31 @@ def _http_get_text(
         raise CatalogSyncError(f"Failed to fetch {url}: {exc}") from exc
 
 
+def _ensure_all_numbers_finite(obj: Any, *, context: str) -> None:
+    if isinstance(obj, float):
+        if not math.isfinite(obj):
+            raise CatalogSyncError(f"Non-finite float value {obj!r} rejected in {context}")
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            _ensure_all_numbers_finite(k, context=context)
+            _ensure_all_numbers_finite(v, context=context)
+    elif isinstance(obj, list):
+        for item in obj:
+            _ensure_all_numbers_finite(item, context=context)
+
+
+def _strict_json_loads(text: str, *, context: str) -> Any:
+    def _reject_constant(val: str) -> Any:
+        raise ValueError(f"Non-standard JSON constant {val!r} is not allowed")
+
+    try:
+        data = json.loads(text, parse_constant=_reject_constant)
+    except Exception as exc:
+        raise CatalogSyncError(f"Invalid JSON from {context}: {exc}") from exc
+    _ensure_all_numbers_finite(data, context=context)
+    return data
+
+
 def fetch_tinfoil_router_manifest(
     url: str = DEFAULT_ROUTER_MANIFEST_URL,
     *,
@@ -332,10 +373,7 @@ def fetch_tinfoil_router_manifest(
 ) -> dict[str, Any]:
     getter = http_get or (lambda u: _http_get_text(u, timeout=timeout))
     text = getter(url)
-    try:
-        data = json.loads(text)
-    except Exception as exc:
-        raise CatalogSyncError(f"Invalid JSON from router manifest {url}: {exc}") from exc
+    data = _strict_json_loads(text, context=f"router manifest {url}")
     validate_router_manifest(data)
     return data
 
@@ -348,10 +386,7 @@ def fetch_tinfoil_openai_models(
 ) -> dict[str, Any]:
     getter = http_get or (lambda u: _http_get_text(u, timeout=timeout))
     text = getter(url)
-    try:
-        data = json.loads(text)
-    except Exception as exc:
-        raise CatalogSyncError(f"Invalid JSON from OpenAI models endpoint {url}: {exc}") from exc
+    data = _strict_json_loads(text, context=f"OpenAI models endpoint {url}")
     validate_openai_models(data)
     return data
 
@@ -364,9 +399,9 @@ def fetch_tinfoil_enclave_config(
     timeout: float = 15.0,
     http_get: Callable[[str], str] | None = None,
 ) -> dict[str, Any]:
-    if not isinstance(repo, str) or not ENCLAVE_REPO_RE.match(repo.strip()):
+    if not isinstance(repo, str) or ".." in repo or not ENCLAVE_REPO_RE.match(repo.strip()):
         raise CatalogSyncError(f"Invalid enclave repository identifier: {repo!r}")
-    if not isinstance(tag, str) or not ENCLAVE_TAG_RE.match(tag.strip()):
+    if not isinstance(tag, str) or ".." in tag or not ENCLAVE_TAG_RE.match(tag.strip()):
         raise CatalogSyncError(f"Invalid enclave release tag: {tag!r}")
     url = f"{raw_base_url.rstrip('/')}/{repo.strip()}/{tag.strip()}/tinfoil-config.yml"
     getter = http_get or (lambda u: _http_get_text(u, timeout=timeout))
@@ -375,6 +410,7 @@ def fetch_tinfoil_enclave_config(
 
 
 def validate_router_manifest(data: Any) -> dict[str, dict[str, Any]]:
+    _ensure_all_numbers_finite(data, context="router manifest")
     if not isinstance(data, dict):
         raise CatalogSyncError("Router manifest must be a JSON object")
     raw_models = data.get("models")
@@ -384,31 +420,47 @@ def validate_router_manifest(data: Any) -> dict[str, dict[str, Any]]:
     for mid, info in raw_models.items():
         if not isinstance(mid, str) or not mid.strip() or not isinstance(info, dict):
             raise CatalogSyncError(f"Router manifest contains malformed model entry for {mid!r}")
+        clean_mid = mid.strip()
+        if ".." in clean_mid or not SERVED_ID_RE.match(clean_mid):
+            raise CatalogSyncError(
+                f"Router manifest contains invalid served model identifier {clean_mid!r}"
+            )
         repo = info.get("repo")
         tag = info.get("tag")
         ver = info.get("verification")
         if not isinstance(repo, str) or not repo.strip():
-            raise CatalogSyncError(f"Router manifest model '{mid}' is missing 'repo'")
+            raise CatalogSyncError(f"Router manifest model '{clean_mid}' is missing 'repo'")
+        clean_repo = repo.strip()
+        if ".." in clean_repo or not ENCLAVE_REPO_RE.match(clean_repo):
+            raise CatalogSyncError(
+                f"Router manifest model '{clean_mid}' has untrusted or malformed enclave repo {clean_repo!r}"
+            )
         if tag is not None and not isinstance(tag, str):
-            raise CatalogSyncError(f"Router manifest model '{mid}' has non-string 'tag'")
+            raise CatalogSyncError(f"Router manifest model '{clean_mid}' has non-string 'tag'")
+        if isinstance(tag, str) and tag.strip():
+            clean_tag = tag.strip()
+            if ".." in clean_tag or not ENCLAVE_TAG_RE.match(clean_tag):
+                raise CatalogSyncError(
+                    f"Router manifest model '{clean_mid}' has invalid enclave tag {clean_tag!r}"
+                )
         if (
             not isinstance(ver, dict)
             or not isinstance(ver.get("healthy"), int)
             or isinstance(ver.get("healthy"), bool)
         ):
             raise CatalogSyncError(
-                f"Router manifest model '{mid}' is missing integer 'verification.healthy'"
+                f"Router manifest model '{clean_mid}' is missing integer 'verification.healthy'"
             )
         if ver["healthy"] < 0:
             raise CatalogSyncError(
-                f"Router manifest model '{mid}' has negative 'verification.healthy': {ver['healthy']}"
+                f"Router manifest model '{clean_mid}' has negative 'verification.healthy': {ver['healthy']}"
             )
         cfg_val = ver.get("configured")
         if cfg_val is not None and (
             isinstance(cfg_val, bool) or not isinstance(cfg_val, int) or cfg_val < 0
         ):
             raise CatalogSyncError(
-                f"Router manifest model '{mid}' has invalid 'verification.configured': {cfg_val!r}"
+                f"Router manifest model '{clean_mid}' has invalid 'verification.configured': {cfg_val!r}"
             )
         raw_hosts = ver.get("hosts")
         host_code_tags: list[str] = []
@@ -418,18 +470,29 @@ def validate_router_manifest(data: Any) -> dict[str, dict[str, Any]]:
                 if isinstance(host_info, dict):
                     ct = host_info.get("code_tag")
                     if isinstance(ct, str) and ct.strip():
-                        seen_tags.add(ct.strip())
+                        clean_ct = ct.strip()
+                        if ".." in clean_ct or not ENCLAVE_TAG_RE.match(clean_ct):
+                            raise CatalogSyncError(
+                                f"Router manifest model '{clean_mid}' has invalid host code_tag {clean_ct!r}"
+                            )
+                        seen_tags.add(clean_ct)
+            if len(seen_tags) > MAX_HOST_CODE_TAGS_PER_MODEL:
+                raise CatalogSyncError(
+                    f"Router manifest model '{clean_mid}' has {len(seen_tags)} distinct host code_tags "
+                    f"(exceeds cap of {MAX_HOST_CODE_TAGS_PER_MODEL})"
+                )
             host_code_tags = sorted(seen_tags)
         entry_copy = dict(info)
         if host_code_tags:
             entry_copy["host_code_tags"] = host_code_tags
             if isinstance(tag, str) and tag.strip() in host_code_tags:
                 entry_copy["tag"] = host_code_tags[0]
-        validated[mid.strip()] = entry_copy
+        validated[clean_mid] = entry_copy
     return validated
 
 
 def validate_openai_models(data: Any) -> dict[str, dict[str, Any]]:
+    _ensure_all_numbers_finite(data, context="OpenAI /v1/models")
     if not isinstance(data, dict) or data.get("object") != "list":
         raise CatalogSyncError("OpenAI /v1/models response must be a JSON object with object='list'")
     raw_list = data.get("data")
@@ -442,7 +505,12 @@ def validate_openai_models(data: Any) -> dict[str, dict[str, Any]]:
         mid = item.get("id")
         if not isinstance(mid, str) or not mid.strip():
             raise CatalogSyncError("OpenAI /v1/models item is missing string 'id'")
-        validated[mid.strip()] = item
+        clean_mid = mid.strip()
+        if ".." in clean_mid or not SERVED_ID_RE.match(clean_mid):
+            raise CatalogSyncError(
+                f"OpenAI /v1/models item has invalid model identifier {clean_mid!r}"
+            )
+        validated[clean_mid] = item
     return validated
 
 
@@ -458,10 +526,12 @@ def is_tinfoil_managed_model(model: dict[str, Any]) -> bool:
 
 
 def _demote_routing_and_preserve_evidence(model: dict[str, Any], *, new_status: str) -> dict[str, Any]:
-    """Demote status and routing.private_attested to blocked while moving eval_evidence_artifact to stale_eval_evidence_artifact."""
+    """Demote status (one-way ratchet: active -> candidate -> archived) and routing.private_attested to blocked while moving eval_evidence_artifact to stale_eval_evidence_artifact."""
     changes: dict[str, Any] = {}
     old_status = model.get("status")
-    if old_status != new_status:
+    old_rank = _STATUS_RANK.get(str(old_status), -1)
+    new_rank = _STATUS_RANK.get(new_status, 1)
+    if old_status != new_status and new_rank > old_rank:
         changes["status"] = {"from": old_status, "to": new_status}
         model["status"] = new_status
 
@@ -532,22 +602,26 @@ def _build_candidate_model_entry(
     if (
         isinstance(in_price, bool)
         or not isinstance(in_price, (int, float))
+        or not math.isfinite(float(in_price))
+        or float(in_price) < 0
         or isinstance(out_price, bool)
         or not isinstance(out_price, (int, float))
+        or not math.isfinite(float(out_price))
+        or float(out_price) < 0
     ):
         raise CatalogSyncError(
-            f"New coding model '{served_id}' is missing numeric input/output pricing in /v1/models"
+            f"New coding model '{served_id}' is missing finite non-negative input/output pricing in /v1/models"
         )
 
     pricing_dict: dict[str, float] = {
         "input": float(in_price),
         "output": float(out_price),
     }
-    if (
-        not isinstance(cached_price, bool)
-        and isinstance(cached_price, (int, float))
-        and float(cached_price) >= 0
-    ):
+    if not isinstance(cached_price, bool) and isinstance(cached_price, (int, float)):
+        if not math.isfinite(float(cached_price)) or float(cached_price) < 0:
+            raise CatalogSyncError(
+                f"New coding model '{served_id}' has invalid cachedInputTokenPricePer1M in /v1/models: {cached_price!r}"
+            )
         pricing_dict["cached_input"] = float(cached_price)
 
     raw_oai_ctx = oai_entry.get("context_window")
@@ -693,6 +767,7 @@ def compute_catalog_drift(
     observed_date: str | None = None,
     discover_new_coding_models: bool = True,
     ignored_served_ids: set[str] | None = None,
+    fetch_budget: list[int] | None = None,
 ) -> CatalogDriftReport:
     """Compare models.yaml against live Tinfoil router, /v1/models, and per-enclave tinfoil-config.yml."""
     if not isinstance(models_data, dict) or not isinstance(models_data.get("models"), list):
@@ -705,6 +780,7 @@ def compute_catalog_drift(
         raise CatalogSyncError(f"Invalid observed_date '{today_str}'; expected YYYY-MM-DD")
 
     cfg_cache: dict[str, dict[str, Any]] = dict(enclave_configs or {})
+    budget_box = fetch_budget if (isinstance(fetch_budget, list) and len(fetch_budget) == 1) else [0]
 
     def _get_enclave_cfg(
         served_id: str,
@@ -719,6 +795,11 @@ def compute_catalog_drift(
         if allow_served_id_fallback and served_id in cfg_cache:
             return cfg_cache[served_id]
         if enclave_config_fetcher is not None:
+            if budget_box[0] >= MAX_ENCLAVE_CONFIG_FETCHES:
+                raise CatalogSyncError(
+                    f"Exceeded maximum enclave config fetches ({MAX_ENCLAVE_CONFIG_FETCHES}) in a single catalog sync pass"
+                )
+            budget_box[0] += 1
             fetched = enclave_config_fetcher(repo, tag)
             cfg_cache[key_pair] = fetched
             return fetched
@@ -808,29 +889,7 @@ def compute_catalog_drift(
                 )
             continue
 
-        # Case 2: Present in router manifest with verification.healthy <= 0 (evaluated BEFORE config fetch or disagreement)
-        if r_entry is not None:
-            healthy_count = int((r_entry.get("verification") or {}).get("healthy") or 0)
-            if healthy_count <= 0:
-                if healthy_count < 0:
-                    raise CatalogSyncError(
-                        f"Router manifest model '{served_id}' has negative verification.healthy: {healthy_count}"
-                    )
-                sim_model = copy.deepcopy(model)
-                changes = _demote_routing_and_preserve_evidence(sim_model, new_status="candidate")
-                if changes:
-                    report.updated_models.append(
-                        ModelDriftItem(
-                            model_id=model_id,
-                            served_model_id=served_id,
-                            action="demote_zero_health",
-                            changes=changes,
-                            notes=["Router manifest reports verification.healthy == 0"],
-                        )
-                    )
-                continue
-
-        # Case 3: Feed disagreement (present in one feed with healthy >= 1, absent in the other)
+        # Case 2: Feed disagreement (present in one feed, absent in the other; evaluated BEFORE healthy <= 0)
         if (r_entry is None) != (o_entry is None):
             r_healthy = (
                 int((r_entry.get("verification") or {}).get("healthy") or 0)
@@ -852,6 +911,28 @@ def compute_catalog_drift(
                 )
             )
             continue
+
+        # Case 3: Present in both feeds with verification.healthy <= 0 (evaluated BEFORE config fetch)
+        if r_entry is not None:
+            healthy_count = int((r_entry.get("verification") or {}).get("healthy") or 0)
+            if healthy_count <= 0:
+                if healthy_count < 0:
+                    raise CatalogSyncError(
+                        f"Router manifest model '{served_id}' has negative verification.healthy: {healthy_count}"
+                    )
+                sim_model = copy.deepcopy(model)
+                changes = _demote_routing_and_preserve_evidence(sim_model, new_status="candidate")
+                if changes:
+                    report.updated_models.append(
+                        ModelDriftItem(
+                            model_id=model_id,
+                            served_model_id=served_id,
+                            action="demote_zero_health",
+                            changes=changes,
+                            notes=["Router manifest reports verification.healthy == 0"],
+                        )
+                    )
+                continue
 
         assert r_entry is not None and o_entry is not None
         enclave_repo = str(r_entry.get("repo") or "").strip()
@@ -918,9 +999,20 @@ def compute_catalog_drift(
             in_val = raw_pricing.get("inputTokenPricePer1M")
             out_val = raw_pricing.get("outputTokenPricePer1M")
             cached_val = raw_pricing.get("cachedInputTokenPricePer1M")
+            for p_label, p_val in (
+                ("inputTokenPricePer1M", in_val),
+                ("outputTokenPricePer1M", out_val),
+                ("cachedInputTokenPricePer1M", cached_val),
+            ):
+                if not isinstance(p_val, bool) and isinstance(p_val, (int, float)):
+                    if not math.isfinite(float(p_val)) or float(p_val) < 0:
+                        raise CatalogSyncError(
+                            f"Model '{served_id}' has invalid {p_label} in /v1/models: {p_val!r}"
+                        )
             if (
                 not isinstance(in_val, bool)
                 and isinstance(in_val, (int, float))
+                and math.isfinite(float(in_val))
                 and float(in_val) >= 0
                 and cur_pricing.get("input") != float(in_val)
             ):
@@ -931,6 +1023,7 @@ def compute_catalog_drift(
             if (
                 not isinstance(out_val, bool)
                 and isinstance(out_val, (int, float))
+                and math.isfinite(float(out_val))
                 and float(out_val) >= 0
                 and cur_pricing.get("output") != float(out_val)
             ):
@@ -941,6 +1034,7 @@ def compute_catalog_drift(
             if (
                 not isinstance(cached_val, bool)
                 and isinstance(cached_val, (int, float))
+                and math.isfinite(float(cached_val))
                 and float(cached_val) >= 0
                 and cur_pricing.get("cached_input") != float(cached_val)
             ):
@@ -995,6 +1089,21 @@ def compute_catalog_drift(
             if ignored_served_ids is None
             else set(ignored_served_ids)
         )
+        def _check_discovered_collision(served_id: str, candidate_id: str) -> None:
+            if candidate_id in all_existing_by_id:
+                colliding = all_existing_by_id[candidate_id]
+                raise CatalogSyncError(
+                    f"Discovered Tinfoil model '{served_id}' (candidate id '{candidate_id}') collides with "
+                    f"existing catalog entry id='{colliding.get('id')}' "
+                    f"(repo='{colliding.get('repo')}', runtime='{colliding.get('runtime')}')"
+                )
+            if served_id in all_existing_by_repo:
+                colliding_r = all_existing_by_repo[served_id]
+                raise CatalogSyncError(
+                    f"Discovered Tinfoil model '{served_id}' collides with existing catalog entry "
+                    f"id='{colliding_r.get('id')}' sharing repo='{served_id}'"
+                )
+
         for served_id in sorted(oai_map.keys()):
             if served_id in registered_served_ids or served_id in ignore_set:
                 continue
@@ -1003,28 +1112,30 @@ def compute_catalog_drift(
                 continue
             if o_entry.get("deprecated") is True:
                 continue
+            candidate_id = served_id if served_id.startswith("tinfoil-") else f"tinfoil-{served_id}"
+            _check_discovered_collision(served_id, candidate_id)
             r_entry = router_map.get(served_id)
             if r_entry is None:
+                report.disagreements.append(
+                    FeedDisagreementItem(
+                        model_id=candidate_id,
+                        served_model_id=served_id,
+                        in_router_manifest=False,
+                        in_openai_models=True,
+                        router_healthy=None,
+                        reason=(
+                            f"Unregistered coding model '{served_id}' is present in openai_models "
+                            "but absent from router_manifest"
+                        ),
+                        registered=False,
+                    )
+                )
                 continue
             healthy_count = int((r_entry.get("verification") or {}).get("healthy") or 0)
             enclave_repo = str(r_entry.get("repo") or "").strip()
             enclave_tag = str(r_entry.get("tag") or "").strip()
             if healthy_count < 1 or not enclave_tag:
                 continue
-            candidate_id = served_id if served_id.startswith("tinfoil-") else f"tinfoil-{served_id}"
-            if candidate_id in all_existing_by_id:
-                colliding = all_existing_by_id[candidate_id]
-                raise CatalogSyncError(
-                    f"Discovered Tinfoil model '{served_id}' (candidate id '{candidate_id}') collides with "
-                    f"existing non-Tinfoil catalog entry id='{colliding.get('id')}' "
-                    f"(repo='{colliding.get('repo')}', runtime='{colliding.get('runtime')}')"
-                )
-            if served_id in all_existing_by_repo:
-                colliding_r = all_existing_by_repo[served_id]
-                raise CatalogSyncError(
-                    f"Discovered Tinfoil model '{served_id}' collides with existing non-Tinfoil catalog entry "
-                    f"id='{colliding_r.get('id')}' sharing repo='{served_id}'"
-                )
             enclave_meta = _resolve_verified_enclave_meta(
                 served_id,
                 enclave_repo,
@@ -1039,6 +1150,30 @@ def compute_catalog_drift(
                 today_str,
             )
             report.new_models.append(candidate_entry)
+
+        # Symmetric discovery disagreement check: unregistered non-ignored model in router_manifest with healthy >= 1 missing from /v1/models
+        for served_id in sorted(router_map.keys()):
+            if served_id in registered_served_ids or served_id in ignore_set or served_id in oai_map:
+                continue
+            r_entry = router_map[served_id]
+            healthy_count = int((r_entry.get("verification") or {}).get("healthy") or 0)
+            if healthy_count >= 1:
+                candidate_id = served_id if served_id.startswith("tinfoil-") else f"tinfoil-{served_id}"
+                _check_discovered_collision(served_id, candidate_id)
+                report.disagreements.append(
+                    FeedDisagreementItem(
+                        model_id=candidate_id,
+                        served_model_id=served_id,
+                        in_router_manifest=True,
+                        in_openai_models=False,
+                        router_healthy=healthy_count,
+                        reason=(
+                            f"Unregistered model '{served_id}' is present in router_manifest "
+                            f"(healthy={healthy_count}) but absent from openai_models"
+                        ),
+                        registered=False,
+                    )
+                )
 
     return report
 
@@ -1298,7 +1433,10 @@ def apply_catalog_healing(
                 if field_path in ("status", "routing.private_attested", "eval_evidence_artifact"):
                     if field_path == "status":
                         if not has_weight_change or new_val in ("candidate", "archived"):
-                            target["status"] = new_val
+                            cur_rank = _STATUS_RANK.get(str(target.get("status")), -1)
+                            new_rank = _STATUS_RANK.get(str(new_val), 1)
+                            if new_rank > cur_rank:
+                                target["status"] = new_val
                     elif field_path == "routing.private_attested":
                         if not has_weight_change or new_val == "blocked":
                             target.setdefault("routing", {})["private_attested"] = new_val
@@ -1320,9 +1458,32 @@ def apply_catalog_healing(
 
         if report.disagreements and quarantine_disagreements:
             for d in report.disagreements:
+                if not getattr(d, "registered", True):
+                    continue
                 target = by_id.get(d.model_id)
                 if target is not None:
-                    _demote_routing_and_preserve_evidence(target, new_status="candidate")
+                    if not is_tinfoil_managed_model(target):
+                        raise CatalogSyncError(
+                            f"Cannot quarantine '{d.model_id}': catalog entry is not a Tinfoil-managed model"
+                        )
+                    target_served_id = str(target.get("repo") or target.get("id") or "").strip()
+                    if target_served_id != d.served_model_id:
+                        raise CatalogSyncError(
+                            f"Cannot quarantine '{d.model_id}': catalog entry served_model_id "
+                            f"'{target_served_id}' does not match disagreement served_model_id '{d.served_model_id}'"
+                        )
+                    q_changes = _demote_routing_and_preserve_evidence(target, new_status="candidate")
+                    if q_changes:
+                        target["verified_date"] = report.observed_date
+                        report.updated_models.append(
+                            ModelDriftItem(
+                                model_id=d.model_id,
+                                served_model_id=d.served_model_id,
+                                action="quarantine_disagreement",
+                                changes=q_changes,
+                                notes=[f"Quarantined due to feed disagreement: {d.reason}"],
+                            )
+                        )
 
         if append_new_models:
             by_repo: dict[str, dict[str, Any]] = {
@@ -1362,6 +1523,10 @@ def apply_catalog_healing(
                 ) from exc
 
         rendered = dump_models_yaml(data, header_comments)
+        try:
+            orig_mode = stat.S_IMODE(models_path.stat().st_mode) or 0o644
+        except OSError:
+            orig_mode = 0o644
         parent_dir = models_path.parent
         fd, tmp_path_str = tempfile.mkstemp(
             prefix=".models-sync-", suffix=".yaml", dir=str(parent_dir)
@@ -1372,6 +1537,7 @@ def apply_catalog_healing(
                 handle.write(rendered)
                 handle.flush()
                 os.fsync(handle.fileno())
+            os.chmod(tmp_path, orig_mode)
             if models_path.read_bytes() != initial_bytes:
                 raise CatalogSyncError(
                     f"Aborting catalog update: {models_path} was modified concurrently outside catalog_file_lock during validation"
@@ -1789,6 +1955,19 @@ def format_human_drift_report(report: CatalogDriftReport, *, applied: bool = Fal
     return "\n".join(lines)
 
 
+MAX_FENCED_BACKTICK_RUN = 16
+
+
+def _cap_backtick_runs(payload: str, *, max_run: int = MAX_FENCED_BACKTICK_RUN) -> str:
+    pattern = re.compile(r"`{" + str(max_run + 1) + r",}")
+
+    def _replace(match: re.Match[str]) -> str:
+        run_len = len(match.group(0))
+        return ("`" * max_run) + f"[+{run_len - max_run} backticks]"
+
+    return pattern.sub(_replace, payload)
+
+
 def _code_fence_for(*payloads: str) -> str:
     longest = 2
     for payload in payloads:
@@ -1796,7 +1975,7 @@ def _code_fence_for(*payloads: str) -> str:
             run_len = len(match.group(0))
             if run_len > longest:
                 longest = run_len
-    return "`" * (longest + 1)
+    return "`" * min(longest + 1, MAX_FENCED_BACKTICK_RUN + 1)
 
 
 def render_github_issue_body(
@@ -1808,11 +1987,11 @@ def render_github_issue_body(
     checked_ref: str | None = None,
     checked_sha: str | None = None,
 ) -> str:
-    check_status = str(report_dict.get("check_status") or "")
-    observed_date = str(report_dict.get("observed_date") or "")
-    base_digest = str(report_dict.get("base_catalog_sha256") or "")
-    json_payload = json.dumps(report_dict, indent=2, sort_keys=True)
-    clean_human = human_output.rstrip()
+    check_status = str(report_dict.get("check_status") or "")[:64]
+    observed_date = str(report_dict.get("observed_date") or "")[:32]
+    base_digest = str(report_dict.get("base_catalog_sha256") or "")[:128]
+    json_payload = _cap_backtick_runs(json.dumps(report_dict, indent=2, sort_keys=True))
+    clean_human = _cap_backtick_runs(human_output.rstrip())
     fence = _code_fence_for(clean_human, json_payload)
 
     if check_status == "disagreement" or (exit_code == 1 and report_dict.get("disagreements")):
@@ -1820,6 +1999,12 @@ def render_github_issue_body(
         summary_line = (
             "Primary upstream catalog feeds (`router_manifest` vs `/v1/models`) disagreed. "
             "No automatic catalog mutation was performed."
+        )
+    elif check_status == "quarantined":
+        heading = "## Upstream Catalog Feed Disagreement Quarantined"
+        summary_line = (
+            "Primary upstream catalog feeds disagreed; disagreeing registered models were "
+            "conservatively quarantined (`routing.private_attested: blocked`)."
         )
     elif check_status == "drift" or exit_code == 2 or report_dict.get("has_drift"):
         heading = "## Upstream Model Catalog Drift Detected"
@@ -1838,47 +2023,62 @@ def render_github_issue_body(
     if base_digest:
         meta_lines.append(f"- **Catalog SHA-256**: `{base_digest}`")
     if checked_ref:
-        meta_lines.append(f"- **Checked ref**: `{checked_ref}`")
+        meta_lines.append(f"- **Checked ref**: `{str(checked_ref)[:256]}`")
     if checked_sha:
-        meta_lines.append(f"- **Checked commit**: `{checked_sha}`")
+        meta_lines.append(f"- **Checked commit**: `{str(checked_sha)[:128]}`")
     if run_url:
-        meta_lines.append(f"- **Workflow run**: {run_url}")
+        meta_lines.append(f"- **Workflow run**: {str(run_url)[:512]}")
 
-    body_parts = [
-        heading,
-        "",
-        summary_line,
-        "",
-        "\n".join(meta_lines),
-        "",
-        "### Human-Readable Drift Summary",
-        "",
-        f"{fence}text",
-        clean_human,
-        fence,
-        "",
-        "### Local Remediation Steps (in `lab/`)",
-        "",
-        "```bash",
-        "cd lab",
-        "./scripts/sync-model-catalog --check",
-        "./scripts/sync-model-catalog --apply",
-        ".venv/bin/python ./scripts/generate-eval-manifest --check",
-        ".venv/bin/python -m unittest discover -s tests -v",
-        "```",
-        "",
-        "> Note: Newly discovered models are scaffolded as `status: candidate` with `routing.private_attested: blocked` and require operator-approved 4-gate evaluation (`sanity`, `v1`, `tools`, `opencode-smoke`) before promotion.",
-        "",
-        "<details>",
-        "<summary>Structured Drift Report JSON</summary>",
-        "",
-        f"{fence}json",
-        json_payload,
-        fence,
-        "",
-        "</details>",
-    ]
-    return "\n".join(body_parts) + "\n"
+    def _assemble_body(h_text: str, j_text: str) -> str:
+        body_parts = [
+            heading,
+            "",
+            summary_line,
+            "",
+            "\n".join(meta_lines),
+            "",
+            "### Human-Readable Drift Summary",
+            "",
+            f"{fence}text",
+            h_text,
+            fence,
+            "",
+            "### Local Remediation Steps (in `lab/`)",
+            "",
+            "```bash",
+            "cd lab",
+            "./scripts/sync-model-catalog --check",
+            "./scripts/sync-model-catalog --apply",
+            ".venv/bin/python ./scripts/generate-eval-manifest --check",
+            ".venv/bin/python -m unittest discover -s tests -v",
+            "```",
+            "",
+            "> Note: Newly discovered models are scaffolded as `status: candidate` with `routing.private_attested: blocked` and require operator-approved 4-gate evaluation (`sanity`, `v1`, `tools`, `opencode-smoke`) before promotion.",
+            "",
+            "<details>",
+            "<summary>Structured Drift Report JSON</summary>",
+            "",
+            f"{fence}json",
+            j_text,
+            fence,
+            "",
+            "</details>",
+        ]
+        return "\n".join(body_parts) + "\n"
+
+    rendered = _assemble_body(clean_human, json_payload)
+    if len(rendered) > MAX_GITHUB_ISSUE_BODY_CHARS:
+        trunc_note = "\n... [truncated to fit GitHub 65536-char issue body limit]"
+        empty_shell_len = len(_assemble_body("", ""))
+        budget = max(0, MAX_GITHUB_ISSUE_BODY_CHARS - empty_shell_len - 2 * len(trunc_note) - 64)
+        human_budget = min(len(clean_human), budget // 3)
+        json_budget = max(0, budget - human_budget)
+        if len(clean_human) > human_budget:
+            clean_human = _cap_backtick_runs(clean_human[:human_budget].rstrip()) + trunc_note
+        if len(json_payload) > json_budget:
+            json_payload = _cap_backtick_runs(json_payload[:json_budget].rstrip()) + trunc_note
+        rendered = _assemble_body(clean_human, json_payload)
+    return rendered
 
 
 def _default_run_gh(args: list[str]) -> str:

@@ -279,6 +279,7 @@ def main(argv: list[str] | None = None) -> int:
 
         ignored_ids = set() if args.include_all_chat else set(DEFAULT_IGNORED_SERVED_IDS)
         enclave_cfg_cache: dict[str, dict] = {}
+        invocation_fetch_budget = [0]
 
         def _fetch_enclave_cfg(repo: str, tag: str) -> dict:
             key = f"{repo}@{tag}"
@@ -299,6 +300,7 @@ def main(argv: list[str] | None = None) -> int:
             enclave_config_fetcher=_fetch_enclave_cfg,
             discover_new_coding_models=not args.no_discover_new,
             ignored_served_ids=ignored_ids,
+            fetch_budget=invocation_fetch_budget,
         )
 
         if args.apply:
@@ -314,6 +316,7 @@ def main(argv: list[str] | None = None) -> int:
                     enclave_config_fetcher=_fetch_enclave_cfg,
                     discover_new_coding_models=not args.no_discover_new,
                     ignored_served_ids=ignored_ids,
+                    fetch_budget=invocation_fetch_budget,
                 )
 
         if report.disagreements and not (args.apply and args.quarantine_disagreements):
@@ -345,9 +348,14 @@ def main(argv: list[str] | None = None) -> int:
                     quarantine_disagreements=args.quarantine_disagreements,
                     append_new_models=not args.no_discover_new,
                 )
+            applied_status = (
+                "quarantined"
+                if (report.disagreements and args.quarantine_disagreements)
+                else "clean"
+            )
             _write_optional_outputs(
                 report,
-                check_status="clean",
+                check_status=applied_status,
                 exit_code=0,
                 applied=True,
                 json_out=args.json_out,
@@ -359,6 +367,7 @@ def main(argv: list[str] | None = None) -> int:
             )
             if args.json_output:
                 out = report.to_dict()
+                out["check_status"] = applied_status
                 out["applied"] = True
                 print(json.dumps(out, indent=2))
             else:

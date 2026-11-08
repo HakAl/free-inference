@@ -6,6 +6,7 @@ import os
 import sys
 from typing import Any
 
+from . import __version__
 from .errors import LocalAssistError
 from .tools.compress_context import run as compress_context
 from .tools.delegate_task import run as delegate_task
@@ -13,7 +14,7 @@ from .tools.extract_fields import run as extract_fields
 from .tools.propose_eval_prompts import run as propose_eval_prompts
 
 
-SERVER_INFO = {"name": "local-assist-server", "version": "0.1.0"}
+SERVER_INFO = {"name": "local-assist-server", "version": __version__}
 DEFAULT_PROTOCOL_VERSION = "2024-11-05"
 SUPPORTED_PROTOCOL_VERSIONS = (
     "2025-11-25",

@@ -6,6 +6,7 @@ import os
 import re
 import stat
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +18,7 @@ RELEASE_BINARY_PATH = BIN_DIR / "se-key-proxy"
 TEST_BINARY_PATH = BIN_DIR / "se-key-proxy-test"
 STAMP_PATH = BIN_DIR / ".se-key-proxy.stamp"
 
-EXPECTED_SWIFT_SOURCE_SHA256 = "25afb0d77b321c8999d6db9461650f7909d1c6ff2a21c4273fc40f1ae73c56dd"
+EXPECTED_SWIFT_SOURCE_SHA256 = "6d5ded2f446ae3ab873e5be61325a9ffad2457a9289f85264f9def7b81858947"
 SKIP_EXIT_CODE = 77
 SESSION_TOKEN_REDACT_RE = re.compile(r"se-session-[A-Za-z0-9_-]{16,}")
 SESSION_TOKEN_BYTES_RE = re.compile(rb"se-session-[A-Za-z0-9_-]{16,}")
@@ -301,6 +302,46 @@ def verify_root_owned_binary_and_ancestors(binary_path: Path | str) -> None:
         )
 
 
+def _compile_and_install_binary_atomically(
+    swiftc_args: list[str],
+    dest_bin: Path,
+    target_dir: Path,
+) -> str:
+    """Compile and codesign into a temporary staging file, then atomically replace dest_bin.
+
+    Never writes or re-signs dest_bin in-place, so any running process mapped from the
+    previous inode on macOS keeps its open vnode and code-signature pages intact.
+    """
+    fd, tmp_str = tempfile.mkstemp(prefix=".se-key-proxy-build-", dir=str(target_dir))
+    os.close(fd)
+    tmp_path = Path(tmp_str)
+    try:
+        subprocess.run(
+            [*swiftc_args, "-o", str(tmp_path)],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        subprocess.run(
+            ["codesign", "-f", "-s", "-", "--options", "runtime", str(tmp_path)],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        os.chmod(tmp_path, 0o755)
+        digest = sha256_file(tmp_path)
+        os.replace(str(tmp_path), str(dest_bin))
+        return digest
+    finally:
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+
 def build_se_key_proxy(
     *,
     include_test_binary: bool = False,
@@ -334,39 +375,19 @@ def build_se_key_proxy(
     if reuse_existing_release:
         release_sha = sha256_file(release_bin)
     else:
-        subprocess.run(
-            ["swiftc", "-O", str(src), "-o", str(release_bin)],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=120,
+        release_sha = _compile_and_install_binary_atomically(
+            ["swiftc", "-O", str(src)],
+            release_bin,
+            target_dir,
         )
-        subprocess.run(
-            ["codesign", "-f", "-s", "-", "--options", "runtime", str(release_bin)],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        release_sha = sha256_file(release_bin)
 
     test_sha: str | None = None
     if include_test_binary:
-        subprocess.run(
-            ["swiftc", "-O", "-D", "SE_KEY_TESTING", str(src), "-o", str(test_bin)],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=120,
+        test_sha = _compile_and_install_binary_atomically(
+            ["swiftc", "-O", "-D", "SE_KEY_TESTING", str(src)],
+            test_bin,
+            target_dir,
         )
-        subprocess.run(
-            ["codesign", "-f", "-s", "-", "--options", "runtime", str(test_bin)],
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=30,
-        )
-        test_sha = sha256_file(test_bin)
 
     stamp_data = {
         "source_sha256": source_sha,
@@ -374,7 +395,21 @@ def build_se_key_proxy(
         "binary_sha256": release_sha,
     }
     if not reuse_existing_release:
-        stamp_file.write_text(json.dumps(stamp_data, indent=2, sort_keys=True) + "\n")
+        s_fd, s_tmp_str = tempfile.mkstemp(prefix=".se-key-proxy-stamp-", dir=str(target_dir))
+        s_tmp_path = Path(s_tmp_str)
+        try:
+            with os.fdopen(s_fd, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(stamp_data, indent=2, sort_keys=True) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(s_tmp_path, 0o644)
+            os.replace(str(s_tmp_path), str(stamp_file))
+        finally:
+            if s_tmp_path.exists():
+                try:
+                    s_tmp_path.unlink()
+                except OSError:
+                    pass
     return {
         **stamp_data,
         "release_binary": str(release_bin),

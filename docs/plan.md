@@ -97,8 +97,8 @@ Each candidate must record:
 
 Review workflow:
 
-1. Codex scouts candidates and fills the table with sources.
-2. User cross-checks the table in this workspace with Claude or another strong model, asking it to challenge provenance, fit, missing candidates, and wasted downloads.
+1. An interactive coding agent scouts candidates and fills the table with sources.
+2. User cross-checks the table in this workspace with a second cross-family reviewer model, asking it to challenge provenance, fit, missing candidates, and wasted downloads.
 3. Only models that survive review move to `reviewed` status.
 4. Download only the reviewed models needed for the current milestone.
 
@@ -445,7 +445,7 @@ After setup:
 
 ## Backlog
 
-- Create a dedicated Codex skill named `local-llm-scout`.
+- Create a dedicated scouting skill named `local-llm-scout`.
 - Add multimodal evals for image, chart, OCR, and maybe audio tasks.
 - Evaluate Open WebUI or another richer human comparison UI.
 - Add LLM-as-judge as a secondary signal.

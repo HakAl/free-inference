@@ -2243,6 +2243,510 @@ containers:
         )
         self.assertIn("inconsistent weights across active host code_tags", str(ctx_f2_mirrored.exception))
 
+    def test_review_20261107_catalog_sync_hardening(self) -> None:
+        from local_assist.catalog_sync import (
+            ENCLAVE_REPO_RE,
+            MAX_GITHUB_ISSUE_BODY_CHARS,
+            SERVED_ID_RE,
+            _strict_json_loads,
+        )
+
+        # A3a: Registered already-demoted candidate model (routing.private_attested=blocked)
+        # with healthy=0 in router manifest and absent from /v1/models must still emit a
+        # FeedDisagreementItem so weekly --check does not report clean and close the issue.
+        models_a3a = _make_base_models_fixture()
+        router_a3a = _make_router_manifest_fixture()
+        router_a3a["models"]["kimi-k3"]["verification"]["healthy"] = 0
+        oai_a3a = _make_openai_models_fixture()
+        oai_a3a["data"] = [m for m in oai_a3a["data"] if m["id"] != "kimi-k3"]
+        enclaves_base = {
+            "tinfoilsh/confidential-deepseek-v4-1-flash@v0.0.10+b200": parse_tinfoil_config_yaml(
+                DEEPSEEK_V4_1_FLASH_YAML
+            ),
+            "tinfoilsh/confidential-kimi-k3@v0.0.16": parse_tinfoil_config_yaml(KIMI_K3_V0_0_16_YAML),
+            "tinfoilsh/confidential-kimi-k3-1-pro@v0.0.3": parse_tinfoil_config_yaml(
+                KIMI_K3_1_PRO_V0_0_3_YAML
+            ),
+        }
+        rep_a3a = compute_catalog_drift(
+            models_a3a,
+            router_a3a,
+            oai_a3a,
+            enclaves_base,
+            observed_date="2026-11-08",
+        )
+        self.assertEqual(len(rep_a3a.disagreements), 1)
+        self.assertEqual(rep_a3a.disagreements[0].model_id, "tinfoil-kimi-k3")
+        self.assertEqual(rep_a3a.disagreements[0].router_healthy, 0)
+        self.assertTrue(rep_a3a.has_drift)
+
+        # A3b: Registered model with status='archived' stays at status='archived' (one-way ratchet)
+        # whether healthy > 0 or healthy == 0.
+        models_a3b = _make_base_models_fixture()
+        models_a3b["models"][2]["status"] = "archived"
+        rep_a3b_healthy = compute_catalog_drift(
+            models_a3b,
+            _make_router_manifest_fixture(),
+            _make_openai_models_fixture(),
+            enclaves_base,
+            observed_date="2026-11-08",
+        )
+        kimi_up_h = [u for u in rep_a3b_healthy.updated_models if u.model_id == "tinfoil-kimi-k3"]
+        for u in kimi_up_h:
+            self.assertNotIn("status", u.changes)
+        rep_a3b_zero = compute_catalog_drift(
+            models_a3b,
+            router_a3a,
+            _make_openai_models_fixture(),
+            enclaves_base,
+            observed_date="2026-11-08",
+        )
+        kimi_up_z = [u for u in rep_a3b_zero.updated_models if u.model_id == "tinfoil-kimi-k3"]
+        for u in kimi_up_z:
+            self.assertNotIn("status", u.changes)
+
+        # A3c: ENCLAVE_REPO_RE and SERVED_ID_RE reject non-tinfoilsh owners, dot segments, and slashes
+        for bad_repo in ("evil/repo", "tinfoilsh/..", "tinfoilsh/.", "tinfoilsh/.hidden"):
+            self.assertIsNone(ENCLAVE_REPO_RE.match(bad_repo), f"Accepted {bad_repo!r}")
+            router_bad_repo = _make_router_manifest_fixture()
+            router_bad_repo["models"]["kimi-k3"]["repo"] = bad_repo
+            with self.assertRaises(CatalogSyncError):
+                validate_router_manifest(router_bad_repo)
+        for bad_sid in ("../bad", "bad/slash", ".hidden", ""):
+            self.assertIsNone(SERVED_ID_RE.match(bad_sid), f"Accepted {bad_sid!r}")
+
+        # A3d & PLAN-MINOR-1 & WORK-MINOR-2: Symmetric discovery disagreement in both directions
+        # Direction 1: Unregistered model in router manifest absent from /v1/models:
+        # healthy=2 is included as a disagreement; healthy=0 is excluded
+        router_d1_healthy = _make_router_manifest_fixture()
+        router_d1_healthy["models"]["mystery-router-only"] = {
+            "repo": "tinfoilsh/confidential-mystery",
+            "tag": "v0.0.1",
+            "verification": {"configured": 2, "healthy": 2},
+        }
+        rep_d1_healthy = compute_catalog_drift(
+            _make_base_models_fixture(),
+            router_d1_healthy,
+            _make_openai_models_fixture(),
+            enclaves_base,
+            observed_date="2026-11-08",
+        )
+        self.assertIn(
+            "mystery-router-only",
+            [d.served_model_id for d in rep_d1_healthy.disagreements],
+        )
+
+        router_d1_zero = _make_router_manifest_fixture()
+        router_d1_zero["models"]["mystery-router-only"] = {
+            "repo": "tinfoilsh/confidential-mystery",
+            "tag": "v0.0.1",
+            "verification": {"configured": 2, "healthy": 0},
+        }
+        rep_d1_zero = compute_catalog_drift(
+            _make_base_models_fixture(),
+            router_d1_zero,
+            _make_openai_models_fixture(),
+            enclaves_base,
+            observed_date="2026-11-08",
+        )
+        self.assertNotIn(
+            "mystery-router-only",
+            [d.served_model_id for d in rep_d1_zero.disagreements],
+        )
+
+        # Direction 2: Unregistered coding model (type='chat', tool_calling=True) in /v1/models
+        # absent from router manifest is included regardless of owned_by, while non-coding or deprecated models are excluded
+        for owner_val in ("tinfoil", "other-org"):
+            oai_d2 = _make_openai_models_fixture()
+            oai_d2["data"].append(
+                {
+                    "id": "mystery-oai-only",
+                    "owned_by": owner_val,
+                    "type": "chat",
+                    "tool_calling": True,
+                }
+            )
+            rep_d2 = compute_catalog_drift(
+                _make_base_models_fixture(),
+                _make_router_manifest_fixture(),
+                oai_d2,
+                enclaves_base,
+                observed_date="2026-11-08",
+            )
+            dis_ids_d2 = [d.served_model_id for d in rep_d2.disagreements]
+            self.assertIn("mystery-oai-only", dis_ids_d2)
+
+        oai_d2_excluded = _make_openai_models_fixture()
+        oai_d2_excluded["data"].extend(
+            [
+                {"id": "mystery-embed-only", "type": "embedding", "tool_calling": False},
+                {"id": "mystery-dep-only", "type": "chat", "tool_calling": True, "deprecated": True},
+            ]
+        )
+        rep_d2_excl = compute_catalog_drift(
+            _make_base_models_fixture(),
+            _make_router_manifest_fixture(),
+            oai_d2_excluded,
+            enclaves_base,
+            observed_date="2026-11-08",
+        )
+        dis_ids_excl = [d.served_model_id for d in rep_d2_excl.disagreements]
+        self.assertNotIn("mystery-embed-only", dis_ids_excl)
+        self.assertNotIn("mystery-dep-only", dis_ids_excl)
+
+        # A3e: --apply --quarantine-disagreements records quarantine_disagreement in updated_models
+        # and CLI emits check_status == 'quarantined'
+        models_a3e = _make_base_models_fixture()
+        oai_dis_ds = _make_openai_models_fixture()
+        oai_dis_ds["data"] = [m for m in oai_dis_ds["data"] if m["id"] != "deepseek-v4-1-flash"]
+        rep_a3e = compute_catalog_drift(
+            models_a3e,
+            _make_router_manifest_fixture(),
+            oai_dis_ds,
+            enclaves_base,
+            observed_date="2026-11-08",
+        )
+        self.assertEqual(len(rep_a3e.disagreements), 1)
+        with tempfile.TemporaryDirectory() as td_e:
+            p_e = Path(td_e) / "models.yaml"
+            p_e.write_text(dump_models_yaml(models_a3e), encoding="utf-8")
+            os.chmod(p_e, 0o640)
+            healed_e = apply_catalog_healing(
+                p_e,
+                rep_a3e,
+                quarantine_disagreements=True,
+            )
+            # Mode 0o640 preserved across atomic write
+            self.assertEqual(os.stat(p_e).st_mode & 0o777, 0o640)
+            q_items = [u for u in rep_a3e.updated_models if u.action == "quarantine_disagreement"]
+            self.assertEqual(len(q_items), 1)
+            self.assertEqual(q_items[0].model_id, "tinfoil-deepseek-v4-1-flash")
+            ds_healed = [m for m in healed_e["models"] if m["id"] == "tinfoil-deepseek-v4-1-flash"][0]
+            self.assertEqual(ds_healed["routing"]["private_attested"], "blocked")
+            self.assertEqual(ds_healed["status"], "candidate")
+            self.assertIn("Quarantined due to feed disagreement", q_items[0].notes[0])
+            self.assertEqual(
+                ds_healed["stale_eval_evidence_artifact"],
+                "docs/evals/tinfoil-deepseek-v4-1-flash.json",
+            )
+
+            import importlib.machinery
+            import importlib.util
+
+            script_path = ROOT / "scripts" / "sync-model-catalog"
+            loader = importlib.machinery.SourceFileLoader("sync_model_catalog_cli_a3e", str(script_path))
+            spec = importlib.util.spec_from_loader(loader.name, loader)
+            assert spec is not None and spec.loader is not None
+            cli_mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(cli_mod)
+            p_e2 = Path(td_e) / "models2.yaml"
+            p_e2.write_text(dump_models_yaml(models_a3e), encoding="utf-8")
+            json_e2 = Path(td_e) / "out.json"
+            with (
+                patch.object(cli_mod, "fetch_tinfoil_router_manifest", return_value=_make_router_manifest_fixture()),
+                patch.object(cli_mod, "fetch_tinfoil_openai_models", return_value=oai_dis_ds),
+                patch.object(
+                    cli_mod,
+                    "fetch_tinfoil_enclave_config",
+                    side_effect=lambda r, t, **kw: enclaves_base[f"{r}@{t}"],
+                ),
+            ):
+                rc_q = cli_mod.main(
+                    [
+                        "--apply",
+                        "--quarantine-disagreements",
+                        "--models-path",
+                        str(p_e2),
+                        "--json-out",
+                        str(json_e2),
+                    ]
+                )
+            self.assertEqual(rc_q, 0)
+            q_payload = json.loads(json_e2.read_text(encoding="utf-8"))
+            self.assertEqual(q_payload["check_status"], "quarantined")
+
+            # A3f: _strict_json_loads rejects NaN, Infinity, and 1e999; apply_catalog_healing rejects non-finite numbers
+            for bad_json in ('{"p": NaN}', '{"p": Infinity}', '{"p": -Infinity}', '{"p": 1e999}'):
+                with self.assertRaises(CatalogSyncError):
+                    _strict_json_loads(bad_json, context="test")
+
+            p_nan = Path(td_e) / "models_nan.yaml"
+            p_nan.write_text(dump_models_yaml(_make_base_models_fixture()), encoding="utf-8")
+            rep_nan = copy.deepcopy(rep_a3e)
+            rep_nan.disagreements.clear()
+            rep_nan.updated_models.clear()
+            rep_nan.new_models[0]["remote_trust"]["pricing_per_m_tokens"]["input"] = float("inf")
+            with self.assertRaises(CatalogSyncError):
+                apply_catalog_healing(p_nan, rep_nan)
+
+        # A3g & WORK-MINOR-5: host_code_tags > 8 and enclave_config_fetches > 32 (including across a 2-pass --apply recomputation)
+        # raise CatalogSyncError; catalog-sync.yml has timeout-minutes: 5
+        wf_data = safe_load((ROOT / ".github" / "workflows" / "catalog-sync.yml").read_text(encoding="utf-8"))
+        self.assertEqual(wf_data["jobs"]["check-catalog-drift"].get("timeout-minutes"), 5)
+
+        router_many_tags = _make_router_manifest_fixture()
+        router_many_tags["models"]["deepseek-v4-1-flash"]["verification"]["hosts"] = {
+            f"host-{i}": {"code_tag": f"v0.0.{i}"} for i in range(10)
+        }
+        with self.assertRaises(CatalogSyncError) as ctx_tags:
+            validate_router_manifest(router_many_tags)
+        self.assertIn("exceeds cap of 8", str(ctx_tags.exception))
+
+        # Two-pass shared fetch budget: Pass 1 performs 32 uncached fetches, then a concurrent catalog change
+        # triggers Pass 2 which attempts a 33rd uncached fetch and fails closed (WORK-MINOR-5)
+        with tempfile.TemporaryDirectory() as td_g:
+            p_g = Path(td_g) / "models_budget.yaml"
+            models_32 = _make_base_models_fixture()
+            router_33 = _make_router_manifest_fixture()
+            oai_33 = _make_openai_models_fixture()
+            base_ds_tmpl = copy.deepcopy(
+                [m for m in models_32["models"] if m["id"] == "tinfoil-deepseek-v4-1-flash"][0]
+            )
+            base_ds_tmpl["status"] = "candidate"
+            base_ds_tmpl["routing"]["private_attested"] = "blocked"
+            base_ds_tmpl.pop("eval_evidence_artifact", None)
+            models_32["models"] = []
+            for idx in range(33):
+                sid = f"budget-model-{idx:02d}"
+                er = f"tinfoilsh/confidential-{sid}"
+                et = "v0.0.1"
+                router_33["models"][sid] = {
+                    "repo": er,
+                    "tag": et,
+                    "verification": {"configured": 1, "healthy": 1},
+                }
+                oai_33["data"].append(
+                    {
+                        "id": sid,
+                        "name": f"Budget {idx}",
+                        "type": "chat",
+                        "tool_calling": True,
+                        "context_window": 32768,
+                        "pricing": {"inputTokenPricePer1M": 1.0, "outputTokenPricePer1M": 2.0},
+                    }
+                )
+                if idx < 32:
+                    m_entry = copy.deepcopy(base_ds_tmpl)
+                    m_entry["id"] = f"tinfoil-{sid}"
+                    m_entry["repo"] = sid
+                    m_entry["enclave_repo"] = er
+                    m_entry["enclave_tag"] = et
+                    models_32["models"].append(m_entry)
+
+            # Mutated catalog on disk has all 33 models so when CLI re-reads models.yaml before healing,
+            # the digest differs and triggers Pass 2 (which hits the 33rd uncached model)
+            models_33 = copy.deepcopy(models_32)
+            m_33 = copy.deepcopy(base_ds_tmpl)
+            m_33["id"] = "tinfoil-budget-model-32"
+            m_33["repo"] = "budget-model-32"
+            m_33["enclave_repo"] = "tinfoilsh/confidential-budget-model-32"
+            m_33["enclave_tag"] = "v0.0.1"
+            models_33["models"].append(m_33)
+            # Initially write 32 models to disk; during Pass 1's 32nd config fetch,
+            # concurrently write the 33-model catalog to p_g so Pass 2 is triggered and attempts a 33rd fetch
+            p_g.write_text(dump_models_yaml(models_32), encoding="utf-8")
+
+            ds_cfg_parsed = parse_tinfoil_config_yaml(DEEPSEEK_V4_1_FLASH_YAML)
+            fetch_calls = [0]
+
+            def _concurrent_fetch_enclave(repo: str, _t: str, **_kw: object) -> dict:
+                fetch_calls[0] += 1
+                if fetch_calls[0] == 32:
+                    p_g.write_text(dump_models_yaml(models_33), encoding="utf-8")
+                sid = repo.removeprefix("tinfoilsh/confidential-")
+                return parse_tinfoil_config_yaml(
+                    DEEPSEEK_V4_1_FLASH_YAML.replace("deepseek-v4-1-flash", sid)
+                )
+
+            with (
+                patch.object(cli_mod, "fetch_tinfoil_router_manifest", return_value=router_33),
+                patch.object(cli_mod, "fetch_tinfoil_openai_models", return_value=oai_33),
+                patch.object(
+                    cli_mod,
+                    "fetch_tinfoil_enclave_config",
+                    side_effect=_concurrent_fetch_enclave,
+                ),
+            ):
+                rc_budget = cli_mod.main(
+                    [
+                        "--apply",
+                        "--no-discover-new",
+                        "--models-path",
+                        str(p_g),
+                    ]
+                )
+            self.assertEqual(rc_budget, 1)
+            self.assertEqual(fetch_calls[0], 32)
+
+        # A3h & WORK-MINOR-3: render_github_issue_body truncates oversized reports AND long backtick runs
+        # cleanly within MAX_GITHUB_ISSUE_BODY_CHARS while preserving </details>\n
+        huge_report = copy.deepcopy(rep_a3e)
+        huge_report.new_models.append(
+            {
+                "id": "tinfoil-backtick-bomb",
+                "repo": "backtick-bomb",
+                "enclave_repo": "tinfoilsh/confidential-backtick-bomb",
+                "enclave_tag": "v0.0.1",
+                "license": "MIT " + ("`" * 25000),
+                "fit_notes": "Model name with " + ("`" * 25000),
+                "disk_gb_estimate": 100.0,
+                "remote_trust": {
+                    "provider_manifest_weights_source": "org/model@" + ("a" * 40),
+                    "provider_manifest_weights_hash": "dmverity:sha256:" + ("b" * 64),
+                    "pricing_per_m_tokens": {"input": 1.0, "output": 2.0},
+                },
+            }
+        )
+        for i in range(500):
+            huge_report.new_models.append(
+                {
+                    "id": f"tinfoil-huge-model-{i:04d}",
+                    "repo": f"huge-model-{i:04d}",
+                    "enclave_repo": f"tinfoilsh/confidential-huge-{i:04d}",
+                    "enclave_tag": "v0.0.1",
+                    "disk_gb_estimate": 100.0,
+                    "remote_trust": {
+                        "provider_manifest_weights_source": "org/model@" + ("a" * 40),
+                        "provider_manifest_weights_hash": "dmverity:sha256:" + ("b" * 64),
+                        "pricing_per_m_tokens": {"input": 1.0, "output": 2.0},
+                    },
+                }
+            )
+        rendered_huge = render_github_issue_body(
+            huge_report.to_dict(),
+            exit_code=2,
+            human_output=("`" * 25000) + "\n" + ("huge human output line\n" * 4000),
+        )
+        self.assertLessEqual(len(rendered_huge), MAX_GITHUB_ISSUE_BODY_CHARS)
+        self.assertTrue(rendered_huge.endswith("</details>\n"))
+        self.assertIn("truncated to fit GitHub 65536-char issue body limit", rendered_huge)
+        self.assertIn("backticks]", rendered_huge)
+
+        # FREE-INFERENCE-V013-001 F1: Unregistered discovery disagreements cannot collide with or quarantine a registered model
+        from local_assist.catalog_sync import CatalogDriftReport, FeedDisagreementItem
+
+        # 1. Colliding OpenAI-only served_id ('tinfoil-deepseek-v4-1-flash') while original ('deepseek-v4-1-flash') is healthy in both feeds
+        models_f1_base = _make_base_models_fixture()
+        router_f1_base = _make_router_manifest_fixture()
+        oai_f1_base = _make_openai_models_fixture()
+        oai_f1_collide = copy.deepcopy(oai_f1_base)
+        oai_f1_collide["data"].append(
+            {
+                "id": "tinfoil-deepseek-v4-1-flash",
+                "type": "chat",
+                "tool_calling": True,
+                "deprecated": False,
+                "pricing": {"prompt": 0.5, "completion": 1.0},
+            }
+        )
+        with self.assertRaises(CatalogSyncError) as ctx_f1_oai:
+            compute_catalog_drift(
+                models_f1_base,
+                router_f1_base,
+                oai_f1_collide,
+                enclaves_base,
+                observed_date="2026-11-08",
+            )
+        self.assertIn("collides with existing catalog entry id='tinfoil-deepseek-v4-1-flash'", str(ctx_f1_oai.exception))
+
+        # 2. Colliding router-only served_id ('tinfoil-deepseek-v4-1-flash') while original ('deepseek-v4-1-flash') is healthy in both feeds
+        router_f1_collide = copy.deepcopy(router_f1_base)
+        router_f1_collide["models"]["tinfoil-deepseek-v4-1-flash"] = {
+            "repo": "tinfoilsh/confidential-colliding",
+            "tag": "v0.0.1",
+            "verification": {"healthy": 1, "configured": 1},
+        }
+        with self.assertRaises(CatalogSyncError) as ctx_f1_rtr:
+            compute_catalog_drift(
+                models_f1_base,
+                router_f1_collide,
+                oai_f1_base,
+                enclaves_base,
+                observed_date="2026-11-08",
+            )
+        self.assertIn("collides with existing catalog entry id='tinfoil-deepseek-v4-1-flash'", str(ctx_f1_rtr.exception))
+
+        # 3. CLI --apply --quarantine-disagreements refuses colliding discovery disagreement and leaves models.yaml untouched,
+        # and apply_catalog_healing rejects any synthetic registered disagreement with mismatched served_model_id or non-Tinfoil target
+        with tempfile.TemporaryDirectory() as tmpdir_f1:
+            p_f1 = Path(tmpdir_f1) / "models.yaml"
+            p_f1.write_text(dump_models_yaml(models_f1_base), encoding="utf-8")
+            orig_bytes_f1 = p_f1.read_bytes()
+
+            with (
+                patch.object(cli_mod, "fetch_tinfoil_router_manifest", return_value=router_f1_base),
+                patch.object(cli_mod, "fetch_tinfoil_openai_models", return_value=oai_f1_collide),
+                patch.object(
+                    cli_mod,
+                    "fetch_tinfoil_enclave_config",
+                    side_effect=lambda r, t, **kw: enclaves_base[f"{r}@{t}"],
+                ),
+            ):
+                rc_f1_cli = cli_mod.main(
+                    [
+                        "--apply",
+                        "--quarantine-disagreements",
+                        "--models-path",
+                        str(p_f1),
+                    ]
+                )
+            self.assertEqual(rc_f1_cli, 1)
+            self.assertEqual(p_f1.read_bytes(), orig_bytes_f1)
+
+            # Synthetic registered=True disagreement with mismatched served_model_id refuses before publication
+            synth_mismatch = CatalogDriftReport(
+                observed_date="2026-11-08",
+                base_catalog_sha256=compute_models_data_digest(models_f1_base),
+                disagreements=[
+                    FeedDisagreementItem(
+                        model_id="tinfoil-deepseek-v4-1-flash",
+                        served_model_id="tinfoil-deepseek-v4-1-flash",
+                        in_router_manifest=False,
+                        in_openai_models=True,
+                        router_healthy=None,
+                        reason="synthetic collision",
+                        registered=True,
+                    )
+                ],
+            )
+            with self.assertRaises(CatalogSyncError) as ctx_f1_synth:
+                apply_catalog_healing(
+                    p_f1,
+                    synth_mismatch,
+                    append_new_models=False,
+                    quarantine_disagreements=True,
+                )
+            self.assertIn("served_model_id 'deepseek-v4-1-flash' does not match", str(ctx_f1_synth.exception))
+            self.assertEqual(p_f1.read_bytes(), orig_bytes_f1)
+
+            # Non-colliding unregistered disagreement (registered=False) does not quarantine any registered model
+            unreg_rep = CatalogDriftReport(
+                observed_date="2026-11-08",
+                base_catalog_sha256=compute_models_data_digest(models_f1_base),
+                disagreements=[
+                    FeedDisagreementItem(
+                        model_id="tinfoil-new-unreg-coder",
+                        served_model_id="new-unreg-coder",
+                        in_router_manifest=False,
+                        in_openai_models=True,
+                        router_healthy=None,
+                        reason="unregistered coding model",
+                        registered=False,
+                    )
+                ],
+            )
+            healed_unreg = apply_catalog_healing(
+                p_f1,
+                unreg_rep,
+                append_new_models=False,
+                quarantine_disagreements=True,
+            )
+            ds_after = next(m for m in healed_unreg["models"] if m["id"] == "tinfoil-deepseek-v4-1-flash")
+            self.assertEqual(ds_after["status"], "active")
+            self.assertEqual(ds_after["routing"]["private_attested"], "cleared")
+            self.assertEqual(ds_after["eval_evidence_artifact"], "docs/evals/tinfoil-deepseek-v4-1-flash.json")
+            self.assertNotIn("stale_eval_evidence_artifact", ds_after)
+
 
 if __name__ == "__main__":
     unittest.main()

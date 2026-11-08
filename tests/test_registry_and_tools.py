@@ -2461,7 +2461,11 @@ class RegistryAndToolsTests(unittest.TestCase):
 
     def test_private_coding_admission_requires_cleared_routing_or_override(self) -> None:
         oc_attested = _load_script_module("opencode_attested_gate", "scripts/opencode-attested")
+        oc_local = _load_script_module("opencode_local_gate", "scripts/opencode-local")
         uncleared_ep = resolve_endpoint(
+            load_model("tinfoil-kimi-k3-1-pro"), require_api_key=False
+        )
+        deprecated_ep = resolve_endpoint(
             load_model("tinfoil-kimi-k3"), require_api_key=False
         )
         cleared_ep = resolve_endpoint(
@@ -2495,7 +2499,7 @@ class RegistryAndToolsTests(unittest.TestCase):
         # And refuses when no model is cleared in models_list
         with self.assertRaises(LocalAssistError) as ctx_default:
             oc_attested.resolve_default_attested_model_id(
-                [load_model("tinfoil-gpt-oss-120b"), load_model("tinfoil-kimi-k3")]
+                [load_model("tinfoil-gpt-oss-120b"), load_model("tinfoil-kimi-k3-1-pro")]
             )
         self.assertEqual(ctx_default.exception.code, "routing_gate_blocked")
 
@@ -2508,12 +2512,99 @@ class RegistryAndToolsTests(unittest.TestCase):
         self.assertEqual(ctx_launcher.exception.code, "routing_gate_blocked")
 
         import io
+        from dataclasses import replace
 
         warn_buf = io.StringIO()
         oc_attested.validate_private_attested_endpoint(
             uncleared_ep, allow_uncleared_model=True, err_stream=warn_buf
         )
         self.assertIn("WARNING: Running private-attested with uncleared candidate", warn_buf.getvalue())
+
+        # Deprecated model (tinfoil-kimi-k3) is refused unless --allow-deprecated-model is also passed (A4)
+        with self.assertRaises(LocalAssistError) as ctx_dep:
+            oc_attested.validate_private_attested_endpoint(
+                deprecated_ep, allow_uncleared_model=True
+            )
+        self.assertEqual(ctx_dep.exception.code, "model_deprecated")
+        self.assertIn("2026-11-12", str(ctx_dep.exception))
+
+        dep_warn_buf = io.StringIO()
+        oc_attested.validate_private_attested_endpoint(
+            deprecated_ep,
+            allow_uncleared_model=True,
+            allow_deprecated_model=True,
+            err_stream=dep_warn_buf,
+        )
+        self.assertIn("WARNING: Running with deprecated model", dep_warn_buf.getvalue())
+
+        # Archived models are unconditionally refused by both launchers even with overrides
+        archived_att_ep = replace(uncleared_ep, status="archived")
+        with self.assertRaises(LocalAssistError) as ctx_arch_att:
+            oc_attested.validate_private_attested_endpoint(
+                archived_att_ep,
+                allow_uncleared_model=True,
+                allow_deprecated_model=True,
+            )
+        self.assertEqual(ctx_arch_att.exception.code, "model_archived")
+
+        local_ep = resolve_endpoint(load_model("qwen3-30b-a3b-2507-mlx-4bit"), require_api_key=False)
+        archived_loc_ep = replace(local_ep, status="archived")
+        with self.assertRaises(LocalAssistError) as ctx_arch_loc:
+            oc_local.validate_private_local_endpoint(
+                archived_loc_ep,
+                allow_uncleared_model=True,
+                allow_deprecated_model=True,
+            )
+        self.assertEqual(ctx_arch_loc.exception.code, "model_archived")
+
+        # resolve_endpoint refuses cleared routing on archived or effectively-deprecated models,
+        # while allowing a future deprecation_date when deprecated=False (WORK-MINOR-1)
+        base_ds = dict(load_model("tinfoil-deepseek-v4-1-flash"))
+        with self.assertRaises(RegistryError):
+            resolve_endpoint(dict(base_ds, status="archived"), require_api_key=False)
+        with self.assertRaises(RegistryError):
+            resolve_endpoint(dict(base_ds, deprecated=True), require_api_key=False)
+        with self.assertRaises(RegistryError):
+            resolve_endpoint(
+                dict(base_ds, deprecated=False, deprecation_date="2026-01-01"),
+                require_api_key=False,
+            )
+        with self.assertRaises(RegistryError):
+            resolve_endpoint(dict(base_ds, status="mystery"), require_api_key=False)
+
+        # Future deprecation_date with deprecated=False remains cleared, selectable as default, and launchable
+        future_ds_entry = dict(base_ds, deprecated=False, deprecation_date="2099-12-31")
+        future_ds_ep = resolve_endpoint(future_ds_entry, require_api_key=False)
+        self.assertEqual(
+            oc_attested.resolve_default_attested_model_id([future_ds_entry]),
+            "tinfoil-deepseek-v4-1-flash",
+        )
+        oc_attested.validate_private_attested_endpoint(
+            future_ds_ep,
+            allow_uncleared_model=False,
+            allow_deprecated_model=False,
+        )
+
+        # Past deprecation_date (<= today) with deprecated=False is skipped by default selector and blocked by launcher
+        past_ds_entry = dict(base_ds, deprecated=False, deprecation_date="2026-01-01")
+        with self.assertRaises(LocalAssistError) as ctx_past_def:
+            oc_attested.resolve_default_attested_model_id([past_ds_entry])
+        self.assertEqual(ctx_past_def.exception.code, "routing_gate_blocked")
+
+        past_cand_ep = replace(uncleared_ep, deprecated=False, deprecation_date="2026-01-01")
+        with self.assertRaises(LocalAssistError) as ctx_past_launch:
+            oc_attested.validate_private_attested_endpoint(
+                past_cand_ep,
+                allow_uncleared_model=True,
+                allow_deprecated_model=False,
+            )
+        self.assertEqual(ctx_past_launch.exception.code, "model_deprecated")
+        oc_attested.validate_private_attested_endpoint(
+            past_cand_ep,
+            allow_uncleared_model=True,
+            allow_deprecated_model=True,
+            err_stream=io.StringIO(),
+        )
 
     def test_verify_served_model_port_occupancy_across_proxy_models(self) -> None:
         verify_mod = _load_script_module("verify_served_model_proxy_test", "scripts/verify-served-model")
@@ -3765,6 +3856,411 @@ class RegistryAndToolsTests(unittest.TestCase):
             self.assertEqual(rc_esc_survive, 1)
             self.assertEqual(signals_sent_c, [signal.SIGTERM, signal.SIGKILL])
             self.assertTrue(pid_path.exists())
+
+    def test_version_0_1_3_and_setup_modes(self) -> None:
+        import shutil
+        import local_assist
+        from local_assist.server import SERVER_INFO
+
+        # 1. Version parity across __init__.py, server.py, package.json, and scripts/models --version (A4)
+        self.assertEqual(local_assist.__version__, "0.1.3")
+        self.assertEqual(SERVER_INFO["version"], "0.1.3")
+        pkg_json = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))
+        self.assertEqual(pkg_json["version"], "0.1.3")
+
+        # 2. requirements-local.txt closure check (Phase 2 / PLAN-MINOR-2 / WORK-MINOR-4)
+        req_local_lines = [
+            line.strip()
+            for line in (ROOT / "requirements-local.txt").read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        req_full_lines = [
+            line.strip()
+            for line in (ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        self.assertEqual(len(req_local_lines), 35)
+        self.assertTrue(set(req_local_lines).issubset(set(req_full_lines)))
+        self.assertIn("mlx-lm==0.31.3", req_local_lines)
+        self.assertIn("PyYAML==6.0.3", req_local_lines)
+        self.assertIn("hf_transfer==0.1.9", req_local_lines)
+        for excluded_pkg in (
+            "mlx-vlm",
+            "mlx-audio",
+            "opencv-python",
+            "scipy",
+            "pandas",
+            "pyarrow",
+            "datasets",
+            "pillow",
+            "soundfile",
+        ):
+            self.assertFalse(
+                any(line.startswith(f"{excluded_pkg}==") for line in req_local_lines),
+                f"Unexpected heavy package {excluded_pkg} in requirements-local.txt",
+            )
+
+        # 3. Isolated execution of no-.venv launchers and scripts/setup modes (WORK-MAJOR-1, WORK-MINOR-4, R2-WORK-MINOR-1)
+        with tempfile.TemporaryDirectory() as tmp_ws_str:
+            tmp_ws = Path(tmp_ws_str)
+            (tmp_ws / "scripts").mkdir(parents=True)
+            (tmp_ws / "bin").mkdir(parents=True)
+            (tmp_ws / "runs").mkdir(parents=True)
+            for script_rel in ("setup", "models", "opencode-local", "opencode-attested"):
+                shutil.copy2(ROOT / "scripts" / script_rel, tmp_ws / "scripts" / script_rel)
+            shutil.copy2(ROOT / "models.yaml", tmp_ws / "models.yaml")
+            shutil.copy2(ROOT / "requirements-local.txt", tmp_ws / "requirements-local.txt")
+            shutil.copy2(ROOT / "requirements.txt", tmp_ws / "requirements.txt")
+            shutil.copytree(ROOT / "local_assist", tmp_ws / "local_assist")
+            shutil.copytree(ROOT / "config", tmp_ws / "config")
+            shutil.copytree(ROOT / "docs" / "evals", tmp_ws / "docs" / "evals")
+
+            # Stub verify-served-model and write mock attested PID + session token so --print-config --no-serve works offline
+            verify_stub = tmp_ws / "scripts" / "verify-served-model"
+            verify_stub.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            verify_stub.chmod(0o755)
+
+            tok_file = tmp_ws / "runs" / "mock-session.tok"
+            tok_file.write_text("se-session-0123456789abcdef0123456789abcdef\n", encoding="utf-8")
+            tok_file.chmod(0o600)
+            att_pid_file = tmp_ws / "runs" / ".serve-tinfoil-deepseek-v4-1-flash.pid"
+            att_pid_file.write_text(
+                json.dumps(
+                    {
+                        "model_id": "tinfoil-deepseek-v4-1-flash",
+                        "pid": os.getpid(),
+                        "session_token_file": str(tok_file),
+                        "max_chat_requests": 50,
+                        "max_request_bytes": 262144,
+                        "max_tokens_cap": 4096,
+                        "ttl_seconds": 3600,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            # Stub scripts/se-key so --launcher-only does not invoke swiftc inside the unit test
+            se_key_stub = tmp_ws / "scripts" / "se-key"
+            se_key_stub.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                'mkdir -p "$(dirname "$0")/../bin"\n'
+                'echo "#!/bin/sh" > "$(dirname "$0")/../bin/se-key-proxy"\n'
+                'chmod +x "$(dirname "$0")/../bin/se-key-proxy"\n'
+                'echo \'{"status": "built", "binary": "bin/se-key-proxy"}\'\n',
+                encoding="utf-8",
+            )
+            se_key_stub.chmod(0o755)
+
+            fake_bin = tmp_ws / "fake-bin"
+            fake_bin.mkdir()
+            invocations_log = tmp_ws / "invocations.log"
+
+            # Ensure python3 is reachable in fake_bin so restricted PATH works on all platforms
+            py3_link = fake_bin / "python3"
+            py3_link.symlink_to(Path(sys.executable))
+
+            tp_stub = tmp_ws / "bin" / "tinfoil-proxy"
+            tp_stub.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            tp_stub.chmod(0o755)
+
+            good_shasum_body = (
+                "#!/usr/bin/env bash\n"
+                "echo '6b526fe32244bcccfcfde3c5d181618b4b06b48498e649cd944cc9b64acf994b  bin/tinfoil-proxy'\n"
+            )
+            good_codesign_body = "#!/usr/bin/env bash\necho 'TeamIdentifier=8KSH668LZT'\nexit 0\n"
+            darwin_uname_body = (
+                "#!/usr/bin/env bash\n"
+                'if [ "${1:-}" = "-s" ]; then echo Darwin; '
+                'elif [ "${1:-}" = "-m" ]; then echo arm64; '
+                "else echo Darwin; fi\n"
+            )
+            linux_uname_body = (
+                "#!/usr/bin/env bash\n"
+                'if [ "${1:-}" = "-s" ]; then echo Linux; '
+                'elif [ "${1:-}" = "-m" ]; then echo x86_64; '
+                "else echo Linux; fi\n"
+            )
+
+            for stub_name, stub_body in (
+                ("uname", darwin_uname_body),
+                ("swiftc", "#!/bin/sh\nexit 0\n"),
+                ("curl", "#!/bin/sh\nexit 0\n"),
+                ("unzip", "#!/bin/sh\nexit 0\n"),
+                ("lsof", "#!/bin/sh\nexit 0\n"),
+                ("ps", "#!/bin/sh\nexit 0\n"),
+                ("pgrep", "#!/bin/sh\nexit 0\n"),
+                ("shasum", good_shasum_body),
+                ("codesign", good_codesign_body),
+                ("gh", "#!/usr/bin/env bash\nexit 1\n"),
+            ):
+                sp = fake_bin / stub_name
+                sp.write_text(stub_body, encoding="utf-8")
+                sp.chmod(0o755)
+
+            # Controlled PATH: only fake_bin + /usr/bin + /bin + /usr/sbin + /sbin (so Homebrew/runner uv, node, npm are absent unless stubbed in fake_bin)
+            test_env = dict(os.environ)
+            test_env["PATH"] = f"{fake_bin}:/usr/bin:/bin:/usr/sbin:/sbin"
+            test_env.pop("FREE_INFERENCE_REQUIRE_GH_ATTESTATION", None)
+
+            # 3a. Clean no-.venv stdlib execution of scripts/models --version and both launchers (--help and --print-config --no-serve)
+            self.assertFalse((tmp_ws / ".venv").exists())
+            models_ver_clean = subprocess.run(
+                [str(py3_link), "-I", str(tmp_ws / "scripts" / "models"), "--version"],
+                cwd=str(tmp_ws),
+                env=test_env,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self.assertEqual(models_ver_clean.stdout.strip(), "free-inference-lab 0.1.3")
+
+            for launcher_rel in ("opencode-local", "opencode-attested"):
+                hlp = subprocess.run(
+                    [str(py3_link), "-I", str(tmp_ws / "scripts" / launcher_rel), "--help"],
+                    cwd=str(tmp_ws),
+                    env=test_env,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                self.assertIn("--allow-deprecated-model", hlp.stdout)
+
+            local_cfg_res = subprocess.run(
+                [str(py3_link), "-I", str(tmp_ws / "scripts" / "opencode-local"), "--print-config", "--no-serve"],
+                cwd=str(tmp_ws),
+                env=test_env,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            local_cfg_payload = json.loads(local_cfg_res.stdout)
+            self.assertEqual(local_cfg_payload["model_id"], "qwen3-30b-a3b-2507-mlx-4bit")
+            self.assertIn("private-local", local_cfg_payload["config"]["provider"])
+
+            att_cfg_res = subprocess.run(
+                [
+                    str(py3_link),
+                    "-I",
+                    str(tmp_ws / "scripts" / "opencode-attested"),
+                    "--print-config",
+                    "--no-serve",
+                ],
+                cwd=str(tmp_ws),
+                env=test_env,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            att_cfg_payload = json.loads(att_cfg_res.stdout)
+            self.assertEqual(att_cfg_payload["model_id"], "tinfoil-deepseek-v4-1-flash")
+            self.assertEqual(att_cfg_payload["session_token"], "<redacted-se-session-token>")
+            self.assertIn("private-attested", att_cfg_payload["config"]["provider"])
+
+            # 3b. Unsupported platform (Linux x86_64) is rejected across default, --launcher-only, and --local-only (WORK-MAJOR-1)
+            (fake_bin / "uname").write_text(linux_uname_body, encoding="utf-8")
+            for mode_args in ([], ["--launcher-only"], ["--local-only"]):
+                res_linux = subprocess.run(
+                    [str(tmp_ws / "scripts" / "setup"), *mode_args],
+                    cwd=str(tmp_ws),
+                    env=test_env,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(res_linux.returncode, 1)
+                self.assertIn("setup requires Apple Silicon macOS (Darwin arm64)", res_linux.stderr)
+            (fake_bin / "uname").write_text(darwin_uname_body, encoding="utf-8")
+
+            # 3c. --launcher-only and --proxy-only succeed without uv/npm/node, creating neither .venv nor node_modules
+            for alias_flag in ("--launcher-only", "--proxy-only"):
+                res_launcher = subprocess.run(
+                    [str(tmp_ws / "scripts" / "setup"), alias_flag],
+                    cwd=str(tmp_ws),
+                    env=test_env,
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                )
+                self.assertIn("mode: launcher-only", res_launcher.stdout)
+                self.assertIn("Setup complete.", res_launcher.stdout)
+                self.assertFalse((tmp_ws / ".venv").exists())
+                self.assertFalse((tmp_ws / "node_modules").exists())
+                self.assertFalse(invocations_log.exists())
+
+            # 3d. Negative SHA-256 and codesign TeamIdentifier checks under --launcher-only
+            (fake_bin / "shasum").write_text(
+                "#!/usr/bin/env bash\necho '0000000000000000000000000000000000000000000000000000000000000000  bin/tinfoil-proxy'\n",
+                encoding="utf-8",
+            )
+            res_bad_sha = subprocess.run(
+                [str(tmp_ws / "scripts" / "setup"), "--launcher-only"],
+                cwd=str(tmp_ws),
+                env=test_env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(res_bad_sha.returncode, 0)
+            self.assertIn("SHA-256 mismatch", res_bad_sha.stderr)
+            (fake_bin / "shasum").write_text(good_shasum_body, encoding="utf-8")
+
+            (fake_bin / "codesign").write_text(
+                "#!/usr/bin/env bash\necho 'TeamIdentifier=WRONGTEAM'\nexit 0\n",
+                encoding="utf-8",
+            )
+            res_bad_team = subprocess.run(
+                [str(tmp_ws / "scripts" / "setup"), "--launcher-only"],
+                cwd=str(tmp_ws),
+                env=test_env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(res_bad_team.returncode, 0)
+            self.assertIn("TeamIdentifier=8KSH668LZT", res_bad_team.stderr)
+            (fake_bin / "codesign").write_text(good_codesign_body, encoding="utf-8")
+
+            # 3e. --local-only installs requirements-local.txt via uv and never invokes npm
+            uv_stub = fake_bin / "uv"
+            uv_stub.write_text(
+                "#!/usr/bin/env bash\n"
+                "set -euo pipefail\n"
+                f'echo "uv $*" >> "{invocations_log}"\n'
+                'if [[ "${1:-}" == "venv" ]]; then\n'
+                "  mkdir -p .venv/bin\n"
+                f'  ln -sf "{sys.executable}" .venv/bin/python\n'
+                "fi\n",
+                encoding="utf-8",
+            )
+            uv_stub.chmod(0o755)
+
+            npm_stub = fake_bin / "npm"
+            npm_stub.write_text(
+                "#!/usr/bin/env bash\n"
+                f'echo "npm $*" >> "{invocations_log}"\n'
+                "exit 1\n",
+                encoding="utf-8",
+            )
+            npm_stub.chmod(0o755)
+
+            res_local = subprocess.run(
+                [str(tmp_ws / "scripts" / "setup"), "--local-only"],
+                cwd=str(tmp_ws),
+                env=test_env,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self.assertIn("mode: local-only", res_local.stdout)
+            self.assertIn("Setup complete.", res_local.stdout)
+            self.assertTrue((tmp_ws / ".venv" / "bin" / "python").exists())
+            self.assertFalse((tmp_ws / "node_modules").exists())
+            logged = invocations_log.read_text(encoding="utf-8")
+            self.assertIn("uv pip install --python .venv/bin/python -r requirements-local.txt", logged)
+            self.assertNotIn("npm", logged)
+
+            # Negative SHA-256 and codesign TeamIdentifier checks under --local-only also fail closed
+            (fake_bin / "shasum").write_text(
+                "#!/usr/bin/env bash\necho '0000000000000000000000000000000000000000000000000000000000000000  bin/tinfoil-proxy'\n",
+                encoding="utf-8",
+            )
+            res_local_bad_sha = subprocess.run(
+                [str(tmp_ws / "scripts" / "setup"), "--local-only"],
+                cwd=str(tmp_ws),
+                env=test_env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(res_local_bad_sha.returncode, 0)
+            self.assertIn("SHA-256 mismatch", res_local_bad_sha.stderr)
+            (fake_bin / "shasum").write_text(good_shasum_body, encoding="utf-8")
+
+            (fake_bin / "codesign").write_text(
+                "#!/usr/bin/env bash\necho 'TeamIdentifier=WRONGTEAM'\nexit 0\n",
+                encoding="utf-8",
+            )
+            res_local_bad_team = subprocess.run(
+                [str(tmp_ws / "scripts" / "setup"), "--local-only"],
+                cwd=str(tmp_ws),
+                env=test_env,
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(res_local_bad_team.returncode, 0)
+            self.assertIn("TeamIdentifier=8KSH668LZT", res_local_bad_team.stderr)
+            (fake_bin / "codesign").write_text(good_codesign_body, encoding="utf-8")
+
+    def test_requirements_local_transitive_closure_darwin_arm64(self) -> None:
+        import importlib.metadata as _md
+        in_repo_venv = (
+            os.environ.get("FREE_INFERENCE_REQUIRE_LOCAL_CLOSURE") == "1"
+            or (
+                (ROOT / ".venv" / "bin" / "python").exists()
+                and Path(sys.executable) == (ROOT / ".venv" / "bin" / "python")
+            )
+            or Path(sys.prefix).resolve() == (ROOT / ".venv").resolve()
+        )
+        try:
+            from packaging.requirements import Requirement as _Req
+            from packaging.utils import canonicalize_name as _canon
+        except ImportError:
+            if in_repo_venv:
+                self.fail("packaging library must be installed in .venv to enforce Requires-Dist closure")
+            self.skipTest("packaging library is required to evaluate PEP 508 Requires-Dist closure")
+
+        req_local_lines = [
+            line.strip()
+            for line in (ROOT / "requirements-local.txt").read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.strip().startswith("#")
+        ]
+        local_pins = {
+            _canon(line.split("==")[0]): line.split("==")[1]
+            for line in req_local_lines
+        }
+        missing_installed = []
+        for dist_name in local_pins:
+            try:
+                _md.distribution(dist_name)
+            except _md.PackageNotFoundError:
+                missing_installed.append(dist_name)
+        if missing_installed:
+            if in_repo_venv:
+                self.fail(
+                    f"Repo .venv is missing {len(missing_installed)}/35 pinned distributions "
+                    f"from requirements-local.txt: {missing_installed}"
+                )
+            self.skipTest(
+                f"Installed environment is missing {len(missing_installed)}/35 pinned distributions "
+                f"(e.g. {missing_installed[0]}); run with .venv/bin/python to enforce full closure"
+            )
+
+        darwin_arm64_env = {
+            "extra": "",
+            "os_name": "posix",
+            "sys_platform": "darwin",
+            "platform_system": "Darwin",
+            "platform_machine": "arm64",
+            "platform_release": "24.0.0",
+            "implementation_name": "cpython",
+        }
+        checked_count = 0
+        for dist_name, pinned_ver in local_pins.items():
+            dist = _md.distribution(dist_name)
+            self.assertEqual(dist.version, pinned_ver)
+            checked_count += 1
+            for req_str in dist.requires or []:
+                req = _Req(req_str)
+                if req.marker and not req.marker.evaluate(darwin_arm64_env):
+                    continue
+                dep_canon = _canon(req.name)
+                self.assertIn(
+                    dep_canon,
+                    local_pins,
+                    f"{dist_name} requires {req_str}, which is missing from requirements-local.txt",
+                )
+                self.assertTrue(
+                    req.specifier.contains(local_pins[dep_canon], prereleases=True),
+                    f"{dist_name} requires {req_str}, got {local_pins[dep_canon]}",
+                )
+        self.assertEqual(checked_count, 35)
 
 
 if __name__ == "__main__":

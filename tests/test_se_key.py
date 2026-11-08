@@ -558,12 +558,14 @@ class SEKeyTests(unittest.TestCase):
                 self.assertIsNone(received_requests[0]["x_leak"])
                 self.assertIsNone(received_requests[0]["cookie"])
 
-                # 8. Valid POST /v1/chat/completions (JSON) with max_tokens=999 -> clamped to 128 and strips caller headers
+                # 8. Valid POST /v1/chat/completions (JSON) with max_tokens=999, n=5, best_of=5 -> clamped to max_tokens=128, n=1, best_of=1 and strips caller headers
                 chat_payload = json.dumps(
                     {
                         "model": allowed_model,
                         "messages": [{"role": "user", "content": "hello"}],
                         "max_tokens": 999,
+                        "n": 5,
+                        "best_of": 5,
                     }
                 ).encode("utf-8")
                 req_chat = Request(
@@ -585,6 +587,8 @@ class SEKeyTests(unittest.TestCase):
                 forwarded_body = received_requests[1]["body"]
                 assert isinstance(forwarded_body, dict)
                 self.assertEqual(forwarded_body["max_tokens"], 128)
+                self.assertEqual(forwarded_body["n"], 1)
+                self.assertEqual(forwarded_body["best_of"], 1)
                 self.assertEqual(received_requests[1]["auth"], f"Bearer {real_api_key}")
                 self.assertIsNone(received_requests[1]["x_leak"])
                 self.assertIsNone(received_requests[1]["cookie"])
@@ -2833,6 +2837,30 @@ class SEKeyTests(unittest.TestCase):
             self.assertEqual(swiftc_targets, [])
             self.assertEqual(res["binary_sha256"], before_sha)
             self.assertEqual(sha256_file(tmp_bin_dir / "se-key-proxy"), before_sha)
+
+            # PLAN-MAJOR-1: Verify force=True compiles and codesigns into temporary staging files
+            # and atomically replaces the target path without mutating an already-open inode.
+            rel_path = tmp_bin_dir / "se-key-proxy"
+            open_fd = os.open(str(rel_path), os.O_RDONLY)
+            try:
+                old_ino = os.fstat(open_fd).st_ino
+                old_bytes = os.pread(open_fd, 64, 0)
+                with patch("local_assist.se_key.subprocess.run", side_effect=spy_run):
+                    res_force = build_se_key_proxy(
+                        include_test_binary=False,
+                        force=True,
+                        bin_dir=tmp_bin_dir,
+                    )
+                self.assertEqual(len(swiftc_targets), 1)
+                self.assertTrue(swiftc_targets[0].startswith(".se-key-proxy-build-"))
+                self.assertEqual(os.fstat(open_fd).st_ino, old_ino)
+                self.assertEqual(os.pread(open_fd, 64, 0), old_bytes)
+                new_ino = os.stat(rel_path).st_ino
+                self.assertNotEqual(new_ino, old_ino)
+                self.assertEqual(list(tmp_bin_dir.glob(".se-key-proxy-build-*")), [])
+                self.assertEqual(sha256_file(rel_path), res_force["binary_sha256"])
+            finally:
+                os.close(open_fd)
 
 
 if __name__ == "__main__":

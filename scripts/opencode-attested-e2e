@@ -119,12 +119,12 @@ def run_check_with_sampling(
 def run_offline_checks() -> dict[str, Any]:
     launcher = str(ROOT / "scripts" / "opencode-attested")
 
-    # Check 1: Default resolution selects cleared tinfoil-deepseek-v4-1-flash, and uncleared models (tinfoil-kimi-k3) are refused without --allow-uncleared-model
+    # Check 1: Default resolution selects cleared tinfoil-deepseek-v4-1-flash, uncleared models (tinfoil-kimi-k3-1-pro) are refused without --allow-uncleared-model, and deprecated models (tinfoil-kimi-k3) are refused without --allow-deprecated-model
     resolved_default = attested_mod.resolve_default_attested_model_id()
     all_blocked_refused = False
     try:
         attested_mod.resolve_default_attested_model_id(
-            [load_model("tinfoil-gpt-oss-120b"), load_model("tinfoil-kimi-k3")]
+            [load_model("tinfoil-gpt-oss-120b"), load_model("tinfoil-kimi-k3-1-pro")]
         )
     except Exception as exc:
         all_blocked_refused = "No Rung 2/3 model in models.yaml is currently cleared" in str(exc)
@@ -133,7 +133,21 @@ def run_offline_checks() -> dict[str, Any]:
         [
             launcher,
             "--model",
+            "tinfoil-kimi-k3-1-pro",
+            "--no-serve",
+            "--print-config",
+        ],
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    proc_deprecated = subprocess.run(
+        [
+            launcher,
+            "--model",
             "tinfoil-kimi-k3",
+            "--allow-uncleared-model",
             "--no-serve",
             "--print-config",
         ],
@@ -147,6 +161,8 @@ def run_offline_checks() -> dict[str, Any]:
         and all_blocked_refused
         and proc_uncleared.returncode == 1
         and "not cleared for private-attested routing" in proc_uncleared.stderr
+        and proc_deprecated.returncode == 1
+        and "Refusing to launch deprecated model 'tinfoil-kimi-k3'" in proc_deprecated.stderr
     )
 
     # Check 2: Port 8081 occupancy mismatch across Rung 3 proxy models (live + starting + duplicate .serve.pid)
@@ -198,13 +214,13 @@ def run_offline_checks() -> dict[str, Any]:
     )
 
     # Check 3: Explicit --max-session-usd 2.00 at bounded caps (25 reqs / 128 KB / 2048 tokens)
-    # refuses kimi-k3 ($5.39 > $2.00) and glm-5-3 ($2.26 > $2.00), and refuses attaching to
+    # refuses kimi-k3-1-pro ($5.39 > $2.00) and glm-5-3 ($2.26 > $2.00), and refuses attaching to
     # an existing proxy session whose active caps exceed --max-session-usd (M3/Y2)
     proc_kimi = subprocess.run(
         [
             launcher,
             "--model",
-            "tinfoil-kimi-k3",
+            "tinfoil-kimi-k3-1-pro",
             "--allow-uncleared-model",
             "--max-chat-requests",
             "25",
