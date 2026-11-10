@@ -509,10 +509,17 @@ def resolve_endpoint(
     pid_record: dict[str, Any] | None = None,
     require_api_key: bool = True,
     require_eval_evidence_file: bool = True,
+    port_override: int | None = None,
 ) -> EndpointConfig:
     model_id = str(model.get("id") or "").strip()
     if not model_id:
         raise RegistryError("Model entry is missing 'id'")
+
+    if port_override is not None:
+        if isinstance(port_override, bool) or not isinstance(port_override, int) or port_override < 1024 or port_override > 65535:
+            raise RegistryError(
+                f"Model {model_id}: port_override must be an integer in 1024..65535, got {port_override!r}"
+            )
 
     served_model_id = str(model.get("repo") or model_id)
     runtime = str(model.get("runtime") or "mlx-lm")
@@ -525,18 +532,24 @@ def resolve_endpoint(
     configured_url = provider.get("apiBaseUrl")
     if configured_url:
         api_base_url = str(configured_url).rstrip("/")
-        if (
+        cfg_parsed = urlparse(api_base_url)
+        cfg_host = cfg_parsed.hostname or "127.0.0.1"
+        if port_override is not None and cfg_host in LOCAL_HOSTS:
+            api_base_url = build_base_url(
+                cfg_host, port_override, scheme=(cfg_parsed.scheme or "http").lower()
+            )
+        elif (
             isinstance(pid_record, dict)
             and pid_record.get("model_id") == model_id
             and isinstance(pid_record.get("port"), int)
             and not isinstance(pid_record.get("port"), bool)
+            and cfg_host in LOCAL_HOSTS
         ):
-            cfg_parsed = urlparse(api_base_url)
-            cfg_host = cfg_parsed.hostname or "127.0.0.1"
-            if cfg_host in LOCAL_HOSTS:
-                api_base_url = build_base_url(
-                    cfg_host, pid_record["port"], scheme=(cfg_parsed.scheme or "http").lower()
-                )
+            api_base_url = build_base_url(
+                cfg_host, pid_record["port"], scheme=(cfg_parsed.scheme or "http").lower()
+            )
+    elif port_override is not None:
+        api_base_url = build_base_url("127.0.0.1", port_override)
     elif pid_record and isinstance(pid_record.get("port"), int) and not isinstance(pid_record.get("port"), bool):
         api_base_url = build_base_url("127.0.0.1", pid_record["port"])
     else:

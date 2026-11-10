@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timedelta, timezone
+import json
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
@@ -14,21 +17,288 @@ if __name__ == "__main__" and VENV_PYTHON.exists() and Path(sys.executable) != V
 sys.path.insert(0, str(ROOT))
 
 from local_assist import __version__
-from local_assist.registry import RegistryError, load_models, resolve_endpoint
+from local_assist.launch import (
+    INTERACTIVE_MIN_CHAT_REQUESTS,
+    INTERACTIVE_MIN_MAX_TOKENS,
+    INTERACTIVE_MIN_REQUEST_BYTES,
+    classify_pid_identity,
+    pid_record_is_live_or_starting,
+)
+from local_assist.registry import (
+    RegistryError,
+    list_pid_records,
+    load_model,
+    load_models,
+    resolve_endpoint,
+)
 
 
-def main(argv: list[str] | None = None) -> int:
+def _classify_session_record(rec: dict[str, Any]) -> dict[str, Any]:
+    model_id = str(rec.get("model_id") or "unknown")
+    runtime = str(rec.get("runtime") or "unknown")
+    host = str(rec.get("host") or "127.0.0.1")
+    port = rec.get("port")
+    upstream_port = rec.get("upstream_port")
+    pid = rec.get("pid")
+    upstream_pid = rec.get("upstream_pid")
+
+    pid_state = classify_pid_identity(pid, rec.get("pid_lstart"))
+    has_upstream = (
+        isinstance(upstream_pid, int)
+        and not isinstance(upstream_pid, bool)
+        and upstream_pid > 0
+    )
+    up_state = (
+        classify_pid_identity(upstream_pid, rec.get("upstream_pid_lstart"))
+        if has_upstream
+        else None
+    )
+
+    if rec.get("status") == "starting" and (
+        pid is None
+        or pid_state in ("matched", "unavailable")
+        or (has_upstream and up_state in ("matched", "unavailable"))
+    ):
+        status = "starting"
+        is_active = True
+        verified_live = False
+    elif pid_state == "matched" and (not has_upstream or up_state == "matched"):
+        status = "ready"
+        is_active = True
+        verified_live = True
+    elif pid_state in ("dead", "reused") and has_upstream and up_state == "matched":
+        status = "orphaned_upstream"
+        is_active = True
+        verified_live = False
+    elif pid_state == "matched" and has_upstream and up_state in ("dead", "reused"):
+        status = "degraded_upstream_dead"
+        is_active = True
+        verified_live = False
+    elif pid_state == "unavailable" or (has_upstream and up_state == "unavailable"):
+        status = "identity_unavailable"
+        is_active = True
+        verified_live = False
+    else:
+        status = "stale"
+        is_active = False
+        verified_live = False
+
+    trust_tier = rec.get("trust_tier")
+    data_control_rung: int | None = None
+    needs_uncleared_flag = False
+    default_port: int | None = None
+    try:
+        model_entry = load_model(model_id)
+        default_ep = resolve_endpoint(model_entry, require_api_key=False)
+        default_port = default_ep.port
+        ep = resolve_endpoint(model_entry, pid_record=rec, require_api_key=False)
+        trust_tier = ep.trust_tier
+        data_control_rung = ep.data_control_rung
+        if ep.trust_tier == "local":
+            needs_uncleared_flag = ep.routing_private_local != "cleared"
+        else:
+            needs_uncleared_flag = ep.routing_private_attested != "cleared"
+    except Exception:
+        pass
+
+    max_reqs = rec.get("max_chat_requests")
+    if max_reqs is None:
+        max_reqs = rec.get("session_max_chat_requests")
+    max_tokens = rec.get("max_tokens_cap")
+    if max_tokens is None:
+        max_tokens = rec.get("session_max_tokens_cap")
+    max_bytes = rec.get("max_request_bytes")
+    if max_bytes is None:
+        max_bytes = rec.get("session_max_request_bytes")
+    ttl_seconds = rec.get("ttl_seconds")
+    if ttl_seconds is None:
+        ttl_seconds = rec.get("session_ttl_seconds")
+    thinking_enabled = bool(rec.get("thinking_enabled", False))
+
+    is_proxy = runtime in ("proxy", "tinfoil_proxy") or bool(rec.get("session_token_file"))
+    if is_proxy:
+        is_low_cap = (
+            (isinstance(max_reqs, int) and max_reqs < INTERACTIVE_MIN_CHAT_REQUESTS)
+            or (isinstance(max_tokens, int) and max_tokens < INTERACTIVE_MIN_MAX_TOKENS)
+            or (isinstance(max_bytes, int) and max_bytes < INTERACTIVE_MIN_REQUEST_BYTES)
+        )
+        mode = "eval" if is_low_cap else "interactive"
+    else:
+        mode = "local"
+
+    started_at = rec.get("started_at")
+    expires_at: str | None = None
+    remaining_ttl_seconds: int | None = None
+    if isinstance(started_at, str) and isinstance(ttl_seconds, int) and ttl_seconds > 0:
+        try:
+            started_dt = datetime.fromisoformat(started_at)
+            if started_dt.tzinfo is None:
+                started_dt = started_dt.replace(tzinfo=timezone.utc)
+            expires_dt = started_dt + timedelta(seconds=ttl_seconds)
+            expires_at = expires_dt.isoformat()
+            remaining_ttl_seconds = max(
+                0,
+                int((expires_dt - datetime.now(timezone.utc)).total_seconds()),
+            )
+        except ValueError:
+            pass
+
+    launcher_script = (
+        "./scripts/opencode-local"
+        if trust_tier == "local" or runtime in ("mlx-lm", "mlx_lm")
+        else "./scripts/opencode-attested"
+    )
+    uncleared_arg = " --allow-uncleared-model" if needs_uncleared_flag else ""
+    port_arg = (
+        f" --port {port}"
+        if isinstance(port, int) and default_port is not None and port != default_port
+        else ""
+    )
+    attach_cmd = f"{launcher_script} --model {model_id}{uncleared_arg}{port_arg}"
+    refresh_cmd = f"{launcher_script} --model {model_id}{uncleared_arg}{port_arg} --refresh-session"
+    stop_cmd = f"./scripts/stop-model {model_id}"
+
+    return {
+        "model_id": model_id,
+        "runtime": runtime,
+        "trust_tier": trust_tier,
+        "data_control_rung": data_control_rung,
+        "status": status,
+        "state": status,
+        "active": is_active,
+        "live": verified_live,
+        "pid": pid,
+        "pid_identity": pid_state,
+        "upstream_pid": upstream_pid,
+        "upstream_pid_identity": up_state,
+        "host": host,
+        "port": port,
+        "upstream_port": upstream_port,
+        "api_base_url": f"http://{host}:{port}/v1" if port is not None else None,
+        "mode": mode,
+        "thinking_enabled": thinking_enabled,
+        "max_chat_requests": max_reqs,
+        "max_tokens_cap": max_tokens,
+        "max_request_bytes": max_bytes,
+        "ttl_seconds": ttl_seconds,
+        "started_at": started_at,
+        "expires_at": expires_at,
+        "remaining_ttl_seconds": remaining_ttl_seconds,
+        "commands": {
+            "attach": attach_cmd,
+            "refresh": refresh_cmd,
+            "stop": stop_cmd,
+        },
+    }
+
+
+def list_active_sessions(
+    runs_dir: Path | None = None,
+    *,
+    include_stale: bool = False,
+) -> list[dict[str, Any]]:
+    records = list_pid_records(runs_dir)
+    # Prefer model-specific .serve-<model>.pid over legacy/default .serve.pid when both point to the same session.
+    sorted_records = sorted(
+        records,
+        key=lambda item: (item[0].name == ".serve.pid", item[0].name),
+    )
+    seen_keys: set[tuple[Any, ...]] = set()
+    out: list[dict[str, Any]] = []
+    for _, rec in sorted_records:
+        dedup_key = (
+            rec.get("model_id"),
+            rec.get("startup_nonce"),
+            rec.get("pid"),
+            rec.get("port"),
+        )
+        if dedup_key in seen_keys:
+            continue
+        seen_keys.add(dedup_key)
+        classified = _classify_session_record(rec)
+        if include_stale or classified["active"]:
+            out.append(classified)
+    return out
+
+
+def main(argv: list[str] | None = None, *, runs_dir: Path | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="List registered models in models.yaml with data-control rung and usage policy."
+        description="List registered models in models.yaml with data-control rung and usage policy, or inspect active served sessions."
     )
     parser.add_argument(
         "--version",
         action="store_true",
         help="Print the free-inference-lab version and exit.",
     )
+    parser.add_argument(
+        "--active",
+        "--sessions",
+        dest="active",
+        action="store_true",
+        default=False,
+        help="List currently served models / proxy sessions from runs/.pids with ports, caps, and commands.",
+    )
+    parser.add_argument(
+        "--json",
+        dest="as_json",
+        action="store_true",
+        default=False,
+        help="Emit machine-readable JSON output.",
+    )
     args = parser.parse_args((argv if argv is not None else sys.argv)[1:])
     if args.version:
         print(f"free-inference-lab {__version__}")
+        return 0
+
+    if args.active:
+        all_sessions = list_active_sessions(runs_dir=runs_dir, include_stale=True)
+        sessions = [s for s in all_sessions if s["active"]]
+        stale_sessions = [s for s in all_sessions if not s["active"]]
+        if args.as_json:
+            print(
+                json.dumps(
+                    {
+                        "sessions": sessions,
+                        "stale_sessions": stale_sessions,
+                    },
+                    indent=2,
+                )
+            )
+            return 0
+        if not sessions and not stale_sessions:
+            print("No active model sessions found in runs/.pids.")
+            return 0
+        if not sessions:
+            print("No active model sessions found in runs/.pids (only stale stopped records present).")
+        for s in sessions:
+            rung_str = (
+                f"rung{s['data_control_rung']}:{s['trust_tier']}"
+                if s.get("data_control_rung") is not None
+                else str(s.get("trust_tier") or "unknown")
+            )
+            port_str = f"{s['host']}:{s['port']}"
+            if s.get("upstream_port") is not None:
+                port_str += f" (upstream 127.0.0.1:{s['upstream_port']})"
+            print(
+                f"{s['model_id']}  status={s['status']}  mode={s['mode']}  "
+                f"runtime={s['runtime']}  control={rung_str}  endpoint={port_str}  pid={s['pid']}"
+            )
+            if s["mode"] in ("interactive", "eval"):
+                ttl_info = (
+                    f"{s['remaining_ttl_seconds']}s remaining"
+                    if s.get("remaining_ttl_seconds") is not None
+                    else f"{s.get('ttl_seconds')}s total"
+                )
+                print(
+                    f"  caps: max_requests={s.get('max_chat_requests')}  "
+                    f"max_tokens={s.get('max_tokens_cap')}  "
+                    f"max_request_bytes={s.get('max_request_bytes')}  "
+                    f"ttl={ttl_info}  thinking={'on' if s.get('thinking_enabled') else 'off'}"
+                )
+            cmds = s["commands"]
+            print(f"  attach:  {cmds['attach']}")
+            print(f"  refresh: {cmds['refresh']}")
+            print(f"  stop:    {cmds['stop']}")
         return 0
 
     try:
@@ -36,6 +306,26 @@ def main(argv: list[str] | None = None) -> int:
     except RegistryError as exc:
         print(str(exc), file=sys.stderr)
         return 1
+
+    if args.as_json:
+        out_rows = []
+        for model in models:
+            endpoint = resolve_endpoint(model, require_api_key=False)
+            out_rows.append(
+                {
+                    "id": model.get("id"),
+                    "status": model.get("status"),
+                    "runtime": endpoint.runtime,
+                    "repo": model.get("repo"),
+                    "data_control_rung": endpoint.data_control_rung,
+                    "trust_tier": endpoint.trust_tier,
+                    "usage_policy": endpoint.usage_policy,
+                    "api_base_url": endpoint.api_base_url,
+                    "disk_gb_estimate": model.get("disk_gb_estimate"),
+                }
+            )
+        print(json.dumps({"models": out_rows}, indent=2))
+        return 0
 
     if not models:
         print("No models registered.")

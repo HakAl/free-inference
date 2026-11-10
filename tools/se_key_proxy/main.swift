@@ -1493,6 +1493,67 @@ private func isSafeTokenFileForUnlink(_ path: String) -> Bool {
     return (st.st_mode & S_IFMT) == S_IFREG
 }
 
+private let kMaxDefaultChatParamsBytes = 4096
+private let kReservedChatParamKeys: Set<String> = [
+    "model",
+    "messages",
+    "n",
+    "best_of",
+    "max_tokens",
+    "max_completion_tokens",
+    "maxOutputTokens",
+    "stream",
+]
+
+private func parseAndValidateDefaultChatParams(rawJSON: String) throws -> [String: Any] {
+    let utf8Count = rawJSON.utf8.count
+    guard utf8Count <= kMaxDefaultChatParamsBytes else {
+        throw NSError(
+            domain: "SEKeyProxy",
+            code: 40,
+            userInfo: [
+                NSLocalizedDescriptionKey:
+                    "--default-chat-params-json exceeds \(kMaxDefaultChatParamsBytes) bytes (\(utf8Count) bytes)"
+            ]
+        )
+    }
+    guard
+        let rawData = rawJSON.data(using: .utf8),
+        let parsed = try? JSONSerialization.jsonObject(with: rawData, options: []),
+        let dict = parsed as? [String: Any],
+        JSONSerialization.isValidJSONObject(dict)
+    else {
+        throw NSError(
+            domain: "SEKeyProxy",
+            code: 41,
+            userInfo: [NSLocalizedDescriptionKey: "--default-chat-params-json must be a valid JSON object"]
+        )
+    }
+    for key in dict.keys {
+        if kReservedChatParamKeys.contains(key) {
+            throw NSError(
+                domain: "SEKeyProxy",
+                code: 42,
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "--default-chat-params-json cannot contain reserved key '\(key)'"
+                ]
+            )
+        }
+    }
+    if let ctk = dict["chat_template_kwargs"], !(ctk is [String: Any]) {
+        throw NSError(
+            domain: "SEKeyProxy",
+            code: 43,
+            userInfo: [
+                NSLocalizedDescriptionKey:
+                    "--default-chat-params-json 'chat_template_kwargs' must be a JSON object"
+            ]
+        )
+    }
+    return dict
+}
+
 private final class ProxyServer: @unchecked Sendable {
     let listenPort: UInt16
     let upstreamBaseURL: URL
@@ -1507,6 +1568,7 @@ private final class ProxyServer: @unchecked Sendable {
     let upstreamBinding: UpstreamProcessBinding?
     let forceURLSession: Bool
     let sessionTokenFile: String?
+    let defaultChatParams: [String: Any]
 
     private let lock = NSLock()
     private var chatRequestsUsed = 0
@@ -1526,7 +1588,8 @@ private final class ProxyServer: @unchecked Sendable {
         upstreamPID: pid_t?,
         upstreamBinding: UpstreamProcessBinding?,
         forceURLSession: Bool,
-        sessionTokenFile: String?
+        sessionTokenFile: String?,
+        defaultChatParams: [String: Any] = [:]
     ) {
         self.listenPort = listenPort
         self.upstreamBaseURL = upstreamBaseURL
@@ -1541,6 +1604,7 @@ private final class ProxyServer: @unchecked Sendable {
         self.upstreamBinding = upstreamBinding
         self.forceURLSession = forceURLSession
         self.sessionTokenFile = sessionTokenFile
+        self.defaultChatParams = defaultChatParams
 
         let cfg = URLSessionConfiguration.ephemeral
         cfg.httpCookieStorage = nil
@@ -1907,21 +1971,23 @@ private final class ProxyServer: @unchecked Sendable {
                 return
             }
 
-            // Enforce session chat request budget before forwarding
-            lock.lock()
-            if chatRequestsUsed >= maxChatRequests {
-                lock.unlock()
-                sendHTTPError(
-                    clientFD: fd,
-                    status: 429,
-                    statusText: "Too Many Requests",
-                    errorCode: "session_request_budget_exceeded",
-                    message: "Session chat request cap (\(maxChatRequests)) reached"
-                )
-                return
+            // Merge non-overwriting default chat parameters (e.g. passthrough thinking=false / include_reasoning=false)
+            for (key, defaultVal) in defaultChatParams {
+                if key == "chat_template_kwargs", let defaultKw = defaultVal as? [String: Any] {
+                    if jsonDict[key] == nil {
+                        jsonDict[key] = defaultKw
+                    } else if var existingKw = jsonDict[key] as? [String: Any] {
+                        for (subKey, subVal) in defaultKw {
+                            if existingKw[subKey] == nil {
+                                existingKw[subKey] = subVal
+                            }
+                        }
+                        jsonDict[key] = existingKw
+                    }
+                } else if jsonDict[key] == nil {
+                    jsonDict[key] = defaultVal
+                }
             }
-            chatRequestsUsed += 1
-            lock.unlock()
 
             // Clamp n (and best_of when present) to 1 so worst-case output spend is bounded to 1 completion per request
             if jsonDict["n"] != nil {
@@ -1956,6 +2022,34 @@ private final class ProxyServer: @unchecked Sendable {
                 )
                 return
             }
+
+            // Enforce maxRequestBytes on the final merged, canonicalized JSON payload before consuming chat request budget
+            if canonicalBody.count > maxRequestBytes {
+                sendHTTPError(
+                    clientFD: fd,
+                    status: 413,
+                    statusText: "Payload Too Large",
+                    errorCode: "payload_too_large",
+                    message: "Request body after default parameter merge exceeds max_request_bytes (\(maxRequestBytes))"
+                )
+                return
+            }
+
+            // Enforce session chat request budget before forwarding
+            lock.lock()
+            if chatRequestsUsed >= maxChatRequests {
+                lock.unlock()
+                sendHTTPError(
+                    clientFD: fd,
+                    status: 429,
+                    statusText: "Too Many Requests",
+                    errorCode: "session_request_budget_exceeded",
+                    message: "Session chat request cap (\(maxChatRequests)) reached"
+                )
+                return
+            }
+            chatRequestsUsed += 1
+            lock.unlock()
             outboundBody = canonicalBody
         }
 
@@ -3604,6 +3698,7 @@ private func runProxy(args: [String]) -> Int32 {
     var maxTokensCap = 0
     var ttlSeconds = 3600
     var streamTimeoutSeconds = 300
+    var defaultChatParamsRaw: String? = nil
     var forceURLSession = false
     #if SE_KEY_TESTING
     var testEphemeralKeyFD: Int32?
@@ -3657,6 +3752,13 @@ private func runProxy(args: [String]) -> Int32 {
         case "--stream-timeout-seconds":
             i += 1
             if i < args.count, let v = Int(args[i]), v > 0 { streamTimeoutSeconds = v }
+        case "--default-chat-params-json":
+            i += 1
+            guard i < args.count else {
+                writeStderr("Missing value for --default-chat-params-json")
+                return 2
+            }
+            defaultChatParamsRaw = args[i]
         default:
             #if SE_KEY_TESTING
             if args[i] == "--test-ephemeral-key-fd" {
@@ -3693,6 +3795,16 @@ private func runProxy(args: [String]) -> Int32 {
     guard listenHost == "127.0.0.1" else {
         writeStderr("Refusing to bind se-key-proxy to non-loopback host '\(listenHost)'")
         return 2
+    }
+
+    var defaultChatParams: [String: Any] = [:]
+    if let rawDefaults = defaultChatParamsRaw {
+        do {
+            defaultChatParams = try parseAndValidateDefaultChatParams(rawJSON: rawDefaults)
+        } catch {
+            writeStderr("Invalid --default-chat-params-json: \(error.localizedDescription)")
+            return 2
+        }
     }
 
     let scheme = (upURL.scheme ?? "").lowercased()
@@ -3816,7 +3928,8 @@ private func runProxy(args: [String]) -> Int32 {
         upstreamPID: upstreamPID,
         upstreamBinding: verifiedBinding,
         forceURLSession: forceURLSession,
-        sessionTokenFile: sessionTokenFile
+        sessionTokenFile: sessionTokenFile,
+        defaultChatParams: defaultChatParams
     )
     bestEffortZero(&unsealedKeyData)
 

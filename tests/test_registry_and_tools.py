@@ -3863,10 +3863,10 @@ class RegistryAndToolsTests(unittest.TestCase):
         from local_assist.server import SERVER_INFO
 
         # 1. Version parity across __init__.py, server.py, package.json, and scripts/models --version (A4)
-        self.assertEqual(local_assist.__version__, "0.1.3")
-        self.assertEqual(SERVER_INFO["version"], "0.1.3")
+        self.assertEqual(local_assist.__version__, "0.1.4")
+        self.assertEqual(SERVER_INFO["version"], "0.1.4")
         pkg_json = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))
-        self.assertEqual(pkg_json["version"], "0.1.3")
+        self.assertEqual(pkg_json["version"], "0.1.4")
 
         # 2. requirements-local.txt closure check (Phase 2 / PLAN-MINOR-2 / WORK-MINOR-4)
         req_local_lines = [
@@ -4013,7 +4013,7 @@ class RegistryAndToolsTests(unittest.TestCase):
                 text=True,
                 check=True,
             )
-            self.assertEqual(models_ver_clean.stdout.strip(), "free-inference-lab 0.1.3")
+            self.assertEqual(models_ver_clean.stdout.strip(), "free-inference-lab 0.1.4")
 
             for launcher_rel in ("opencode-local", "opencode-attested"):
                 hlp = subprocess.run(
@@ -4614,6 +4614,1292 @@ class RegistryAndToolsTests(unittest.TestCase):
         )
         self.assertIn("remaining)", banner)
         self.assertIn("--refresh-session", banner)
+
+    def test_subagent_defaults_and_side_by_side_port_allocation(self) -> None:
+        import io
+        from contextlib import redirect_stderr, redirect_stdout
+        from local_assist.launch import (
+            EXIT_MODEL_MISMATCH,
+            allocate_side_by_side_port,
+            is_port_owned_by_different_active_model,
+        )
+        from local_assist.registry import get_process_lstart, session_token_file_for_model
+
+        oc_att = _load_script_module("oc_att_multi_model", "scripts/opencode-attested")
+        oc_loc = _load_script_module("oc_loc_multi_model", "scripts/opencode-local")
+
+        ep_att = resolve_endpoint(load_model("tinfoil-deepseek-v4-1-flash"), require_api_key=False)
+        ep_kimi = resolve_endpoint(load_model("tinfoil-kimi-k3-1-pro"), require_api_key=False)
+        ep_loc = resolve_endpoint(load_model("qwen3-30b-a3b-2507-mlx-4bit"), require_api_key=False)
+
+        # 1. Subagent defaults in render_private_attested_config and render_private_local_config
+        cfg_att_default = json.loads(oc_att.render_private_attested_config(ep_att))
+        self.assertIs(cfg_att_default["tools"]["task"], False)
+        self.assertIs(cfg_att_default["tools"]["subagent"], False)
+        self.assertEqual(cfg_att_default["permission"]["task"], "deny")
+        self.assertEqual(cfg_att_default["permission"]["subagent"], "deny")
+
+        cfg_att_sub = json.loads(oc_att.render_private_attested_config(ep_att, allow_subagents=True))
+        self.assertIs(cfg_att_sub["tools"]["task"], True)
+        self.assertIs(cfg_att_sub["tools"]["subagent"], True)
+        self.assertEqual(cfg_att_sub["permission"]["task"], "allow")
+        self.assertEqual(cfg_att_sub["permission"]["subagent"], "allow")
+
+        cfg_loc_default = json.loads(oc_loc.render_private_local_config(ep_loc))
+        self.assertIs(cfg_loc_default["tools"]["task"], False)
+        self.assertIs(cfg_loc_default["tools"]["subagent"], False)
+        self.assertEqual(cfg_loc_default["permission"]["task"], "deny")
+        self.assertEqual(cfg_loc_default["permission"]["subagent"], "deny")
+
+        cfg_loc_sub = json.loads(oc_loc.render_private_local_config(ep_loc, allow_subagents=True))
+        self.assertIs(cfg_loc_sub["tools"]["task"], True)
+        self.assertIs(cfg_loc_sub["tools"]["subagent"], True)
+        self.assertEqual(cfg_loc_sub["permission"]["task"], "allow")
+        self.assertEqual(cfg_loc_sub["permission"]["subagent"], "allow")
+
+        # 2. resolve_endpoint(..., port_override=...) rewrites port and api_base_url
+        ep_kimi_8082 = resolve_endpoint(
+            load_model("tinfoil-kimi-k3-1-pro"),
+            require_api_key=False,
+            port_override=8082,
+        )
+        self.assertEqual(ep_kimi_8082.port, 8082)
+        self.assertEqual(ep_kimi_8082.api_base_url, "http://127.0.0.1:8082/v1")
+
+        ep_loc_8085 = resolve_endpoint(
+            load_model("qwen3-30b-a3b-2507-mlx-4bit"),
+            require_api_key=False,
+            port_override=8085,
+        )
+        self.assertEqual(ep_loc_8085.port, 8085)
+        self.assertEqual(ep_loc_8085.api_base_url, "http://127.0.0.1:8085/v1")
+
+        # 3. is_port_owned_by_different_active_model + side-by-side port allocation + negative controls (PLAN-MAJOR-1, PLAN-MAJOR-2)
+        with tempfile.TemporaryDirectory() as tmp:
+            runs_dir = Path(tmp) / "runs"
+            runs_dir.mkdir(parents=True)
+            my_lstart = get_process_lstart(os.getpid())
+            self.assertTrue(my_lstart)
+
+            # Write live PID record for tinfoil-deepseek-v4-1-flash on port 8081
+            ds_pid_file = pid_file_for_model("tinfoil-deepseek-v4-1-flash", runs_dir)
+            ds_pid_file.write_text(
+                json.dumps(
+                    {
+                        "model_id": "tinfoil-deepseek-v4-1-flash",
+                        "runtime": "tinfoil_proxy",
+                        "host": "127.0.0.1",
+                        "port": 8081,
+                        "upstream_port": 9081,
+                        "pid": os.getpid(),
+                        "pid_lstart": my_lstart,
+                        "status": "ready",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            # (a) Positive ownership check for a DIFFERENT model (tinfoil-kimi-k3-1-pro) on port 8081
+            owned, owner_id = is_port_owned_by_different_active_model(
+                "tinfoil-kimi-k3-1-pro", 8081, runs_dir=runs_dir
+            )
+            self.assertTrue(owned)
+            self.assertEqual(owner_id, "tinfoil-deepseek-v4-1-flash")
+
+            # (b) Negative control: SAME model on port 8081 (or qwen3 on 8080 with hf_offline=False) -> (False, None)
+            same_owned, same_owner = is_port_owned_by_different_active_model(
+                "tinfoil-deepseek-v4-1-flash", 8081, runs_dir=runs_dir
+            )
+            self.assertFalse(same_owned)
+            self.assertIsNone(same_owner)
+
+            # (c) Negative control: unknown listener on port 8089 with no live PID record -> (False, None)
+            unk_owned, unk_owner = is_port_owned_by_different_active_model(
+                "tinfoil-kimi-k3-1-pro", 8089, runs_dir=runs_dir
+            )
+            self.assertFalse(unk_owned)
+            self.assertIsNone(unk_owner)
+
+            # (d) End-to-end opencode-attested ensure_model_served + main() baseURL propagation when 8081 is owned by deepseek
+            recorded_cmds: list[list[str]] = []
+            kimi_tok_file = session_token_file_for_model("tinfoil-kimi-k3-1-pro", runs_dir)
+            kimi_tok_file.write_text("se-session-" + ("9" * 64) + "\n", encoding="utf-8")
+            os.chmod(kimi_tok_file, 0o600)
+            kimi_pid_file = pid_file_for_model("tinfoil-kimi-k3-1-pro", runs_dir)
+
+            def fake_side_by_side_cmd(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+                recorded_cmds.append(cmd)
+                if "verify-served-model" in cmd[0] and "--wait" not in cmd:
+                    return subprocess.CompletedProcess(
+                        cmd,
+                        EXIT_MODEL_MISMATCH,
+                        stdout="",
+                        stderr="served model mismatch on port 8081: active PID record is for model_id='tinfoil-deepseek-v4-1-flash'",
+                    )
+                if "serve-model" in cmd[0]:
+                    port_idx = cmd.index("--port")
+                    chosen_port = int(cmd[port_idx + 1])
+                    kimi_pid_file.write_text(
+                        json.dumps(
+                            {
+                                "model_id": "tinfoil-kimi-k3-1-pro",
+                                "runtime": "tinfoil_proxy",
+                                "host": "127.0.0.1",
+                                "port": chosen_port,
+                                "upstream_port": chosen_port + 1000,
+                                "pid": os.getpid(),
+                                "pid_lstart": my_lstart,
+                                "status": "ready",
+                                "session_token_file": str(kimi_tok_file),
+                                "max_chat_requests": 1000,
+                                "max_tokens_cap": 16384,
+                                "max_request_bytes": 8388608,
+                                "ttl_seconds": 43200,
+                                "thinking_enabled": False,
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    return subprocess.CompletedProcess(cmd, 0, stdout="started", stderr="")
+                return subprocess.CompletedProcess(cmd, 0, stdout="verified", stderr="")
+
+            with patch(
+                "local_assist.launch._can_bind_loopback_port",
+                side_effect=lambda p: p not in (8081, 9081),
+            ):
+                ok_sbs, err_sbs, _ = oc_att.ensure_model_served(
+                    ep_kimi,
+                    no_serve=False,
+                    runs_dir=runs_dir,
+                    run_cmd=fake_side_by_side_cmd,
+                )
+            self.assertTrue(ok_sbs, msg=err_sbs)
+            serve_invocations = [c for c in recorded_cmds if "serve-model" in c[0]]
+            self.assertEqual(len(serve_invocations), 1)
+            self.assertIn("--port", serve_invocations[0])
+            allocated_port = int(serve_invocations[0][serve_invocations[0].index("--port") + 1])
+            self.assertEqual(allocated_port, 8082)
+
+            # Verify opencode-attested main(--print-config) re-resolves endpoint after ensure_model_served
+            # so api_base_url and provider.private-attested.options.baseURL point to port 8082!
+            iso_home = Path(tmp) / ".home" / "opencode-private-attested"
+            out_buf = io.StringIO()
+            err_buf = io.StringIO()
+            kimi_rec = json.loads(kimi_pid_file.read_text(encoding="utf-8"))
+            with (
+                patch.object(oc_att, "DEFAULT_ISOLATED_HOME", iso_home),
+                patch.object(
+                    oc_att,
+                    "read_pid_record_for_model",
+                    side_effect=[None, kimi_rec],
+                ),
+                patch.object(
+                    oc_att,
+                    "ensure_model_served",
+                    return_value=(
+                        True,
+                        None,
+                        {
+                            "session_token": "se-session-" + ("9" * 64),
+                            "attached": False,
+                            "max_chat_requests": 1000,
+                            "max_tokens_cap": 16384,
+                            "max_request_bytes": 8388608,
+                            "ttl_seconds": 43200,
+                            "thinking_enabled": False,
+                            "input_price_per_m": 0.60,
+                            "output_price_per_m": 3.00,
+                            "worst_total_usd": 50.77,
+                        },
+                    ),
+                ),
+                redirect_stdout(out_buf),
+                redirect_stderr(err_buf),
+            ):
+                rc_main = oc_att.main(
+                    [
+                        "scripts/opencode-attested",
+                        "--model",
+                        "tinfoil-kimi-k3-1-pro",
+                        "--allow-uncleared-model",
+                        "--print-config",
+                    ]
+                )
+            self.assertEqual(rc_main, 0, msg=err_buf.getvalue())
+            printed_payload = json.loads(out_buf.getvalue())
+            self.assertEqual(printed_payload["api_base_url"], "http://127.0.0.1:8082/v1")
+            self.assertEqual(
+                printed_payload["config"]["provider"]["private-attested"]["options"]["baseURL"],
+                "http://127.0.0.1:8082/v1",
+            )
+
+            # (e) Negative control on opencode-local: same-model offline-policy failure (hf_offline=False)
+            #     must fail closed and NEVER allocate a side-by-side port (PLAN-MAJOR-2)
+            qwen_pid_file = pid_file_for_model("qwen3-30b-a3b-2507-mlx-4bit", runs_dir)
+            qwen_pid_file.write_text(
+                json.dumps(
+                    {
+                        "model_id": "qwen3-30b-a3b-2507-mlx-4bit",
+                        "runtime": "mlx_lm",
+                        "host": "127.0.0.1",
+                        "port": 8080,
+                        "pid": os.getpid(),
+                        "pid_lstart": my_lstart,
+                        "hf_offline": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            loc_mismatch_cmds: list[list[str]] = []
+
+            def fake_loc_online_mismatch(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+                loc_mismatch_cmds.append(cmd)
+                return subprocess.CompletedProcess(
+                    cmd,
+                    EXIT_MODEL_MISMATCH,
+                    stdout="",
+                    stderr="served model on port 8080 was started with hf_offline=False",
+                )
+
+            ok_loc_neg, err_loc_neg = oc_loc.ensure_model_served(
+                ep_loc,
+                no_serve=False,
+                runs_dir=runs_dir,
+                run_cmd=fake_loc_online_mismatch,
+            )
+            self.assertFalse(ok_loc_neg)
+            self.assertIn("Stop the active model first", str(err_loc_neg))
+            self.assertEqual(len(loc_mismatch_cmds), 1)
+
+            # (f) Negative control: explicit --port when model is already active on a different port without --refresh-session
+            err_port_buf = io.StringIO()
+            with (
+                patch.object(oc_att, "read_pid_record_for_model", return_value=kimi_rec),
+                redirect_stderr(err_port_buf),
+            ):
+                rc_port_conflict = oc_att.main(
+                    [
+                        "scripts/opencode-attested",
+                        "--model",
+                        "tinfoil-kimi-k3-1-pro",
+                        "--allow-uncleared-model",
+                        "--port",
+                        "8085",
+                        "--print-config",
+                    ]
+                )
+            self.assertEqual(rc_port_conflict, 1)
+            self.assertIn("--refresh-session", err_port_buf.getvalue())
+
+            # (g) WORK-MAJOR-1: Refreshing a session on a non-default port (8082) while default port (8081/8080)
+            #     is occupied by another model preserves port 8082 after stop-model deletes the PID record
+            #     in BOTH opencode-attested and opencode-local!
+            kimi_pid_file.write_text(json.dumps(kimi_rec), encoding="utf-8")
+            refresh_att_cmds: list[list[str]] = []
+
+            def fake_refresh_nondefault_att(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+                refresh_att_cmds.append(cmd)
+                if "stop-model" in cmd[0]:
+                    kimi_pid_file.unlink(missing_ok=True)
+                    return subprocess.CompletedProcess(cmd, 0, stdout="stopped", stderr="")
+                if "serve-model" in cmd[0]:
+                    self.assertIn("--port", cmd)
+                    p_arg = int(cmd[cmd.index("--port") + 1])
+                    self.assertEqual(p_arg, 8082)
+                    kimi_pid_file.write_text(json.dumps(kimi_rec), encoding="utf-8")
+                    return subprocess.CompletedProcess(cmd, 0, stdout="started", stderr="")
+                return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+
+            ep_kimi_8082 = resolve_endpoint(
+                load_model("tinfoil-kimi-k3-1-pro"),
+                pid_record=kimi_rec,
+                require_api_key=False,
+            )
+            self.assertEqual(ep_kimi_8082.port, 8082)
+            ok_ref_att, err_ref_att, meta_ref_att = oc_att.ensure_model_served(
+                ep_kimi_8082,
+                no_serve=False,
+                refresh_session=True,
+                explicit_port=None,
+                runs_dir=runs_dir,
+                run_cmd=fake_refresh_nondefault_att,
+            )
+            self.assertTrue(ok_ref_att, msg=err_ref_att)
+            assert meta_ref_att is not None
+            self.assertEqual(meta_ref_att["allocated_port"], 8082)
+
+            # Same non-default port refresh preservation in opencode-local (on port 8082 while 8080 is owned by another model):
+            qwen_8082_rec = {
+                "model_id": "qwen3-30b-a3b-2507-mlx-4bit",
+                "runtime": "mlx_lm",
+                "host": "127.0.0.1",
+                "port": 8082,
+                "pid": os.getpid(),
+                "pid_lstart": my_lstart,
+                "hf_offline": True,
+            }
+            qwen_pid_file.write_text(json.dumps(qwen_8082_rec), encoding="utf-8")
+            ep_loc_8082 = resolve_endpoint(
+                load_model("qwen3-30b-a3b-2507-mlx-4bit"),
+                pid_record=qwen_8082_rec,
+                require_api_key=False,
+            )
+            self.assertEqual(ep_loc_8082.port, 8082)
+            refresh_loc_cmds: list[list[str]] = []
+
+            def fake_refresh_nondefault_loc(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+                refresh_loc_cmds.append(cmd)
+                if "stop-model" in cmd[0]:
+                    qwen_pid_file.unlink(missing_ok=True)
+                    return subprocess.CompletedProcess(cmd, 0, stdout="stopped", stderr="")
+                if "serve-model" in cmd[0]:
+                    self.assertIn("--port", cmd)
+                    p_arg = int(cmd[cmd.index("--port") + 1])
+                    self.assertEqual(p_arg, 8082)
+                    qwen_pid_file.write_text(json.dumps(qwen_8082_rec), encoding="utf-8")
+                    return subprocess.CompletedProcess(cmd, 0, stdout="started", stderr="")
+                return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+
+            ok_ref_loc, err_ref_loc = oc_loc.ensure_model_served(
+                ep_loc_8082,
+                no_serve=False,
+                refresh_session=True,
+                explicit_port=None,
+                runs_dir=runs_dir,
+                run_cmd=fake_refresh_nondefault_loc,
+            )
+            self.assertTrue(ok_ref_loc, msg=err_ref_loc)
+
+            # (h) WORK-MAJOR-2: Fresh explicit-port launch (--port 8082) when no Kimi PID record exists
+            #     and DeepSeek owns default port 8081:
+            #     - Paired control 1: Free explicit target (8082) succeeds while 8081 belongs to DeepSeek!
+            #     - Paired control 2: Occupied explicit target (8081) refuses!
+            #     - Paired control 3: Incompatible own-model record on 8081 when --port 8082 is requested refuses!
+            verify_mod = _load_script_module("verify_port_test", "scripts/verify-served-model")
+            kimi_pid_file.unlink(missing_ok=True)
+            qwen_pid_file.unlink(missing_ok=True)
+            ep_kimi_explicit_8082 = resolve_endpoint(
+                load_model("tinfoil-kimi-k3-1-pro"),
+                pid_record=None,
+                require_api_key=False,
+                port_override=8082,
+            )
+            ok_v_free, err_v_free = verify_mod.verify_pid_record_matches(
+                ep_kimi_explicit_8082, runs_dir=runs_dir
+            )
+            self.assertTrue(ok_v_free, msg=err_v_free)
+
+            explicit_free_cmds: list[list[str]] = []
+
+            def fake_explicit_free_cmd(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+                explicit_free_cmds.append(cmd)
+                if "verify-served-model" in cmd[0] and "--wait" not in cmd:
+                    self.assertIn("--port", cmd)
+                    self.assertEqual(int(cmd[cmd.index("--port") + 1]), 8082)
+                    return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="unreachable on 8082")
+                if "serve-model" in cmd[0]:
+                    self.assertIn("--port", cmd)
+                    self.assertEqual(int(cmd[cmd.index("--port") + 1]), 8082)
+                    kimi_pid_file.write_text(json.dumps(kimi_rec), encoding="utf-8")
+                    return subprocess.CompletedProcess(cmd, 0, stdout="started", stderr="")
+                return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+
+            ok_exp_free, err_exp_free, meta_exp_free = oc_att.ensure_model_served(
+                ep_kimi_explicit_8082,
+                no_serve=False,
+                explicit_port=8082,
+                runs_dir=runs_dir,
+                run_cmd=fake_explicit_free_cmd,
+            )
+            self.assertTrue(ok_exp_free, msg=err_exp_free)
+            assert meta_exp_free is not None
+            self.assertEqual(meta_exp_free["allocated_port"], 8082)
+
+            # Paired control 2: Occupied explicit target (8081 owned by DeepSeek) refuses
+            ep_kimi_explicit_8081 = resolve_endpoint(
+                load_model("tinfoil-kimi-k3-1-pro"),
+                pid_record=None,
+                require_api_key=False,
+                port_override=8081,
+            )
+            ok_v_occ, err_v_occ = verify_mod.verify_pid_record_matches(
+                ep_kimi_explicit_8081, runs_dir=runs_dir
+            )
+            self.assertFalse(ok_v_occ)
+            self.assertIn("tinfoil-deepseek-v4-1-flash", str(err_v_occ))
+
+            ok_exp_occ, err_exp_occ, _ = oc_att.ensure_model_served(
+                ep_kimi_explicit_8081,
+                no_serve=False,
+                explicit_port=8081,
+                runs_dir=runs_dir,
+                run_cmd=lambda cmd, **kw: subprocess.CompletedProcess(
+                    cmd, EXIT_MODEL_MISMATCH, stdout="", stderr=str(err_v_occ)
+                ),
+            )
+            self.assertFalse(ok_exp_occ)
+            self.assertIn("another model is already serving", str(err_exp_occ))
+
+            # Paired control 3: Incompatible own-model record on 8082 when --port 8085 is requested in verify_pid_record_matches
+            ep_kimi_explicit_8085 = resolve_endpoint(
+                load_model("tinfoil-kimi-k3-1-pro"),
+                pid_record=kimi_rec,
+                require_api_key=False,
+                port_override=8085,
+            )
+            ok_v_own_port, err_v_own_port = verify_mod.verify_pid_record_matches(
+                ep_kimi_explicit_8085, runs_dir=runs_dir
+            )
+            self.assertFalse(ok_v_own_port)
+            self.assertIn("served model port mismatch", str(err_v_own_port))
+
+    def test_provenance_aware_low_cap_auto_upgrade_and_thinking_toggle(self) -> None:
+        from local_assist.registry import get_process_lstart, session_token_file_for_model
+
+        oc_att = _load_script_module("oc_att_caps_thinking", "scripts/opencode-attested")
+        serve_mod = _load_script_module("serve_caps_thinking", "scripts/serve-model")
+        ep_kimi = resolve_endpoint(load_model("tinfoil-kimi-k3-1-pro"), require_api_key=False)
+
+        # 1. parse_args tracks explicit_cap_flags and explicit_thinking
+        args_default, _ = oc_att.parse_args(["scripts/opencode-attested"])
+        self.assertEqual(args_default.explicit_cap_flags, frozenset())
+        self.assertFalse(args_default.explicit_thinking)
+
+        args_one_cap, _ = oc_att.parse_args(
+            ["scripts/opencode-attested", "--max-chat-requests", "80", "--thinking"]
+        )
+        self.assertEqual(args_one_cap.explicit_cap_flags, frozenset({"max_chat_requests"}))
+        self.assertTrue(args_one_cap.explicit_thinking)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runs_dir = Path(tmp) / "runs"
+            runs_dir.mkdir(parents=True)
+            my_lstart = get_process_lstart(os.getpid())
+            tok_file = session_token_file_for_model("tinfoil-kimi-k3-1-pro", runs_dir)
+            tok_file.write_text("se-session-" + ("7" * 64) + "\n", encoding="utf-8")
+            os.chmod(tok_file, 0o600)
+            pid_file = pid_file_for_model("tinfoil-kimi-k3-1-pro", runs_dir)
+
+            def _write_eval_pid_record(*, thinking: bool = False) -> None:
+                pid_file.write_text(
+                    json.dumps(
+                        {
+                            "model_id": "tinfoil-kimi-k3-1-pro",
+                            "runtime": "tinfoil_proxy",
+                            "host": "127.0.0.1",
+                            "port": 8081,
+                            "upstream_port": 9081,
+                            "pid": os.getpid(),
+                            "pid_lstart": my_lstart,
+                            "status": "ready",
+                            "session_token_file": str(tok_file),
+                            "max_chat_requests": 50,
+                            "max_tokens_cap": 4096,
+                            "max_request_bytes": 262144,
+                            "ttl_seconds": 3600,
+                            "thinking_enabled": thinking,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            # 2. Whole-invocation explicit-cap opt-out (R2-PLAN-MINOR-1):
+            #    When ANY cap flag is explicitly passed (e.g. --max-chat-requests 80 alone),
+            #    cap-driven auto-upgrade is vetoed for the entire invocation and it attaches without restarting!
+            _write_eval_pid_record(thinking=False)
+            veto_cmds: list[list[str]] = []
+
+            def fake_veto_cmd(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+                veto_cmds.append(cmd)
+                return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+
+            ok_veto, err_veto, meta_veto = oc_att.ensure_model_served(
+                ep_kimi,
+                no_serve=False,
+                max_chat_requests=80,
+                explicit_cap_flags=frozenset({"max_chat_requests"}),
+                runs_dir=runs_dir,
+                run_cmd=fake_veto_cmd,
+            )
+            self.assertTrue(ok_veto, msg=err_veto)
+            assert meta_veto is not None
+            self.assertTrue(meta_veto["attached"])
+            self.assertEqual(meta_veto["max_chat_requests"], 50)
+            self.assertEqual(meta_veto["max_tokens_cap"], 4096)
+            self.assertEqual(len(veto_cmds), 1)
+            self.assertIn("verify-served-model", veto_cmds[0][0])
+
+            # 3. Default interactive invocation (explicit_cap_flags=frozenset()) against an eval-capped
+            #    proxy automatically refreshes the session to interactive caps (1000 / 16384 / 8388608)!
+            _write_eval_pid_record(thinking=False)
+            upgrade_cmds: list[list[str]] = []
+
+            def fake_upgrade_cmd(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+                upgrade_cmds.append(cmd)
+                if "serve-model" in cmd[0]:
+                    pid_file.write_text(
+                        json.dumps(
+                            {
+                                "model_id": "tinfoil-kimi-k3-1-pro",
+                                "runtime": "tinfoil_proxy",
+                                "host": "127.0.0.1",
+                                "port": 8081,
+                                "upstream_port": 9081,
+                                "pid": os.getpid(),
+                                "pid_lstart": my_lstart,
+                                "status": "ready",
+                                "session_token_file": str(tok_file),
+                                "max_chat_requests": 1000,
+                                "max_tokens_cap": 16384,
+                                "max_request_bytes": 8388608,
+                                "ttl_seconds": 43200,
+                                "thinking_enabled": False,
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+
+            ok_upg, err_upg, meta_upg = oc_att.ensure_model_served(
+                ep_kimi,
+                no_serve=False,
+                explicit_cap_flags=frozenset(),
+                runs_dir=runs_dir,
+                run_cmd=fake_upgrade_cmd,
+            )
+            self.assertTrue(ok_upg, msg=err_upg)
+            assert meta_upg is not None
+            self.assertFalse(meta_upg["attached"])
+            self.assertEqual(meta_upg["max_chat_requests"], 1000)
+            self.assertEqual(meta_upg["max_tokens_cap"], 16384)
+            serve_calls = [c for c in upgrade_cmds if "serve-model" in c[0]]
+            self.assertEqual(len(serve_calls), 1)
+            self.assertIn("1000", serve_calls[0])
+            self.assertIn("16384", serve_calls[0])
+
+            # 4. Passing --thinking with an explicit cap ceiling (--max-chat-requests 80) against a 50-request
+            #    session with thinking_enabled=False vetoes cap auto-upgrade AND refreshes to enable thinking
+            #    while preserving all attached caps (50 requests / 4096 tokens / 262144 bytes, WORK-MINOR-1)!
+            _write_eval_pid_record(thinking=False)
+            think_cmds: list[list[str]] = []
+
+            def fake_think_cmd(cmd: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+                think_cmds.append(cmd)
+                if "serve-model" in cmd[0]:
+                    req_idx = cmd.index("--max-chat-requests")
+                    tok_idx = cmd.index("--max-tokens-cap")
+                    byt_idx = cmd.index("--max-request-bytes")
+                    ttl_idx = cmd.index("--ttl-seconds")
+                    pid_file.write_text(
+                        json.dumps(
+                            {
+                                "model_id": "tinfoil-kimi-k3-1-pro",
+                                "runtime": "tinfoil_proxy",
+                                "host": "127.0.0.1",
+                                "port": 8081,
+                                "upstream_port": 9081,
+                                "pid": os.getpid(),
+                                "pid_lstart": my_lstart,
+                                "status": "ready",
+                                "session_token_file": str(tok_file),
+                                "max_chat_requests": int(cmd[req_idx + 1]),
+                                "max_tokens_cap": int(cmd[tok_idx + 1]),
+                                "max_request_bytes": int(cmd[byt_idx + 1]),
+                                "ttl_seconds": int(cmd[ttl_idx + 1]),
+                                "thinking_enabled": True,
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                return subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+
+            ok_th, err_th, meta_th = oc_att.ensure_model_served(
+                ep_kimi,
+                no_serve=False,
+                max_chat_requests=80,
+                explicit_cap_flags=frozenset({"max_chat_requests"}),
+                thinking=True,
+                explicit_thinking=True,
+                runs_dir=runs_dir,
+                run_cmd=fake_think_cmd,
+            )
+            self.assertTrue(ok_th, msg=err_th)
+            assert meta_th is not None
+            self.assertTrue(meta_th["thinking_enabled"])
+            self.assertEqual(meta_th["max_chat_requests"], 50)
+            self.assertEqual(meta_th["max_tokens_cap"], 4096)
+            self.assertEqual(meta_th["max_request_bytes"], 262144)
+            think_serve_calls = [c for c in think_cmds if "serve-model" in c[0]]
+            self.assertEqual(len(think_serve_calls), 1)
+            self.assertIn("--thinking", think_serve_calls[0])
+            req_flag_idx = think_serve_calls[0].index("--max-chat-requests")
+            self.assertEqual(think_serve_calls[0][req_flag_idx + 1], "50")
+
+            # 5. Low-cap warning in format_session_banner when attached to a low-cap session
+            _write_eval_pid_record(thinking=False)
+            ok_ns, err_ns, meta_ns = oc_att.ensure_model_served(
+                ep_kimi,
+                no_serve=True,
+                runs_dir=runs_dir,
+                run_cmd=lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout="ok", stderr=""),
+            )
+            self.assertTrue(ok_ns, msg=err_ns)
+            assert meta_ns is not None
+            banner_low = oc_att.format_session_banner(ep_kimi, meta_ns, max_session_usd=None)
+            self.assertIn("WARNING: Attached session has eval-sized caps", banner_low)
+
+        # 6. serve-model _extract_default_chat_params extracts passthrough when thinking=False and returns {} when thinking=True
+        kimi_model = load_model("tinfoil-kimi-k3-1-pro")
+        extracted_off = serve_mod._extract_default_chat_params(kimi_model, thinking=False)
+        self.assertEqual(
+            extracted_off,
+            {
+                "chat_template_kwargs": {"thinking": False},
+                "include_reasoning": False,
+            },
+        )
+        ds_model = load_model("tinfoil-deepseek-v4-1-flash")
+        extracted_ds = serve_mod._extract_default_chat_params(ds_model, thinking=False)
+        self.assertEqual(
+            extracted_ds,
+            {
+                "chat_template_kwargs": {"thinking": False},
+                "include_reasoning": False,
+            },
+        )
+        extracted_on = serve_mod._extract_default_chat_params(kimi_model, thinking=True)
+        self.assertEqual(extracted_on, {})
+
+    def test_publish_and_run_opencode_per_invocation_isolation_and_lifecycle(self) -> None:
+        import io
+        import threading
+        from contextlib import redirect_stdout
+        from local_assist.launch import (
+            _prune_active_opencode_clients,
+            publish_and_run_opencode,
+        )
+        from local_assist.registry import get_process_lstart
+
+        ep_ds = resolve_endpoint(load_model("tinfoil-deepseek-v4-1-flash"), require_api_key=False)
+        ep_kimi = resolve_endpoint(
+            load_model("tinfoil-kimi-k3-1-pro"), require_api_key=False, port_override=8082
+        )
+        my_lstart = get_process_lstart(os.getpid())
+        self.assertTrue(my_lstart)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            iso_home = Path(tmp) / "iso_home"
+            iso_home.mkdir(parents=True)
+            ws_dir = Path(tmp) / "ws"
+            ws_dir.mkdir(parents=True)
+
+            # 1. Exclusive first launch writes shared opencode.json, runs service restart, does NOT inject --standalone,
+            #    and cleans up its per-invocation config and registry entry on exit.
+            service_cmds: list[list[str]] = []
+            popens_seen: list[tuple[list[str], dict[str, str]]] = []
+
+            class _FakeCompletedPopen:
+                def __init__(self, cmd: list[str], cwd: str, env: dict[str, str]) -> None:
+                    self.pid = os.getpid()
+                    popens_seen.append((list(cmd), dict(env)))
+
+                def wait(self) -> int:
+                    return 0
+
+                def poll(self) -> int:
+                    return 0
+
+            rc_1 = publish_and_run_opencode(
+                opencode_bin="/usr/bin/opencode",
+                opencode_args=["run", "hello"],
+                caller_cwd=ws_dir,
+                isolated_home=iso_home,
+                endpoint=ep_ds,
+                config_text=json.dumps({"model": "ds"}),
+                build_env_fn=lambda cfg_p: {"OPENCODE_CONFIG": str(cfg_p)},
+                current_sync={"model_id": "tinfoil-deepseek-v4-1-flash", "startup_nonce": "n1"},
+                popen_fn=_FakeCompletedPopen,
+                run_service_cmd=lambda cmd, **kw: (
+                    service_cmds.append(list(cmd)) or subprocess.CompletedProcess(cmd, 0, "", "")
+                ),
+            )
+            self.assertEqual(rc_1, 0)
+            self.assertEqual(len(service_cmds), 1)
+            self.assertEqual(popens_seen[0][0], ["/usr/bin/opencode", "run", "hello"])
+            self.assertEqual(
+                json.loads((iso_home / "opencode.json").read_text(encoding="utf-8")),
+                {"model": "ds"},
+            )
+            self.assertEqual(list((iso_home / ".configs").glob("*.json")), [])
+
+            # 2. Pre-upgrade / unregistered daemon detection (R2-PLAN-MAJOR-1):
+            #    When .last-service-sync.json exists and .active-opencode-clients.json is absent,
+            #    has_unregistered_opencode_service returns True -> non-exclusive (--standalone injected,
+            #    shared opencode.json NOT overwritten, service restart NOT called)!
+            (iso_home / ".active-opencode-clients.json").unlink(missing_ok=True)
+            self.assertTrue((iso_home / ".last-service-sync.json").exists())
+            service_cmds.clear()
+            popens_seen.clear()
+
+            rc_pre = publish_and_run_opencode(
+                opencode_bin="/usr/bin/opencode",
+                opencode_args=["run", "second"],
+                caller_cwd=ws_dir,
+                isolated_home=iso_home,
+                endpoint=ep_kimi,
+                config_text=json.dumps({"model": "kimi"}),
+                build_env_fn=lambda cfg_p: {"OPENCODE_CONFIG": str(cfg_p)},
+                current_sync={"model_id": "tinfoil-kimi-k3-1-pro", "startup_nonce": "n2"},
+                popen_fn=_FakeCompletedPopen,
+                run_service_cmd=lambda cmd, **kw: (
+                    service_cmds.append(list(cmd)) or subprocess.CompletedProcess(cmd, 0, "", "")
+                ),
+            )
+            self.assertEqual(rc_pre, 0)
+            self.assertEqual(len(service_cmds), 0)
+            self.assertEqual(
+                popens_seen[0][0], ["/usr/bin/opencode", "run", "--standalone", "second"]
+            )
+            # Shared opencode.json still holds {"model": "ds"}!
+            self.assertEqual(
+                json.loads((iso_home / "opencode.json").read_text(encoding="utf-8")),
+                {"model": "ds"},
+            )
+
+            # 3. Dead-wrapper with live-child retention AND unconfirmed "starting" (child_pid=None) retention
+            #    (R2-PLAN-MAJOR-2):
+            live_child_cfg = iso_home / ".configs" / "opencode-live-child.json"
+            live_child_cfg.write_text('{"model":"live-child"}\n', encoding="utf-8")
+            starting_cfg = iso_home / ".configs" / "opencode-starting-orphan.json"
+            starting_cfg.write_text('{"model":"starting-orphan"}\n', encoding="utf-8")
+            dead_both_cfg = iso_home / ".configs" / "opencode-dead-both.json"
+            dead_both_cfg.write_text('{"model":"dead-both"}\n', encoding="utf-8")
+
+            reg_file = iso_home / ".active-opencode-clients.json"
+            reg_file.write_text(
+                json.dumps(
+                    [
+                        {
+                            "invocation_id": "inv-live-child",
+                            "launcher_pid": 999998,
+                            "launcher_lstart": "Thu Jan  1 00:00:00 1970",
+                            "child_pid": os.getpid(),
+                            "child_lstart": my_lstart,
+                            "status": "running",
+                            "model_id": "tinfoil-deepseek-v4-1-flash",
+                            "config_path": str(live_child_cfg),
+                        },
+                        {
+                            "invocation_id": "inv-starting-orphan",
+                            "launcher_pid": 999997,
+                            "launcher_lstart": "Thu Jan  1 00:00:00 1970",
+                            "child_pid": None,
+                            "child_lstart": None,
+                            "status": "starting",
+                            "model_id": "tinfoil-kimi-k3-1-pro",
+                            "config_path": str(starting_cfg),
+                        },
+                        {
+                            "invocation_id": "inv-dead-both",
+                            "launcher_pid": 999996,
+                            "launcher_lstart": "Thu Jan  1 00:00:00 1970",
+                            "child_pid": 999995,
+                            "child_lstart": "Thu Jan  1 00:00:00 1970",
+                            "status": "running",
+                            "model_id": "tinfoil-glm-5-3",
+                            "config_path": str(dead_both_cfg),
+                        },
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            retained, reg_existed, reg_unavail = _prune_active_opencode_clients(iso_home)
+            self.assertTrue(reg_existed)
+            self.assertFalse(reg_unavail)
+            retained_ids = {item["invocation_id"] for item in retained}
+            self.assertEqual(retained_ids, {"inv-live-child", "inv-starting-orphan"})
+            self.assertTrue(live_child_cfg.exists())
+            self.assertTrue(starting_cfg.exists())
+            self.assertFalse(dead_both_cfg.exists())
+
+            # 4. Synchronous popen_fn failure (OSError) before any child is spawned immediately
+            #    removes its own provisional "starting" record and per-invocation config file (R3-PLAN-MAJOR-1)!
+            reg_file.write_text("[]\n", encoding="utf-8")
+            (iso_home / ".last-service-sync.json").unlink(missing_ok=True)
+            live_child_cfg.unlink(missing_ok=True)
+            starting_cfg.unlink(missing_ok=True)
+
+            def _failing_popen(*a: object, **kw: object) -> object:
+                raise OSError("Simulated exec failure before child exists")
+
+            with self.assertRaises(OSError):
+                publish_and_run_opencode(
+                    opencode_bin="/usr/bin/nonexistent-opencode",
+                    opencode_args=["run", "fail"],
+                    caller_cwd=ws_dir,
+                    isolated_home=iso_home,
+                    endpoint=ep_ds,
+                    config_text=json.dumps({"model": "ds"}),
+                    build_env_fn=lambda cfg_p: {"OPENCODE_CONFIG": str(cfg_p)},
+                    current_sync={"model_id": "tinfoil-deepseek-v4-1-flash", "startup_nonce": "n3"},
+                    popen_fn=_failing_popen,
+                    run_service_cmd=lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, "", ""),
+                )
+            self.assertEqual(json.loads(reg_file.read_text(encoding="utf-8")), [])
+            self.assertEqual(list((iso_home / ".configs").glob("*.json")), [])
+
+            # 5. Next-launch behavior when an unconfirmed "starting" (child_pid=None) row is retained (WORK-MINOR-4):
+            #    Asserts non-exclusive standalone execution, no shared opencode.json / .last-service-sync.json
+            #    write, and no service restart!
+            (iso_home / "opencode.json").write_text('{"model":"preserved-by-pending"}\n', encoding="utf-8")
+            (iso_home / ".last-service-sync.json").write_text('{"startup_nonce":"sync-before-pending"}\n', encoding="utf-8")
+            pending_cfg = iso_home / ".configs" / "opencode-pending.json"
+            pending_cfg.write_text('{"model":"pending"}\n', encoding="utf-8")
+            reg_file.write_text(
+                json.dumps(
+                    [
+                        {
+                            "invocation_id": "inv-pending-handoff",
+                            "launcher_pid": 999994,
+                            "launcher_lstart": "Thu Jan  1 00:00:00 1970",
+                            "child_pid": None,
+                            "child_lstart": None,
+                            "status": "starting",
+                            "model_id": "tinfoil-deepseek-v4-1-flash",
+                            "config_path": str(pending_cfg),
+                        }
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            service_cmds.clear()
+            popens_seen.clear()
+            rc_after_pending = publish_and_run_opencode(
+                opencode_bin="/usr/bin/opencode",
+                opencode_args=["run", "after-pending"],
+                caller_cwd=ws_dir,
+                isolated_home=iso_home,
+                endpoint=ep_ds,
+                config_text=json.dumps({"model": "new-attempt"}),
+                build_env_fn=lambda cfg_p: {"OPENCODE_CONFIG": str(cfg_p)},
+                current_sync={"model_id": "tinfoil-deepseek-v4-1-flash", "startup_nonce": "sync-new"},
+                popen_fn=_FakeCompletedPopen,
+                run_service_cmd=lambda cmd, **kw: (
+                    service_cmds.append(list(cmd)) or subprocess.CompletedProcess(cmd, 0, "", "")
+                ),
+            )
+            self.assertEqual(rc_after_pending, 0)
+            self.assertEqual(service_cmds, [])
+            self.assertEqual(
+                popens_seen[0][0], ["/usr/bin/opencode", "run", "--standalone", "after-pending"]
+            )
+            self.assertEqual(
+                json.loads((iso_home / "opencode.json").read_text(encoding="utf-8")),
+                {"model": "preserved-by-pending"},
+            )
+            self.assertEqual(
+                json.loads((iso_home / ".last-service-sync.json").read_text(encoding="utf-8")),
+                {"startup_nonce": "sync-before-pending"},
+            )
+            pending_cfg.unlink(missing_ok=True)
+
+            # 6. Controlled ps_runner observer test with an existing empty registry ([]), a same-home
+            #    unregistered `opencode serve --service` daemon, and changed sync metadata (WORK-MAJOR-3):
+            #    Asserts no shared-config/sync write or service restart and standalone execution!
+            reg_file.write_text("[]\n", encoding="utf-8")
+            (iso_home / "opencode.json").write_text('{"model":"preserved-by-unreg-daemon"}\n', encoding="utf-8")
+            (iso_home / ".last-service-sync.json").write_text('{"startup_nonce":"sync-before-daemon"}\n', encoding="utf-8")
+            service_cmds.clear()
+            popens_seen.clear()
+
+            def _fake_ps_with_same_home_daemon(cmd: list[str], **kw: object) -> subprocess.CompletedProcess[str]:
+                return subprocess.CompletedProcess(
+                    cmd,
+                    0,
+                    stdout=f"88888 /opt/homebrew/bin/opencode serve --service OPENCODE_TEST_HOME={iso_home}\n",
+                    stderr="",
+                )
+
+            rc_unreg_daemon = publish_and_run_opencode(
+                opencode_bin="/usr/bin/opencode",
+                opencode_args=["run", "with-unreg-daemon"],
+                caller_cwd=ws_dir,
+                isolated_home=iso_home,
+                endpoint=ep_ds,
+                config_text=json.dumps({"model": "would-clobber"}),
+                build_env_fn=lambda cfg_p: {"OPENCODE_CONFIG": str(cfg_p)},
+                current_sync={"model_id": "tinfoil-deepseek-v4-1-flash", "startup_nonce": "sync-changed"},
+                popen_fn=_FakeCompletedPopen,
+                run_service_cmd=lambda cmd, **kw: (
+                    service_cmds.append(list(cmd)) or subprocess.CompletedProcess(cmd, 0, "", "")
+                ),
+                ps_runner=_fake_ps_with_same_home_daemon,
+            )
+            self.assertEqual(rc_unreg_daemon, 0)
+            self.assertEqual(service_cmds, [])
+            self.assertEqual(
+                popens_seen[0][0], ["/usr/bin/opencode", "run", "--standalone", "with-unreg-daemon"]
+            )
+            self.assertEqual(
+                json.loads((iso_home / "opencode.json").read_text(encoding="utf-8")),
+                {"model": "preserved-by-unreg-daemon"},
+            )
+            self.assertEqual(
+                json.loads((iso_home / ".last-service-sync.json").read_text(encoding="utf-8")),
+                {"startup_nonce": "sync-before-daemon"},
+            )
+
+            # 7. Overlapping same-model launches from two workspaces (ws_a and ws_b) with a blocked
+            #    fake child lifetime + concurrent --print-config while Client A is active (WORK-MINOR-4):
+            ws_a = Path(tmp) / "ws_a"
+            ws_b = Path(tmp) / "ws_b"
+            ws_a.mkdir(parents=True)
+            ws_b.mkdir(parents=True)
+            reg_file.write_text("[]\n", encoding="utf-8")
+            service_cmds.clear()
+
+            client_a_waiting = threading.Event()
+            client_a_release = threading.Event()
+            overlap_records: dict[str, tuple[list[str], dict[str, str], dict[str, Any]]] = {}
+
+            def _make_popen_for(tag: str, block: bool) -> Any:
+                class _TaggedPopen:
+                    def __init__(self, cmd: list[str], cwd: str, env: dict[str, str]) -> None:
+                        self.pid = os.getpid()
+                        cfg_data = json.loads(Path(env["OPENCODE_CONFIG"]).read_text(encoding="utf-8"))
+                        overlap_records[tag] = (list(cmd), dict(env), cfg_data)
+                        self._done = False
+
+                    def wait(self) -> int:
+                        if block:
+                            client_a_waiting.set()
+                            client_a_release.wait(timeout=10)
+                        self._done = True
+                        return 0
+
+                    def poll(self) -> int | None:
+                        return 0 if self._done else None
+
+                return _TaggedPopen
+
+            rc_holder: list[int] = []
+
+            def _run_client_a() -> None:
+                rc_a = publish_and_run_opencode(
+                    opencode_bin="/usr/bin/opencode",
+                    opencode_args=["run", "from-ws-a"],
+                    caller_cwd=ws_a,
+                    isolated_home=iso_home,
+                    endpoint=ep_ds,
+                    config_text=json.dumps({"workspace": "ws_a", "model": "ds"}),
+                    build_env_fn=lambda cfg_p: {"OPENCODE_CONFIG": str(cfg_p)},
+                    current_sync={"model_id": "tinfoil-deepseek-v4-1-flash", "startup_nonce": "sync-a"},
+                    popen_fn=_make_popen_for("A", block=True),
+                    run_service_cmd=lambda cmd, **kw: (
+                        service_cmds.append(list(cmd)) or subprocess.CompletedProcess(cmd, 0, "", "")
+                    ),
+                )
+                rc_holder.append(rc_a)
+
+            t_a = threading.Thread(target=_run_client_a)
+            t_a.start()
+            self.assertTrue(client_a_waiting.wait(timeout=5))
+
+            try:
+                # Client A is active: verify it was exclusive owner and its per-invocation config exists
+                self.assertEqual(len(service_cmds), 1)
+                self.assertEqual(overlap_records["A"][0], ["/usr/bin/opencode", "run", "from-ws-a"])
+                cfg_a_path = Path(overlap_records["A"][1]["OPENCODE_CONFIG"])
+                self.assertTrue(cfg_a_path.exists())
+                self.assertEqual(
+                    json.loads((iso_home / "opencode.json").read_text(encoding="utf-8")),
+                    {"workspace": "ws_a", "model": "ds"},
+                )
+
+                # Run --print-config while Client A is active: must NOT overwrite shared opencode.json or Client A's config!
+                print_buf = io.StringIO()
+                with redirect_stdout(print_buf):
+                    rc_print = publish_and_run_opencode(
+                        opencode_bin=None,
+                        opencode_args=[],
+                        caller_cwd=ws_b,
+                        isolated_home=iso_home,
+                        endpoint=ep_ds,
+                        config_text=json.dumps({"workspace": "print_preview", "model": "ds"}),
+                        build_env_fn=lambda cfg_p: {"OPENCODE_CONFIG": str(cfg_p)},
+                        current_sync={"model_id": "tinfoil-deepseek-v4-1-flash", "startup_nonce": "sync-print"},
+                        print_config=True,
+                    )
+                self.assertEqual(rc_print, 0)
+                print_payload = json.loads(print_buf.getvalue())
+                self.assertNotEqual(Path(print_payload["opencode_config_path"]), iso_home / "opencode.json")
+                self.assertFalse(Path(print_payload["opencode_config_path"]).exists())
+                self.assertEqual(
+                    json.loads((iso_home / "opencode.json").read_text(encoding="utf-8")),
+                    {"workspace": "ws_a", "model": "ds"},
+                )
+                self.assertEqual(
+                    json.loads(cfg_a_path.read_text(encoding="utf-8")),
+                    {"workspace": "ws_a", "model": "ds"},
+                )
+
+                # Launch overlapping same-model Client B from ws_b while Client A is still active:
+                rc_b = publish_and_run_opencode(
+                    opencode_bin="/usr/bin/opencode",
+                    opencode_args=["run", "from-ws-b"],
+                    caller_cwd=ws_b,
+                    isolated_home=iso_home,
+                    endpoint=ep_ds,
+                    config_text=json.dumps({"workspace": "ws_b", "model": "ds"}),
+                    build_env_fn=lambda cfg_p: {"OPENCODE_CONFIG": str(cfg_p)},
+                    current_sync={"model_id": "tinfoil-deepseek-v4-1-flash", "startup_nonce": "sync-b"},
+                    popen_fn=_make_popen_for("B", block=False),
+                    run_service_cmd=lambda cmd, **kw: (
+                        service_cmds.append(list(cmd)) or subprocess.CompletedProcess(cmd, 0, "", "")
+                    ),
+                )
+                self.assertEqual(rc_b, 0)
+                self.assertEqual(len(service_cmds), 1)
+                self.assertEqual(
+                    overlap_records["B"][0], ["/usr/bin/opencode", "run", "--standalone", "from-ws-b"]
+                )
+                self.assertEqual(overlap_records["B"][2], {"workspace": "ws_b", "model": "ds"})
+                self.assertNotEqual(
+                    overlap_records["A"][1]["OPENCODE_CONFIG"],
+                    overlap_records["B"][1]["OPENCODE_CONFIG"],
+                )
+                # Client A's config file and shared opencode.json remain intact while Client A is still alive!
+                self.assertTrue(cfg_a_path.exists())
+                self.assertEqual(
+                    json.loads(cfg_a_path.read_text(encoding="utf-8")),
+                    {"workspace": "ws_a", "model": "ds"},
+                )
+                self.assertEqual(
+                    json.loads((iso_home / "opencode.json").read_text(encoding="utf-8")),
+                    {"workspace": "ws_a", "model": "ds"},
+                )
+            finally:
+                client_a_release.set()
+                t_a.join(timeout=5)
+
+            self.assertEqual(rc_holder, [0])
+            self.assertEqual(json.loads(reg_file.read_text(encoding="utf-8")), [])
+            self.assertEqual(list((iso_home / ".configs").glob("*.json")), [])
+
+    def test_models_active_sessions_inspection_cli_and_json(self) -> None:
+        import io
+        from contextlib import redirect_stdout
+        from local_assist.registry import get_process_lstart
+
+        models_mod = _load_script_module("models_active_test", "scripts/models")
+        my_lstart = get_process_lstart(os.getpid())
+        self.assertTrue(my_lstart)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runs_dir = Path(tmp) / "runs"
+            runs_dir.mkdir(parents=True)
+
+            # 1. Dual-process ready interactive tinfoil_proxy session on 8081
+            pid_1 = pid_file_for_model("tinfoil-deepseek-v4-1-flash", runs_dir)
+            pid_1.write_text(
+                json.dumps(
+                    {
+                        "model_id": "tinfoil-deepseek-v4-1-flash",
+                        "runtime": "tinfoil_proxy",
+                        "host": "127.0.0.1",
+                        "port": 8081,
+                        "upstream_port": 9081,
+                        "pid": os.getpid(),
+                        "pid_lstart": my_lstart,
+                        "upstream_pid": os.getpid(),
+                        "upstream_pid_lstart": my_lstart,
+                        "status": "ready",
+                        "started_at": "2026-11-08T18:00:00+00:00",
+                        "session_max_chat_requests": 1000,
+                        "session_max_tokens_cap": 16384,
+                        "session_max_request_bytes": 8388608,
+                        "session_ttl_seconds": 43200,
+                        "thinking_enabled": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            # 2. Primary-only ready local mlx_lm session on 8080
+            pid_local = pid_file_for_model("qwen3-30b-a3b-2507-mlx-4bit", runs_dir)
+            pid_local.write_text(
+                json.dumps(
+                    {
+                        "model_id": "qwen3-30b-a3b-2507-mlx-4bit",
+                        "runtime": "mlx_lm",
+                        "host": "127.0.0.1",
+                        "port": 8080,
+                        "pid": os.getpid(),
+                        "pid_lstart": my_lstart,
+                        "status": "ready",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            # 3. Orphaned upstream session (dead primary pid=999999, live verified upstream_pid=os.getpid()) on 8082
+            pid_orphan = pid_file_for_model("tinfoil-kimi-k3-1-pro", runs_dir)
+            pid_orphan.write_text(
+                json.dumps(
+                    {
+                        "model_id": "tinfoil-kimi-k3-1-pro",
+                        "runtime": "tinfoil_proxy",
+                        "host": "127.0.0.1",
+                        "port": 8082,
+                        "upstream_port": 9082,
+                        "pid": 999999,
+                        "pid_lstart": "Thu Jan  1 00:00:00 1970",
+                        "upstream_pid": os.getpid(),
+                        "upstream_pid_lstart": my_lstart,
+                        "status": "ready",
+                        "session_max_chat_requests": 50,
+                        "session_max_tokens_cap": 4096,
+                        "session_max_request_bytes": 262144,
+                        "session_ttl_seconds": 3600,
+                        "thinking_enabled": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            # 4. Starting session on 8083
+            pid_starting = pid_file_for_model("tinfoil-glm-5-3", runs_dir)
+            pid_starting.write_text(
+                json.dumps(
+                    {
+                        "model_id": "tinfoil-glm-5-3",
+                        "runtime": "tinfoil_proxy",
+                        "host": "127.0.0.1",
+                        "port": 8083,
+                        "upstream_port": 9083,
+                        "pid": None,
+                        "status": "starting",
+                        "session_max_chat_requests": 1000,
+                        "session_max_tokens_cap": 16384,
+                        "session_max_request_bytes": 8388608,
+                        "session_ttl_seconds": 43200,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            # 5. Unverifiable identity session (live pid without pid_lstart) on 8084
+            pid_unavail = pid_file_for_model("gemma-4-26b-a4b-it-optiq-mlx-4bit", runs_dir)
+            pid_unavail.write_text(
+                json.dumps(
+                    {
+                        "model_id": "gemma-4-26b-a4b-it-optiq-mlx-4bit",
+                        "runtime": "mlx_lm",
+                        "host": "127.0.0.1",
+                        "port": 8084,
+                        "pid": os.getpid(),
+                        "pid_lstart": "",
+                        "status": "ready",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            # 6. Wholly dead session (both primary and upstream dead) on 8085
+            pid_dead = pid_file_for_model("tinfoil-gpt-oss-120b", runs_dir)
+            pid_dead.write_text(
+                json.dumps(
+                    {
+                        "model_id": "tinfoil-gpt-oss-120b",
+                        "runtime": "tinfoil_proxy",
+                        "host": "127.0.0.1",
+                        "port": 8085,
+                        "upstream_port": 9085,
+                        "pid": 999999,
+                        "pid_lstart": "Thu Jan  1 00:00:00 1970",
+                        "upstream_pid": 999998,
+                        "upstream_pid_lstart": "Thu Jan  1 00:00:00 1970",
+                        "status": "ready",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            # Also write a duplicate .serve.pid for tinfoil-deepseek-v4-1-flash to verify deduplication
+            (runs_dir / ".serve.pid").write_text(
+                pid_1.read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+
+            # JSON output
+            json_buf = io.StringIO()
+            with redirect_stdout(json_buf):
+                rc_json = models_mod.main(
+                    ["scripts/models", "--active", "--json"], runs_dir=runs_dir
+                )
+            self.assertEqual(rc_json, 0)
+            payload = json.loads(json_buf.getvalue())
+            by_id = {s["model_id"]: s for s in payload["sessions"]}
+            stale_by_id = {s["model_id"]: s for s in payload["stale_sessions"]}
+            self.assertEqual(
+                set(by_id.keys()),
+                {
+                    "tinfoil-deepseek-v4-1-flash",
+                    "qwen3-30b-a3b-2507-mlx-4bit",
+                    "tinfoil-kimi-k3-1-pro",
+                    "tinfoil-glm-5-3",
+                    "gemma-4-26b-a4b-it-optiq-mlx-4bit",
+                },
+            )
+            self.assertEqual(set(stale_by_id.keys()), {"tinfoil-gpt-oss-120b"})
+
+            ds_s = by_id["tinfoil-deepseek-v4-1-flash"]
+            self.assertTrue(ds_s["live"])
+            self.assertEqual(ds_s["status"], "ready")
+            self.assertEqual(ds_s["mode"], "interactive")
+            self.assertFalse(ds_s["thinking_enabled"])
+            self.assertEqual(ds_s["port"], 8081)
+            self.assertEqual(ds_s["upstream_port"], 9081)
+            self.assertIn("--model tinfoil-deepseek-v4-1-flash", ds_s["commands"]["attach"])
+            self.assertNotIn("--allow-uncleared-model", ds_s["commands"]["attach"])
+
+            loc_s = by_id["qwen3-30b-a3b-2507-mlx-4bit"]
+            self.assertTrue(loc_s["live"])
+            self.assertEqual(loc_s["status"], "ready")
+            self.assertEqual(loc_s["mode"], "local")
+
+            kimi_s = by_id["tinfoil-kimi-k3-1-pro"]
+            self.assertFalse(kimi_s["live"])
+            self.assertEqual(kimi_s["status"], "orphaned_upstream")
+            self.assertEqual(kimi_s["mode"], "eval")
+            self.assertTrue(kimi_s["thinking_enabled"])
+            self.assertEqual(kimi_s["port"], 8082)
+            self.assertIn("--allow-uncleared-model --port 8082", kimi_s["commands"]["attach"])
+            self.assertIn("--allow-uncleared-model --port 8082 --refresh-session", kimi_s["commands"]["refresh"])
+
+            glm_s = by_id["tinfoil-glm-5-3"]
+            self.assertFalse(glm_s["live"])
+            self.assertEqual(glm_s["status"], "starting")
+
+            gemma_s = by_id["gemma-4-26b-a4b-it-optiq-mlx-4bit"]
+            self.assertFalse(gemma_s["live"])
+            self.assertEqual(gemma_s["status"], "identity_unavailable")
+
+            gpt_stale = stale_by_id["tinfoil-gpt-oss-120b"]
+            self.assertFalse(gpt_stale["live"])
+            self.assertFalse(gpt_stale["active"])
+            self.assertEqual(gpt_stale["status"], "stale")
+
+            # Human-readable output
+            txt_buf = io.StringIO()
+            with redirect_stdout(txt_buf):
+                rc_txt = models_mod.main(["scripts/models", "--active"], runs_dir=runs_dir)
+            self.assertEqual(rc_txt, 0)
+            txt = txt_buf.getvalue()
+            self.assertIn("tinfoil-deepseek-v4-1-flash  status=ready  mode=interactive", txt)
+            self.assertIn("tinfoil-kimi-k3-1-pro  status=orphaned_upstream  mode=eval", txt)
+            self.assertIn("tinfoil-glm-5-3  status=starting  mode=interactive", txt)
+            self.assertIn("gemma-4-26b-a4b-it-optiq-mlx-4bit  status=identity_unavailable  mode=local", txt)
+            self.assertNotIn("tinfoil-gpt-oss-120b", txt)
+            self.assertIn(
+                "attach:  ./scripts/opencode-attested --model tinfoil-kimi-k3-1-pro --allow-uncleared-model --port 8082",
+                txt,
+            )
 
 
 if __name__ == "__main__":

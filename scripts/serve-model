@@ -49,11 +49,19 @@ from local_assist.se_key import (
     ensure_envelope_available_or_migrate,
     verify_se_key_proxy_binary,
 )
+from local_assist.security_profile import (
+    SecurityProfileError,
+    validate_default_chat_params,
+)
 
 
 RUNS = ROOT / "runs"
 DEFAULT_PORT = 8080
 DEFAULT_MAX_TOKENS_CAP = 4096
+INTERACTIVE_MAX_CHAT_REQUESTS = 1000
+INTERACTIVE_MAX_TOKENS_CAP = 16384
+INTERACTIVE_MAX_REQUEST_BYTES = 8388608
+INTERACTIVE_TTL_SECONDS = 43200
 CUSTOM_COMMAND_RUNTIMES = {"proxy", "mlx-vlm", "vllm-mlx", "omlx", "llama.cpp"}
 SERVE_ENV_ALLOWLIST = BASE_SAFE_ENV_ALLOWLIST | frozenset({
     "COLORTERM",
@@ -438,6 +446,21 @@ def _unlink_pid_files_if_matching(
                 pass
 
 
+def _extract_default_chat_params(
+    model: dict[str, Any],
+    *,
+    thinking: bool = False,
+) -> dict[str, Any]:
+    if thinking:
+        return {}
+    raw_provider = model.get("promptfoo_provider")
+    raw_cfg = raw_provider.get("config") if isinstance(raw_provider, dict) else None
+    raw_passthrough = raw_cfg.get("passthrough") if isinstance(raw_cfg, dict) else None
+    if isinstance(raw_passthrough, dict) and raw_passthrough:
+        return validate_default_chat_params(raw_passthrough)
+    return {}
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
         description="Start the local model or proxy server configured in models.yaml."
@@ -503,6 +526,29 @@ def main(argv: list[str]) -> int:
         help="Maximum total duration in seconds for a single proxied request/stream in se-key-proxy (default: 300).",
     )
     parser.add_argument(
+        "--interactive",
+        action="store_true",
+        default=False,
+        help=(
+            "Use interactive coding session caps for se-key-proxy "
+            f"(max_chat_requests={INTERACTIVE_MAX_CHAT_REQUESTS}, max_tokens_cap={INTERACTIVE_MAX_TOKENS_CAP}, "
+            f"max_request_bytes={INTERACTIVE_MAX_REQUEST_BYTES}, ttl_seconds={INTERACTIVE_TTL_SECONDS})."
+        ),
+    )
+    parser.add_argument(
+        "--eval-caps",
+        dest="eval_caps",
+        action="store_true",
+        default=False,
+        help="Use evaluation suite session caps for se-key-proxy (max_chat_requests=50, max_tokens_cap=4096, max_request_bytes=262144, ttl_seconds=3600; default).",
+    )
+    parser.add_argument(
+        "--thinking",
+        action="store_true",
+        default=False,
+        help="Do not inject model passthrough thinking=false / include_reasoning=false defaults in se-key-proxy.",
+    )
+    parser.add_argument(
         "--refresh-session",
         "--restart",
         dest="refresh_session",
@@ -511,6 +557,24 @@ def main(argv: list[str]) -> int:
         help="Stop any active server/proxy session for this model on the target port and start a fresh session.",
     )
     args = parser.parse_args(argv[1:])
+
+    if args.interactive and args.eval_caps:
+        print("Cannot combine --interactive and --eval-caps.", file=sys.stderr)
+        return 2
+
+    raw_flags = set(argv[1:])
+    has_explicit_flag = lambda flag: any(
+        tok == flag or tok.startswith(f"{flag}=") for tok in raw_flags
+    )
+    if args.interactive:
+        if not has_explicit_flag("--max-chat-requests"):
+            args.max_chat_requests = INTERACTIVE_MAX_CHAT_REQUESTS
+        if not has_explicit_flag("--max-tokens-cap"):
+            args.max_tokens_cap = INTERACTIVE_MAX_TOKENS_CAP
+        if not has_explicit_flag("--max-request-bytes"):
+            args.max_request_bytes = INTERACTIVE_MAX_REQUEST_BYTES
+        if not has_explicit_flag("--ttl-seconds"):
+            args.ttl_seconds = INTERACTIVE_TTL_SECONDS
 
     chat_template_args_override = None
     if args.chat_template_args is not None:
@@ -562,8 +626,17 @@ def main(argv: list[str]) -> int:
     upstream_cmd: list[str] | None = None
     upstream_url: str | None = None
     cmd: list[str] | None = None
+    default_chat_params: dict[str, Any] = {}
 
     if uses_se_key_proxy:
+        try:
+            default_chat_params = _extract_default_chat_params(
+                model,
+                thinking=bool(args.thinking),
+            )
+        except SecurityProfileError as exc:
+            print(f"Invalid model passthrough config for {endpoint.model_id}: {exc}", file=sys.stderr)
+            return 1
         try:
             se_proxy_bin = verify_se_key_proxy_binary()
         except SEKeyIntegrityError as exc:
@@ -841,6 +914,8 @@ def main(argv: list[str]) -> int:
                     "max_request_bytes": args.max_request_bytes,
                     "ttl_seconds": args.ttl_seconds,
                     "stream_timeout_seconds": args.stream_timeout_seconds,
+                    "thinking_enabled": bool(args.thinking),
+                    "default_chat_params": default_chat_params,
                     "command": [],
                     "upstream_command": upstream_cmd,
                     "log": str(log),
@@ -926,6 +1001,13 @@ def main(argv: list[str]) -> int:
                         "--stream-timeout-seconds",
                         str(args.stream_timeout_seconds),
                     ]
+                    if default_chat_params:
+                        se_cmd.extend(
+                            [
+                                "--default-chat-params-json",
+                                json.dumps(default_chat_params, separators=(",", ":")),
+                            ]
+                        )
                     if upstream_proc is not None:
                         se_cmd.extend(["--upstream-pid", str(upstream_proc.pid)])
 

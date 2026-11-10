@@ -5021,11 +5021,221 @@ class Phase2LookoutRemediationTests(unittest.TestCase):
                     "not-json-project-file\n",
                 )
                 self.assertFalse((proj_dir / ".keep-worker-home").exists())
+
+            # R3-F1: When popen_factory raises synchronously before spawning a child,
+            # run_worker_sandbox_lifecycle clears the pre-child pending
+            # .unconfirmed-process-group.json marker so teardown_worker_home removes isolated_home.
+            wid_popen_err, home_popen_err = allocate_worker_home()
+            try:
+                def _raising_popen(*_a: Any, **_kw: Any) -> Any:
+                    self.assertTrue((home_popen_err / ".unconfirmed-process-group.json").is_file())
+                    raise OSError("simulated synchronous pre-child Popen failure")
+
+                with patch(
+                    "local_assist.security_profile._scan_worker_pids",
+                    return_value=({}, True),
+                ):
+                    with self.assertRaises(OSError):
+                        run_worker_sandbox_lifecycle(
+                            [sys.executable, "-c", "raise SystemExit(0)"],
+                            cwd=home_popen_err,
+                            env=os.environ,
+                            isolated_home=home_popen_err,
+                            worker_id=wid_popen_err,
+                            harvest_logs=False,
+                            remove_home=True,
+                            popen_factory=_raising_popen,
+                        )
+                self.assertFalse(home_popen_err.exists())
+            finally:
+                if home_popen_err.exists():
+                    _safe_rmtree_nofollow(home_popen_err)
         finally:
             if isolated_home.exists():
                 _safe_rmtree_nofollow(isolated_home)
             if dest_dir is not None and dest_dir.exists():
                 shutil.rmtree(dest_dir, ignore_errors=True)
+
+    def test_worker_relay_default_chat_params_and_subagent_flag_decoupling(self) -> None:
+        import argparse
+        from urllib.error import HTTPError
+        from urllib.request import Request, urlopen
+        from local_assist.launch import (
+            add_common_launcher_arguments,
+            resolve_active_security_profile,
+        )
+        from local_assist.security_profile import validate_default_chat_params
+
+        # 1. Decouple --allow-subagents from implicitly activating the unattended worker Seatbelt sandbox:
+        #    passing --allow-subagents alone returns None (interactive mode), while passing
+        #    --unattended-worker --allow-subagents returns a WorkerSecurityProfile with allow_subagents=True.
+        parser = argparse.ArgumentParser()
+        parser.add_argument("--allow-uncleared-model", action="store_true", default=False)
+        parser.add_argument("--max-session-usd", type=float, default=None)
+        add_common_launcher_arguments(
+            parser,
+            default_output_limit=8192,
+            default_wait_seconds=60.0,
+            wait_help="wait",
+            no_serve_help="no-serve",
+            print_config_help="print-config",
+            unattended_help="unattended",
+        )
+        interactive_args = parser.parse_args(["--allow-subagents"])
+        self.assertIsNone(resolve_active_security_profile(interactive_args))
+
+        worker_args = parser.parse_args(["--unattended-worker", "--allow-subagents"])
+        prof = resolve_active_security_profile(worker_args)
+        self.assertIsNotNone(prof)
+        assert prof is not None
+        self.assertTrue(prof.allow_subagents)
+
+        # 2. validate_default_chat_params rejects reserved keys and >4096-byte payloads
+        for bad_dict in (
+            {"model": "evil"},
+            {"messages": []},
+            {"max_tokens": 999999},
+            {"max_completion_tokens": 999999},
+            {"maxOutputTokens": 999999},
+            {"n": 3},
+            {"best_of": 3},
+            {"stream": True},
+            {"pad": "x" * 4100},
+        ):
+            with self.assertRaises(SecurityProfileError):
+                validate_default_chat_params(bad_dict)
+
+        # 3. _WorkerTokenRelay merges default_chat_params non-overwritingly and enforces
+        #    post-merge max_request_bytes BEFORE incrementing chat_requests_used.
+        received_bodies: list[dict[str, Any]] = []
+
+        class _RelayUpstreamHandler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length)
+                received_bodies.append(json.loads(raw.decode("utf-8")))
+                resp = json.dumps(
+                    {
+                        "id": "chatcmpl-relay",
+                        "object": "chat.completion",
+                        "model": "kimi-k3-1-pro",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {"role": "assistant", "content": "ok"},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                    }
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp)))
+                self.end_headers()
+                self.wfile.write(resp)
+
+            def log_message(self, format: str, *args: Any) -> None:
+                return
+
+        up_srv = ThreadingHTTPServer(("127.0.0.1", 0), _RelayUpstreamHandler)
+        up_port = int(up_srv.server_address[1])
+        threading.Thread(target=up_srv.serve_forever, daemon=True).start()
+
+        relay = _WorkerTokenRelay(
+            upstream_base_url=f"http://127.0.0.1:{up_port}/v1",
+            upstream_session_token="se-session-" + ("f" * 64),
+            max_chat_requests=2,
+            max_request_bytes=320,
+            max_tokens_cap=512,
+            default_chat_params={
+                "chat_template_kwargs": {"thinking": False, "enable_thinking": False},
+                "reasoning_effort": "none",
+                "include_reasoning": False,
+            },
+        ).start()
+        try:
+            # (a) Borderline body <= 320B raw that exceeds 320B after merging defaults -> 413 without incrementing chat_requests_used
+            borderline = json.dumps(
+                {
+                    "model": "kimi-k3-1-pro",
+                    "messages": [{"role": "user", "content": "x" * 160}],
+                }
+            ).encode("utf-8")
+            self.assertLessEqual(len(borderline), 320)
+            req_413 = Request(
+                f"{relay.api_base_url}/chat/completions",
+                data=borderline,
+                headers={
+                    "Authorization": f"Bearer {relay.relay_token}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            with self.assertRaises(HTTPError) as ctx_413:
+                urlopen(req_413, timeout=3)
+            self.assertEqual(ctx_413.exception.code, 413)
+            err_payload = json.loads(ctx_413.exception.read().decode("utf-8"))
+            ctx_413.exception.close()
+            self.assertEqual(err_payload["error"]["type"], "request_too_large")
+            self.assertEqual(relay.chat_requests_used, 0)
+            self.assertEqual(len(received_bodies), 0)
+
+            # (b) Compact request -> defaults merged
+            body_1 = json.dumps(
+                {
+                    "model": "kimi-k3-1-pro",
+                    "messages": [{"role": "user", "content": "hi"}],
+                }
+            ).encode("utf-8")
+            req_1 = Request(
+                f"{relay.api_base_url}/chat/completions",
+                data=body_1,
+                headers={
+                    "Authorization": f"Bearer {relay.relay_token}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            with urlopen(req_1, timeout=3) as r1:
+                self.assertEqual(r1.status, 200)
+            self.assertEqual(relay.chat_requests_used, 1)
+            self.assertEqual(received_bodies[0].get("reasoning_effort"), "none")
+            self.assertIs(received_bodies[0].get("include_reasoning"), False)
+            self.assertEqual(
+                received_bodies[0].get("chat_template_kwargs"),
+                {"thinking": False, "enable_thinking": False},
+            )
+
+            # (c) Client override preserved
+            body_2 = json.dumps(
+                {
+                    "model": "kimi-k3-1-pro",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "include_reasoning": True,
+                    "chat_template_kwargs": {"thinking": True},
+                }
+            ).encode("utf-8")
+            req_2 = Request(
+                f"{relay.api_base_url}/chat/completions",
+                data=body_2,
+                headers={
+                    "Authorization": f"Bearer {relay.relay_token}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            with urlopen(req_2, timeout=3) as r2:
+                self.assertEqual(r2.status, 200)
+            self.assertEqual(relay.chat_requests_used, 2)
+            self.assertIs(received_bodies[1].get("include_reasoning"), True)
+            self.assertEqual(
+                received_bodies[1].get("chat_template_kwargs"),
+                {"thinking": True, "enable_thinking": False},
+            )
+        finally:
+            relay.close()
+            up_srv.shutdown()
+            up_srv.server_close()
 
 
 if __name__ == "__main__":

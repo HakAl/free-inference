@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import errno
 import hmac
 import http.client
@@ -2507,6 +2508,50 @@ def redact_session_tokens(text: str) -> str:
     return SE_SESSION_REDACT_RE.sub("se-session-REDACTED", text)
 
 
+MAX_DEFAULT_CHAT_PARAMS_BYTES = 4096
+RESERVED_CHAT_PARAM_KEYS: frozenset[str] = frozenset({
+    "model",
+    "messages",
+    "n",
+    "best_of",
+    "max_tokens",
+    "max_completion_tokens",
+    "maxOutputTokens",
+    "stream",
+})
+
+
+def validate_default_chat_params(raw_params: dict[str, Any] | None) -> dict[str, Any]:
+    if raw_params is None:
+        return {}
+    if not isinstance(raw_params, dict):
+        raise SecurityProfileError("default_chat_params must be a JSON object mapping.")
+    for key in raw_params:
+        if not isinstance(key, str):
+            raise SecurityProfileError("default_chat_params keys must be strings.")
+        if key in RESERVED_CHAT_PARAM_KEYS:
+            raise SecurityProfileError(
+                f"default_chat_params cannot contain reserved key {key!r}."
+            )
+    if "chat_template_kwargs" in raw_params and not isinstance(
+        raw_params["chat_template_kwargs"], dict
+    ):
+        raise SecurityProfileError(
+            "default_chat_params 'chat_template_kwargs' must be a JSON object."
+        )
+    try:
+        serialized = json.dumps(raw_params, separators=(",", ":")).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise SecurityProfileError(
+            f"default_chat_params is not JSON-serializable: {exc}"
+        ) from exc
+    if len(serialized) > MAX_DEFAULT_CHAT_PARAMS_BYTES:
+        raise SecurityProfileError(
+            f"default_chat_params exceeds {MAX_DEFAULT_CHAT_PARAMS_BYTES} bytes ({len(serialized)} bytes)."
+        )
+    return copy.deepcopy(raw_params)
+
+
 class _WorkerTokenRelay:
     """In-process loopback HTTP relay that keeps se-session-* tokens outside the worker sandbox."""
 
@@ -2520,6 +2565,7 @@ class _WorkerTokenRelay:
         max_tokens_cap: int = 2048,
         upstream_timeout_seconds: float = 120.0,
         max_response_bytes: int = 16 * 1024 * 1024,
+        default_chat_params: dict[str, Any] | None = None,
     ) -> None:
         parsed = urlparse(upstream_base_url.rstrip("/"))
         if parsed.hostname not in ("127.0.0.1", "localhost") or parsed.port is None:
@@ -2537,6 +2583,7 @@ class _WorkerTokenRelay:
         self.max_tokens_cap = max(1, int(max_tokens_cap))
         self.upstream_timeout_seconds = max(1.0, float(upstream_timeout_seconds))
         self.max_response_bytes = max(4096, int(max_response_bytes))
+        self.default_chat_params = validate_default_chat_params(default_chat_params)
         self._lock = threading.Lock()
         self._inflight_sem = threading.BoundedSemaphore(16)
         self.chat_requests_used = 0
@@ -2675,6 +2722,20 @@ class _WorkerTokenRelay:
                         400, "Request body must be a JSON object.", "invalid_request_error"
                     )
                     return
+
+                # Merge non-overwriting default chat parameters (e.g. passthrough thinking=false / include_reasoning=false).
+                for k, default_val in relay.default_chat_params.items():
+                    if k == "chat_template_kwargs" and isinstance(default_val, dict):
+                        if k not in parsed_body or parsed_body[k] is None:
+                            parsed_body[k] = copy.deepcopy(default_val)
+                        elif isinstance(parsed_body[k], dict):
+                            merged_kw = dict(parsed_body[k])
+                            for sub_k, sub_v in default_val.items():
+                                if sub_k not in merged_kw:
+                                    merged_kw[sub_k] = copy.deepcopy(sub_v)
+                            parsed_body[k] = merged_kw
+                    elif k not in parsed_body:
+                        parsed_body[k] = copy.deepcopy(default_val)
 
                 # Clamp n (and best_of when present) to 1 so worst-case output spend is bounded to 1 completion per request.
                 if "n" in parsed_body:
@@ -3828,13 +3889,19 @@ def run_worker_sandbox_lifecycle(
                 group_clean = False
                 exit_code = 1
             else:
-                proc = actual_popen(
-                    list(cmd),
-                    cwd=str(cwd),
-                    env=dict(env),
-                    stdin=subprocess.DEVNULL,
-                    start_new_session=True,
-                )
+                try:
+                    proc = actual_popen(
+                        list(cmd),
+                        cwd=str(cwd),
+                        env=dict(env),
+                        stdin=subprocess.DEVNULL,
+                        start_new_session=True,
+                    )
+                except Exception:
+                    if teardown_fn is None:
+                        if not _clear_unconfirmed_group_marker(isolated_home):
+                            group_clean = False
+                    raise
                 cancel_state["proc"] = proc
                 owned_pgid = proc.pid
                 if teardown_fn is None:

@@ -118,12 +118,20 @@ cd /path/to/your/project
 /path/to/free-inference/scripts/opencode-attested -- run "Review the current git diff for security issues"
 ```
 
-To try another evaluated Rung 3 candidate (`tinfoil-kimi-k3-1-pro`, `tinfoil-glm-5-3`, or `tinfoil-gpt-oss-120b`), stop the active proxy on port `8081` and pass `--model <id> --allow-uncleared-model` (models with `deprecated: true` or a `deprecation_date` in `models.yaml`, such as `tinfoil-kimi-k3`, are blocked unless `--allow-deprecated-model` is also passed):
+To try another evaluated Rung 3 candidate (`tinfoil-kimi-k3-1-pro`, `tinfoil-glm-5-3`, or `tinfoil-gpt-oss-120b`), pass `--model <id> --allow-uncleared-model`. If another model is already serving on port `8081`, `opencode-attested` automatically allocates the next free side-by-side localhost port pair (`8082`/`9082`, `8083`/`9083`, ...) and writes an isolated per-invocation OpenCode config so both sessions run concurrently without interfering (models with `deprecated: true` or a `deprecation_date` in `models.yaml`, such as `tinfoil-kimi-k3`, are blocked unless `--allow-deprecated-model` is also passed):
 
 ```bash
-./scripts/stop-model tinfoil-deepseek-v4-1-flash
+# Runs side-by-side (automatically selects 127.0.0.1:8082 if 8081 is occupied by another model)
 ./scripts/opencode-attested --model tinfoil-kimi-k3-1-pro --allow-uncleared-model
+
+# Resume an interrupted session with fresh interactive caps (1,000 reqs / 16,384 output tokens)
+./scripts/opencode-attested --model tinfoil-kimi-k3-1-pro --allow-uncleared-model --refresh-session -- -c
+
+# Inspect all active model servers, bound ports, session caps, and remaining TTL
+./scripts/models --active
 ```
+
+See [`docs/runbooks.md`](docs/runbooks.md) for copy-paste operator runbooks covering multi-model side-by-side sessions, session recovery (`--refresh-session -- -c`), extended thinking (`--thinking`), subagents (`--allow-subagents`), and spend controls.
 
 ---
 
@@ -162,13 +170,13 @@ See [`SECURITY.md`](SECURITY.md) for the full threat model. Key operational boun
 
 | Command | Purpose |
 |---|---|
-| `./scripts/models` | List all models in `models.yaml` with data-control rung, status, and usage policy |
+| `./scripts/models` | List all models in `models.yaml` with data-control rung, status, and usage policy (`--active` / `--sessions` inspects live served models, ports, caps, and TTL; `--json` emits JSON) |
 | `./scripts/sync-model-catalog` | `--check` or `--apply` upstream model catalog drift against live enclave and Hugging Face sources |
-| `./scripts/serve-model <id>` | Start a local MLX server (`127.0.0.1:8080`) or dual attested proxy (`:8081` + `:9081`; `--refresh-session` restarts) |
+| `./scripts/serve-model <id>` | Start a local MLX server (`127.0.0.1:8080`) or dual attested proxy (`:8081` + `:9081`; `--interactive`, `--eval-caps`, `--thinking`, `--port`, `--refresh-session`) |
 | `./scripts/verify-served-model <id>` | Verify active PID records (`pid_lstart`), `/v1/models`, and OS listener `--model` flags (`--require-offline` for Rung 1) |
 | `./scripts/stop-model <id>` | Stop a running model server or proxy after verifying `pid_lstart` (`--all` stops all) |
-| `./scripts/opencode-local` | Launch OpenCode locked to Rung 1 (`private-local`) with isolated state and Rung 1 MCP (`--refresh-session` restarts) |
-| `./scripts/opencode-attested` | Launch OpenCode locked to Rung 2/3 (`private-attested`) with spend caps (`--max-session-usd`, `--refresh-session`) and Rung 1 MCP |
+| `./scripts/opencode-local` | Launch OpenCode locked to Rung 1 (`private-local`) with isolated state and Rung 1 MCP (`--port`, `--allow-subagents`, `--refresh-session`) |
+| `./scripts/opencode-attested` | Launch OpenCode locked to Rung 2/3 (`private-attested`) with spend caps (`--max-session-usd`, `--thinking`, `--allow-subagents`, `--port`, `--refresh-session`) and Rung 1 MCP |
 | `./scripts/delegate-local <tool>` | Delegate bounded subtasks (`delegate_task`, `compress_context`, `extract_fields`, `propose_eval_prompts`) to Rung 1 |
 | `./scripts/se-key <cmd> <service>` | Build `bin/se-key-proxy` (also buildable standalone via `swift build --package-path tools/se_key_proxy -c release`), run `selftest`, or `store` / `migrate` / `status` / `delete` Secure Enclave keys |
 | `./scripts/eval <suite> <id>` | Run `sanity`, `v1`, or `tools` promptfoo suites plus streaming TTFT probe |

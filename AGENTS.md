@@ -5,6 +5,7 @@
 Read these documents before making changes:
 
 - [`README.md`](README.md): quick start, CLI reference, 5-rung ladder, and platform support matrix.
+- [`docs/runbooks.md`](docs/runbooks.md): operator runbooks for daily coding, side-by-side multi-model sessions, session recovery (`--refresh-session -- -c`), extended thinking (`--thinking`), subagents (`--allow-subagents`), and active session inspection (`./scripts/models --active`).
 - [`SECURITY.md`](SECURITY.md): threat model, credential isolation, and residual operational boundaries.
 - [`docs/proposal.md`](docs/proposal.md): 5-rung architecture (`local`, `enclave_weights_attested`, `enclave_runtime_attested`, `zdr_contract`, `standard_api`) and settled design decisions.
 - [`docs/plan.md`](docs/plan.md): evaluation workbench design, provenance review gates, and capability suites (`sanity`, `v1`, `tools`).
@@ -33,12 +34,12 @@ Read these documents before making changes:
 ## Everyday Commands
 
 - Bootstrap & verify dependencies: `./scripts/setup`
-- List registered models: `./scripts/models`
+- List registered models: `./scripts/models` (or inspect active served sessions, ports, caps, and TTL with `./scripts/models --active [--json]`)
 - Check or heal upstream model catalog drift (also tracked weekly via `.github/workflows/catalog-sync.yml` issues on `https://github.com/HakAl/free-inference/issues` or `gh issue list --repo HakAl/free-inference --state open`):
   - `./scripts/sync-model-catalog --check`
   - `./scripts/sync-model-catalog --apply`
 - Launch Rung 1 local coding session (from target project directory): `/path/to/free-inference/scripts/opencode-local` (pass `--refresh-session` to restart the server)
-- Launch Rung 3 attested enclave coding session (from target project directory): `/path/to/free-inference/scripts/opencode-attested` (pass `--refresh-session` to renew the 12h Touch ID proxy session)
+- Launch Rung 3 attested enclave coding session (from target project directory): `/path/to/free-inference/scripts/opencode-attested` (pass `--refresh-session` to renew the 12h Touch ID proxy session, `--thinking` to enable reasoning traces, `--allow-subagents` to opt into OpenCode subagents, or `--port <port>` to pin a custom port)
 - Launch unattended sandboxed worker (Rung 1 or Rung 3):
   - `/path/to/free-inference/scripts/opencode-local --unattended-worker -- run --format json "<prompt>"`
   - `/path/to/free-inference/scripts/opencode-attested --security-profile <profile.yaml> --max-session-usd 0.50 -- run --format json "<prompt>"`

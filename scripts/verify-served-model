@@ -146,8 +146,6 @@ def verify_pid_record_matches(
     matched_local_offline = False
     for _, rec in deduplicated_pid_records(runs_dir):
         rec_port = rec.get("port", 8080)
-        if rec_port != endpoint.port:
-            continue
         rec_pid = rec.get("pid")
         rec_up_pid = rec.get("upstream_pid")
         rec_status = rec.get("status")
@@ -165,6 +163,14 @@ def verify_pid_record_matches(
 
         rec_model_id = rec.get("model_id")
         rec_repo = rec.get("repo")
+        if rec_port != endpoint.port:
+            if rec_model_id == endpoint.model_id:
+                return (
+                    False,
+                    f"served model port mismatch for '{endpoint.model_id}': active PID record is serving on "
+                    f"port {rec_port} (status={rec_status or 'ready'}, pid={rec_pid}), not requested port {endpoint.port}",
+                )
+            continue
         if (rec_model_id and rec_model_id != endpoint.model_id) or (
             rec_repo and rec_repo != endpoint.served_model_id
         ):
@@ -386,12 +392,23 @@ def main(argv: list[str]) -> int:
         action="store_true",
         help="Reject local model servers started with --allow-hf-online (hf_offline=False).",
     )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Expected local port (overrides models.yaml and PID record default).",
+    )
     args = parser.parse_args(argv[1:])
 
     try:
         model = load_model(args.model_id)
         initial_pid_record = read_pid_record_for_model(args.model_id)
-        endpoint_meta = resolve_endpoint(model, pid_record=initial_pid_record, require_api_key=False)
+        endpoint_meta = resolve_endpoint(
+            model,
+            pid_record=initial_pid_record,
+            require_api_key=False,
+            port_override=args.port,
+        )
     except RegistryError as exc:
         print(str(exc), file=sys.stderr)
         return EXIT_UNREACHABLE
@@ -408,7 +425,12 @@ def main(argv: list[str]) -> int:
 
         pid_record = read_pid_record_for_model(args.model_id)
         try:
-            endpoint = resolve_endpoint(model, pid_record=pid_record, require_api_key=True)
+            endpoint = resolve_endpoint(
+                model,
+                pid_record=pid_record,
+                require_api_key=True,
+                port_override=args.port,
+            )
         except RegistryError as exc:
             if time.monotonic() >= deadline:
                 print(str(exc), file=sys.stderr)

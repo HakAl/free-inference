@@ -3511,6 +3511,241 @@ class SEKeyTests(unittest.TestCase):
             self.assertEqual(list(preexisting_build_dir.iterdir()), [sentinel_file])
             self.assertEqual((pkg_dir / ".build").exists(), had_repo_dot_build)
 
+    def test_default_chat_params_json_merge_validation_and_post_merge_size_cap(self) -> None:
+        session_token = "se-session-" + ("c" * 64)
+        real_api_key = "tf-default-params-secret-9999"
+        allowed_model = "kimi-k3-1-pro"
+
+        # 1. Startup validation: reject reserved keys, invalid JSON, non-object JSON, and >4096-byte JSON (exit 2)
+        for bad_json in (
+            "not-json",
+            "[]",
+            json.dumps({"model": "evil"}),
+            json.dumps({"messages": []}),
+            json.dumps({"max_tokens": 999999}),
+            json.dumps({"max_completion_tokens": 999999}),
+            json.dumps({"maxOutputTokens": 999999}),
+            json.dumps({"n": 5}),
+            json.dumps({"best_of": 5}),
+            json.dumps({"stream": True}),
+            json.dumps({"pad": "x" * 4100}),
+        ):
+            cp = subprocess.run(
+                [
+                    str(TEST_BINARY_PATH),
+                    "proxy",
+                    "--service",
+                    "free-inference.test",
+                    "--listen-host",
+                    "127.0.0.1",
+                    "--listen-port",
+                    str(_free_port()),
+                    "--upstream-url",
+                    f"http://127.0.0.1:{_free_port()}/v1",
+                    "--upstream-pid",
+                    str(os.getpid()),
+                    "--allowed-model",
+                    allowed_model,
+                    "--default-chat-params-json",
+                    bad_json,
+                ],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
+            self.assertEqual(cp.returncode, 2, f"Expected exit 2 for {bad_json[:80]!r}, got {cp.returncode}: {cp.stderr}")
+
+        # 2. Live proxy forwarding: verify non-overwriting merge of top-level + nested chat_template_kwargs,
+        #    preservation of explicit client overrides, and post-merge canonicalBody.count > maxRequestBytes
+        #    rejection (413 payload_too_large) BEFORE incrementing chatRequestsUsed.
+        received_bodies: list[dict[str, object]] = []
+
+        class _DefaultParamsUpstreamHandler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self) -> None:
+                length = int(self.headers.get("Content-Length", "0"))
+                raw = self.rfile.read(length)
+                received_bodies.append(json.loads(raw.decode("utf-8")))
+                resp = json.dumps(
+                    {
+                        "id": "chatcmpl-test",
+                        "object": "chat.completion",
+                        "model": allowed_model,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {"role": "assistant", "content": "ok"},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                    }
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(resp)))
+                self.end_headers()
+                self.wfile.write(resp)
+
+            def log_message(self, format: str, *args: object) -> None:
+                return
+
+        upstream_srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _DefaultParamsUpstreamHandler)
+        upstream_port = int(upstream_srv.server_address[1])
+        threading.Thread(target=upstream_srv.serve_forever, daemon=True).start()
+
+        default_params = {
+            "chat_template_kwargs": {"thinking": False, "enable_thinking": False},
+            "reasoning_effort": "none",
+            "include_reasoning": False,
+        }
+        p_port = _free_port()
+        tok_r, tok_w = os.pipe()
+        key_r, key_w = os.pipe()
+        ready_r, ready_w = os.pipe()
+        os.write(tok_w, (session_token + "\n").encode("utf-8"))
+        os.close(tok_w)
+        os.write(key_w, (real_api_key + "\n").encode("utf-8"))
+        os.close(key_w)
+
+        # Set max_request_bytes=320 and max_chat_requests=2 so a raw body of 220 bytes that expands
+        # above 320 bytes after merging default_chat_params is rejected with 413 without consuming
+        # Either of the 2 allowed chat requests!
+        proc = subprocess.Popen(
+            [
+                str(TEST_BINARY_PATH),
+                "proxy",
+                "--service",
+                "free-inference.test",
+                "--listen-host",
+                "127.0.0.1",
+                "--listen-port",
+                str(p_port),
+                "--upstream-url",
+                f"http://127.0.0.1:{upstream_port}/v1",
+                "--upstream-pid",
+                str(os.getpid()),
+                "--allowed-model",
+                allowed_model,
+                "--max-chat-requests",
+                "2",
+                "--max-request-bytes",
+                "320",
+                "--max-tokens-cap",
+                "512",
+                "--default-chat-params-json",
+                json.dumps(default_params),
+                "--session-token-fd",
+                str(tok_r),
+                "--ready-fd",
+                str(ready_w),
+                "--test-ephemeral-key-fd",
+                str(key_r),
+            ],
+            pass_fds=(tok_r, key_r, ready_w),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        os.close(tok_r)
+        os.close(key_r)
+        os.close(ready_w)
+        try:
+            ready_data = os.read(ready_r, 256)
+            os.close(ready_r)
+            self.assertEqual(json.loads(ready_data.decode("utf-8"))["status"], "ready")
+
+            # (a) Raw body is <= 320 bytes (~230 bytes), but after merging default_params + max_tokens + n + best_of
+            #     canonicalBody exceeds 320 bytes -> HTTP 413 payload_too_large and 0 upstream calls!
+            borderline_body = json.dumps(
+                {
+                    "model": allowed_model,
+                    "messages": [{"role": "user", "content": "x" * 160}],
+                }
+            ).encode("utf-8")
+            self.assertLessEqual(len(borderline_body), 320)
+            req_big = Request(
+                f"http://127.0.0.1:{p_port}/v1/chat/completions",
+                data=borderline_body,
+                headers={
+                    "Authorization": f"Bearer {session_token}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            with self.assertRaises(HTTPError) as ctx_413:
+                urlopen(req_big, timeout=3)
+            self.assertEqual(ctx_413.exception.code, 413)
+            err_413 = json.loads(ctx_413.exception.read().decode("utf-8"))
+            ctx_413.exception.close()
+            self.assertEqual(err_413["error"]["code"], "payload_too_large")
+            self.assertEqual(len(received_bodies), 0)
+
+            # (b) Request 1: compact body without thinking params -> defaults injected
+            body_1 = json.dumps(
+                {
+                    "model": allowed_model,
+                    "messages": [{"role": "user", "content": "hi"}],
+                }
+            ).encode("utf-8")
+            req_1 = Request(
+                f"http://127.0.0.1:{p_port}/v1/chat/completions",
+                data=body_1,
+                headers={
+                    "Authorization": f"Bearer {session_token}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            with urlopen(req_1, timeout=3) as resp_1:
+                self.assertEqual(resp_1.status, 200)
+            self.assertEqual(len(received_bodies), 1)
+            self.assertEqual(received_bodies[0].get("reasoning_effort"), "none")
+            self.assertIs(received_bodies[0].get("include_reasoning"), False)
+            self.assertEqual(
+                received_bodies[0].get("chat_template_kwargs"),
+                {"thinking": False, "enable_thinking": False},
+            )
+
+            # (c) Request 2 (proving the 413 above did NOT consume a chat request slot!):
+            #     client explicitly overrides include_reasoning=True and chat_template_kwargs.thinking=True
+            body_2 = json.dumps(
+                {
+                    "model": allowed_model,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "include_reasoning": True,
+                    "chat_template_kwargs": {"thinking": True},
+                }
+            ).encode("utf-8")
+            req_2 = Request(
+                f"http://127.0.0.1:{p_port}/v1/chat/completions",
+                data=body_2,
+                headers={
+                    "Authorization": f"Bearer {session_token}",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            with urlopen(req_2, timeout=3) as resp_2:
+                self.assertEqual(resp_2.status, 200)
+            self.assertEqual(len(received_bodies), 2)
+            self.assertIs(received_bodies[1].get("include_reasoning"), True)
+            self.assertEqual(received_bodies[1].get("reasoning_effort"), "none")
+            self.assertEqual(
+                received_bodies[1].get("chat_template_kwargs"),
+                {"thinking": True, "enable_thinking": False},
+            )
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+            if proc.stdout:
+                proc.stdout.close()
+            if proc.stderr:
+                proc.stderr.close()
+            upstream_srv.shutdown()
+            upstream_srv.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

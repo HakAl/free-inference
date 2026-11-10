@@ -23,10 +23,14 @@ from local_assist.launch import (
     EXIT_MODEL_MISMATCH,
     SAFE_ENV_ALLOWLIST,
     add_common_launcher_arguments,
+    allocate_side_by_side_port,
     build_isolated_opencode_env,
     check_endpoint_lifecycle_status,
     execute_worker_profile_session,
+    is_port_owned_by_different_active_model,
     json_escape as _json_escape,
+    pid_record_is_live_or_starting,
+    publish_and_run_opencode,
     resolve_active_security_profile as _resolve_active_security_profile,
     split_launcher_argv,
     sync_and_run_opencode,
@@ -116,6 +120,7 @@ def render_private_local_config(
     context_limit: int = DEFAULT_CONTEXT_LIMIT,
     output_limit: int = DEFAULT_OUTPUT_LIMIT,
     edit_permission: str = "ask",
+    allow_subagents: bool = False,
     lab_python: Path | None = None,
     lab_root: Path | None = None,
     workspace_dir: Path | None = None,
@@ -134,6 +139,8 @@ def render_private_local_config(
     effective_python = lab_python or (VENV_PYTHON if VENV_PYTHON.exists() else Path(sys.executable))
     effective_root = lab_root or ROOT
     effective_workspace = (workspace_dir or Path.cwd()).resolve()
+    subagent_enabled = "true" if allow_subagents else "false"
+    subagent_permission = "allow" if allow_subagents else "deny"
 
     rendered = (
         tmpl.replace("__API_BASE_URL__", _json_escape(effective_base_url))
@@ -143,6 +150,8 @@ def render_private_local_config(
         .replace("__CONTEXT_LIMIT__", str(int(context_limit)))
         .replace("__OUTPUT_LIMIT__", str(int(output_limit)))
         .replace("__EDIT_PERMISSION__", _json_escape(edit_permission))
+        .replace("__SUBAGENT_ENABLED__", subagent_enabled)
+        .replace("__SUBAGENT_PERMISSION__", subagent_permission)
         .replace("__LAB_PYTHON__", _json_escape(effective_python))
         .replace("__LAB_ROOT__", _json_escape(effective_root))
         .replace("__WORKSPACE_DIR__", _json_escape(effective_workspace))
@@ -178,6 +187,7 @@ def ensure_model_served(
     no_serve: bool = False,
     refresh_session: bool = False,
     wait_seconds: float = DEFAULT_WAIT_SECONDS,
+    explicit_port: int | None = None,
     runs_dir: Path | None = None,
     run_cmd: Any = subprocess.run,
 ) -> tuple[bool, str | None]:
@@ -191,8 +201,20 @@ def ensure_model_served(
     serve_script = str(ROOT / "scripts" / "serve-model")
     stop_script = str(ROOT / "scripts" / "stop-model")
 
+    pre_refresh_rec = read_pid_record_for_model(endpoint.model_id, runs_dir)
+    rec_port_val = (pre_refresh_rec or {}).get("port")
+    if explicit_port is not None:
+        target_port: int | None = explicit_port
+    elif isinstance(rec_port_val, int) and not isinstance(rec_port_val, bool):
+        target_port = int(rec_port_val)
+    else:
+        target_port = endpoint.port
+
+    initial_verify_cmd = [verify_script, endpoint.model_id, "--require-offline"]
+    if target_port is not None:
+        initial_verify_cmd.extend(["--port", str(target_port)])
     initial = run_cmd(
-        [verify_script, endpoint.model_id, "--require-offline"],
+        initial_verify_cmd,
         cwd=str(ROOT),
         capture_output=True,
         text=True,
@@ -203,16 +225,46 @@ def ensure_model_served(
 
     initial_err = (initial.stderr or initial.stdout or "").strip()
     if initial.returncode == EXIT_MODEL_MISMATCH:
-        return (
-            False,
-            f"Refusing to launch private-local: another model is already serving "
-            f"(or active server was started with --allow-hf-online) at "
-            f"{endpoint.api_base_url} ({initial_err}). Stop the active model first "
-            "with ./scripts/stop-model <active-model-id>.",
+        check_port = target_port if target_port is not None else endpoint.port
+        owned_by_other, owner_mid = is_port_owned_by_different_active_model(
+            endpoint.model_id,
+            check_port,
+            runs_dir=runs_dir,
         )
+        if owned_by_other and not no_serve and explicit_port is None:
+            try:
+                target_port = allocate_side_by_side_port(
+                    check_port,
+                    uses_upstream_port=False,
+                    runs_dir=runs_dir,
+                )
+            except LocalAssistError as exc:
+                return False, str(exc)
+            print(
+                f"Port {check_port} is actively serving '{owner_mid}'; "
+                f"starting '{endpoint.model_id}' side-by-side on 127.0.0.1:{target_port}.",
+                file=sys.stderr,
+            )
+        elif (
+            refresh_session
+            and not no_serve
+            and not owned_by_other
+            and pre_refresh_rec is not None
+        ):
+            pass
+        else:
+            return (
+                False,
+                f"Refusing to launch private-local: another model is already serving "
+                f"(or active server was started with --allow-hf-online) at "
+                f"{endpoint.api_base_url} ({initial_err}). Stop the active model first "
+                "with ./scripts/stop-model <active-model-id>.",
+            )
 
     if refresh_session and (
-        initial.returncode == 0 or read_pid_record_for_model(endpoint.model_id, runs_dir) is not None
+        initial.returncode == 0
+        or pre_refresh_rec is not None
+        or read_pid_record_for_model(endpoint.model_id, runs_dir) is not None
     ):
         stop_res = run_cmd(
             [stop_script, endpoint.model_id],
@@ -236,6 +288,8 @@ def ensure_model_served(
         )
 
     serve_cmd = [serve_script, endpoint.model_id]
+    if target_port is not None:
+        serve_cmd.extend(["--port", str(target_port)])
     if refresh_session:
         serve_cmd.append("--refresh-session")
     serve_res = run_cmd(
@@ -249,8 +303,17 @@ def ensure_model_served(
         serve_err = (serve_res.stderr or serve_res.stdout or "").strip()
         return False, f"Failed to start model '{endpoint.model_id}': {serve_err}"
 
+    wait_verify_cmd = [
+        verify_script,
+        endpoint.model_id,
+        "--wait",
+        str(wait_seconds),
+        "--require-offline",
+    ]
+    if target_port is not None:
+        wait_verify_cmd.extend(["--port", str(target_port)])
     wait_res = run_cmd(
-        [verify_script, endpoint.model_id, "--wait", str(wait_seconds), "--require-offline"],
+        wait_verify_cmd,
         cwd=str(ROOT),
         capture_output=True,
         text=True,
@@ -340,10 +403,36 @@ def main(argv: list[str]) -> int:
         else args.allow_uncleared_model
     )
 
+    explicit_port = getattr(args, "port", None)
+    refresh_session = bool(getattr(args, "refresh_session", False))
+
     try:
         model = load_model(args.model)
         pid_record = read_pid_record_for_model(args.model)
-        endpoint = resolve_endpoint(model, pid_record=pid_record, require_api_key=False)
+        if explicit_port is not None and isinstance(pid_record, dict):
+            init_active, init_unavail = pid_record_is_live_or_starting(pid_record)
+            rec_port = pid_record.get("port")
+            if (init_active or init_unavail) and isinstance(rec_port, int) and rec_port != explicit_port:
+                if args.no_serve:
+                    print(
+                        f"Refusing --port {explicit_port} with --no-serve: model '{args.model}' is "
+                        f"currently served on port {rec_port}.",
+                        file=sys.stderr,
+                    )
+                    return 1
+                if not refresh_session:
+                    print(
+                        f"Model '{args.model}' is already served on port {rec_port}; pass "
+                        f"--refresh-session (--restart) with --port {explicit_port} to move it.",
+                        file=sys.stderr,
+                    )
+                    return 1
+        endpoint = resolve_endpoint(
+            model,
+            pid_record=pid_record if not (refresh_session and explicit_port is not None) else None,
+            require_api_key=False,
+            port_override=explicit_port,
+        )
         validate_private_local_endpoint(
             endpoint,
             allow_uncleared_model=effective_allow_uncleared,
@@ -370,14 +459,36 @@ def main(argv: list[str]) -> int:
         print(worker_err or "Worker preflight validation failed", file=sys.stderr)
         return 1
 
+    ensure_kwargs: dict[str, Any] = {
+        "no_serve": args.no_serve,
+        "refresh_session": refresh_session,
+        "wait_seconds": args.wait,
+    }
+    if explicit_port is not None:
+        ensure_kwargs["explicit_port"] = explicit_port
     ok, err_msg = ensure_model_served(
         endpoint,
-        no_serve=args.no_serve,
-        refresh_session=bool(getattr(args, "refresh_session", False)),
-        wait_seconds=args.wait,
+        **ensure_kwargs,
     )
     if not ok:
         print(err_msg or "Failed to verify served model", file=sys.stderr)
+        return 1
+
+    active_pid_record = read_pid_record_for_model(args.model)
+    try:
+        endpoint = resolve_endpoint(
+            model,
+            pid_record=active_pid_record,
+            require_api_key=False,
+            port_override=explicit_port if active_pid_record is None else None,
+        )
+        validate_private_local_endpoint(
+            endpoint,
+            allow_uncleared_model=effective_allow_uncleared,
+            allow_deprecated_model=bool(getattr(args, "allow_deprecated_model", False)),
+        )
+    except (RegistryError, LocalAssistError) as exc:
+        print(str(exc), file=sys.stderr)
         return 1
 
     if active_profile is not None:
@@ -394,6 +505,7 @@ def main(argv: list[str]) -> int:
                     context_limit=args.context_limit,
                     output_limit=args.output_limit,
                     edit_permission="allow",
+                    allow_subagents=active_profile.allow_subagents,
                     workspace_dir=caller_cwd,
                 )
             ),
@@ -415,53 +527,44 @@ def main(argv: list[str]) -> int:
         (isolated_home / subdir).mkdir(parents=True, exist_ok=True)
 
     edit_permission = "allow" if args.allow_edit else "ask"
+    allow_subagents = bool(getattr(args, "allow_subagents", False))
     config_text = render_private_local_config(
         endpoint,
         context_limit=args.context_limit,
         output_limit=args.output_limit,
         edit_permission=edit_permission,
+        allow_subagents=allow_subagents,
         workspace_dir=caller_cwd,
     )
-    opencode_config_path = isolated_home / "opencode.json"
-    opencode_config_path.write_text(config_text)
 
-    env = build_private_local_env(
-        caller_cwd,
-        isolated_home,
-        opencode_config_path,
-        endpoint,
-        preserve_host_home=args.preserve_host_home,
-    )
-
-    if args.print_config:
-        print(
-            json.dumps(
-                {
-                    "model_id": endpoint.model_id,
-                    "served_model_id": endpoint.served_model_id,
-                    "api_base_url": endpoint.api_base_url,
-                    "opencode_config_path": str(opencode_config_path),
-                    "isolated_home": str(isolated_home),
-                    "config": json.loads(config_text),
-                },
-                indent=2,
-            )
-        )
-        return 0
-
-    assert opencode_bin is not None
-    active_pid_record = read_pid_record_for_model(args.model)
     current_sync = {
         "model_id": endpoint.model_id,
         "startup_nonce": (active_pid_record or {}).get("startup_nonce"),
     }
-    return sync_and_run_opencode(
-        opencode_bin,
-        opencode_args,
+    return publish_and_run_opencode(
+        opencode_bin=opencode_bin,
+        opencode_args=opencode_args,
         caller_cwd=caller_cwd,
         isolated_home=isolated_home,
-        env=env,
+        endpoint=endpoint,
+        config_text=config_text,
+        build_env_fn=lambda cfg_path: build_private_local_env(
+            caller_cwd,
+            isolated_home,
+            cfg_path,
+            endpoint,
+            preserve_host_home=args.preserve_host_home,
+        ),
         current_sync=current_sync,
+        print_config=args.print_config,
+        build_print_config_payload_fn=lambda cfg_path, cfg_dict: {
+            "model_id": endpoint.model_id,
+            "served_model_id": endpoint.served_model_id,
+            "api_base_url": endpoint.api_base_url,
+            "opencode_config_path": str(cfg_path),
+            "isolated_home": str(isolated_home),
+            "config": cfg_dict,
+        },
     )
 
 

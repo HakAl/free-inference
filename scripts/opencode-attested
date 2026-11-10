@@ -25,12 +25,19 @@ from local_assist.client import check_private_coding_admission
 from local_assist.errors import LocalAssistError
 from local_assist.launch import (
     EXIT_MODEL_MISMATCH,
+    INTERACTIVE_MIN_CHAT_REQUESTS,
+    INTERACTIVE_MIN_MAX_TOKENS,
+    INTERACTIVE_MIN_REQUEST_BYTES,
     SAFE_ENV_ALLOWLIST,
     add_common_launcher_arguments,
+    allocate_side_by_side_port,
     build_isolated_opencode_env,
     check_endpoint_lifecycle_status,
     execute_worker_profile_session,
+    is_port_owned_by_different_active_model,
     json_escape as _json_escape,
+    pid_record_is_live_or_starting,
+    publish_and_run_opencode,
     resolve_active_security_profile as _resolve_active_security_profile,
     split_launcher_argv,
     sync_and_run_opencode,
@@ -66,6 +73,9 @@ DEFAULT_TTL_SECONDS = 43200
 DEFAULT_STREAM_TIMEOUT_SECONDS = 300
 DEFAULT_MAX_SESSION_USD: float | None = None
 MIN_ATTACHED_REQUEST_BYTES = 65536
+MIN_INTERACTIVE_CHAT_REQUESTS = 200
+MIN_INTERACTIVE_TOKENS_CAP = 8192
+MIN_INTERACTIVE_REQUEST_BYTES = 2097152
 WORST_CASE_BYTES_PER_TOKEN = 3.0
 RUNG1_LOCAL_ASSIST_BASE_URL = "http://127.0.0.1:8080/v1"
 
@@ -420,6 +430,14 @@ def format_session_banner(
         f"[private-attested] Session caps: max_chat_requests={session_meta['max_chat_requests']} (includes small_model title requests), max_tokens_cap={session_meta['max_tokens_cap']}, max_request_bytes={session_meta['max_request_bytes']}, ttl_seconds={ttl_str}",
         f"[private-attested] Pricing: ${session_meta['input_price_per_m']:.2f}/1M input, ${session_meta['output_price_per_m']:.2f}/1M output ({ceiling_str})",
     ]
+    if session_meta.get("low_caps_warning"):
+        lines.append(
+            f"[private-attested] WARNING: Attached session has eval-sized caps "
+            f"(max_chat_requests={session_meta['max_chat_requests']}, "
+            f"max_tokens_cap={session_meta['max_tokens_cap']}, "
+            f"max_request_bytes={session_meta['max_request_bytes']}). "
+            f"For interactive coding, run: ./scripts/opencode-attested --model {endpoint.model_id} --refresh-session"
+        )
     if session_meta.get("attached"):
         lines.append(
             "[private-attested] To refresh the 12h session: ./scripts/opencode-attested --refresh-session"
@@ -436,6 +454,7 @@ def render_private_attested_config(
     max_tokens_cap: int | None = None,
     max_request_bytes: int | None = None,
     edit_permission: str = "ask",
+    allow_subagents: bool = False,
     lab_python: Path | None = None,
     lab_root: Path | None = None,
     workspace_dir: Path | None = None,
@@ -465,6 +484,8 @@ def render_private_attested_config(
     effective_root = lab_root or ROOT
     effective_workspace = (workspace_dir or Path.cwd()).resolve()
     trust_label = f"Rung {endpoint.data_control_rung} {endpoint.trust_tier}"
+    subagent_enabled_str = "true" if allow_subagents else "false"
+    subagent_perm_str = "allow" if allow_subagents else "deny"
 
     rendered = (
         tmpl.replace("__API_BASE_URL__", _json_escape(effective_base_url))
@@ -475,6 +496,8 @@ def render_private_attested_config(
         .replace("__CONTEXT_LIMIT__", str(int(effective_context_limit)))
         .replace("__OUTPUT_LIMIT__", str(int(effective_output_limit)))
         .replace("__EDIT_PERMISSION__", _json_escape(edit_permission))
+        .replace("__SUBAGENT_ENABLED__", subagent_enabled_str)
+        .replace("__SUBAGENT_PERMISSION__", _json_escape(subagent_perm_str))
         .replace("__LAB_PYTHON__", _json_escape(effective_python))
         .replace("__LAB_ROOT__", _json_escape(effective_root))
         .replace("__WORKSPACE_DIR__", _json_escape(effective_workspace))
@@ -526,6 +549,10 @@ def ensure_model_served(
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
     stream_timeout_seconds: int = DEFAULT_STREAM_TIMEOUT_SECONDS,
     max_session_usd: float | None = DEFAULT_MAX_SESSION_USD,
+    explicit_port: int | None = None,
+    explicit_cap_flags: Any = (),
+    thinking: bool = False,
+    explicit_thinking: bool = False,
     runs_dir: Path | None = None,
     run_cmd: Any = subprocess.run,
 ) -> tuple[bool, str | None, dict[str, Any] | None]:
@@ -553,8 +580,25 @@ def ensure_model_served(
     serve_script = str(ROOT / "scripts" / "serve-model")
     stop_script = str(ROOT / "scripts" / "stop-model")
 
+    pre_refresh_rec = read_pid_record_for_model(endpoint.model_id, runs_dir)
+    rec_port_val = (pre_refresh_rec or {}).get("port")
+    if explicit_port is not None:
+        target_port: int | None = explicit_port
+    elif isinstance(rec_port_val, int) and not isinstance(rec_port_val, bool):
+        target_port = int(rec_port_val)
+    else:
+        target_port = endpoint.port
+    effective_refresh = bool(refresh_session)
+    serve_reqs = max_chat_requests
+    serve_tokens = max_tokens_cap
+    serve_bytes = max_request_bytes
+    serve_ttl = ttl_seconds
+
+    initial_verify_cmd = [verify_script, endpoint.model_id]
+    if target_port is not None:
+        initial_verify_cmd.extend(["--port", str(target_port)])
     initial = run_cmd(
-        [verify_script, endpoint.model_id],
+        initial_verify_cmd,
         cwd=str(ROOT),
         capture_output=True,
         text=True,
@@ -616,29 +660,108 @@ def ensure_model_served(
             )
         except LocalAssistError as exc:
             return False, str(exc), None
-        return (
-            True,
-            None,
-            {
-                **attached_est,
-                "attached": True,
-                "ttl_seconds": rec_ttl,
-                "started_at": (active_rec or {}).get("started_at"),
-            },
+
+        has_low_caps = (
+            rec_max_reqs < MIN_INTERACTIVE_CHAT_REQUESTS
+            or rec_max_tokens < MIN_INTERACTIVE_TOKENS_CAP
+            or rec_max_bytes < MIN_INTERACTIVE_REQUEST_BYTES
         )
+        has_explicit_cap_arg = (
+            bool(explicit_cap_flags)
+            or max_chat_requests != DEFAULT_MAX_CHAT_REQUESTS
+            or max_tokens_cap != DEFAULT_MAX_TOKENS_CAP
+            or max_request_bytes != DEFAULT_MAX_REQUEST_BYTES
+            or ttl_seconds != DEFAULT_TTL_SECONDS
+        )
+        cap_auto_upgrade_needed = (not has_explicit_cap_arg) and has_low_caps
+        rec_thinking = bool((active_rec or {}).get("thinking_enabled", False))
+        thinking_auto_upgrade_needed = bool(explicit_thinking) and (
+            rec_thinking != bool(thinking)
+        )
+        active_port = int((active_rec or {}).get("port") or endpoint.port)
+
+        if (cap_auto_upgrade_needed or thinking_auto_upgrade_needed) and not no_serve:
+            target_port = active_port
+            effective_refresh = True
+            if cap_auto_upgrade_needed:
+                serve_reqs = max_chat_requests
+                serve_tokens = max_tokens_cap
+                serve_bytes = max_request_bytes
+                serve_ttl = ttl_seconds
+                print(
+                    f"[private-attested] Active session for '{endpoint.model_id}' on port {active_port} "
+                    f"has eval caps (max_chat_requests={rec_max_reqs}, max_tokens_cap={rec_max_tokens}, "
+                    f"max_request_bytes={rec_max_bytes}); refreshing with interactive caps "
+                    f"({serve_reqs} reqs, {serve_tokens} tokens, {serve_bytes} bytes)...",
+                    file=sys.stderr,
+                )
+            else:
+                serve_reqs = rec_max_reqs
+                serve_tokens = rec_max_tokens
+                serve_bytes = rec_max_bytes
+                serve_ttl = rec_ttl
+                print(
+                    f"[private-attested] Refreshing session for '{endpoint.model_id}' on port {active_port} "
+                    f"to set thinking={bool(thinking)}...",
+                    file=sys.stderr,
+                )
+        else:
+            return (
+                True,
+                None,
+                {
+                    **attached_est,
+                    "attached": True,
+                    "ttl_seconds": rec_ttl,
+                    "started_at": (active_rec or {}).get("started_at"),
+                    "low_caps_warning": bool(has_low_caps),
+                    "thinking_enabled": rec_thinking,
+                    "allocated_port": active_port,
+                },
+            )
 
     initial_err = (initial.stderr or initial.stdout or "").strip()
     if initial.returncode == EXIT_MODEL_MISMATCH:
-        return (
-            False,
-            f"Refusing to launch private-attested: another model is already serving at "
-            f"{endpoint.api_base_url} ({initial_err}). Stop the active model first "
-            "with ./scripts/stop-model <active-model-id>.",
-            None,
+        check_port = target_port if target_port is not None else endpoint.port
+        owned_by_other, owner_mid = is_port_owned_by_different_active_model(
+            endpoint.model_id,
+            check_port,
+            runs_dir=runs_dir,
         )
+        if owned_by_other and not no_serve and explicit_port is None:
+            try:
+                target_port = allocate_side_by_side_port(
+                    check_port,
+                    uses_upstream_port=True,
+                    runs_dir=runs_dir,
+                )
+            except LocalAssistError as exc:
+                return False, str(exc), None
+            print(
+                f"[private-attested] Port {check_port} is active for '{owner_mid}'; "
+                f"allocating side-by-side port {target_port} (upstream {target_port + 1000}) for '{endpoint.model_id}'.",
+                file=sys.stderr,
+            )
+        elif (
+            refresh_session
+            and not no_serve
+            and not owned_by_other
+            and pre_refresh_rec is not None
+        ):
+            pass
+        else:
+            return (
+                False,
+                f"Refusing to launch private-attested: another model is already serving at "
+                f"{endpoint.api_base_url} ({initial_err}). Stop the active model first "
+                "with ./scripts/stop-model <active-model-id>.",
+                None,
+            )
 
     if refresh_session and (
-        initial.returncode == 0 or read_pid_record_for_model(endpoint.model_id, runs_dir) is not None
+        initial.returncode == 0
+        or pre_refresh_rec is not None
+        or read_pid_record_for_model(endpoint.model_id, runs_dir) is not None
     ):
         stop_res = run_cmd(
             [stop_script, endpoint.model_id],
@@ -667,17 +790,21 @@ def ensure_model_served(
         serve_script,
         endpoint.model_id,
         "--max-chat-requests",
-        str(max_chat_requests),
+        str(serve_reqs),
         "--max-tokens-cap",
-        str(max_tokens_cap),
+        str(serve_tokens),
         "--max-request-bytes",
-        str(max_request_bytes),
+        str(serve_bytes),
         "--ttl-seconds",
-        str(ttl_seconds),
+        str(serve_ttl),
         "--stream-timeout-seconds",
         str(stream_timeout_seconds),
     ]
-    if refresh_session:
+    if target_port is not None:
+        serve_cmd.extend(["--port", str(target_port)])
+    if thinking:
+        serve_cmd.append("--thinking")
+    if effective_refresh:
         serve_cmd.append("--refresh-session")
     serve_res = run_cmd(
         serve_cmd,
@@ -690,8 +817,11 @@ def ensure_model_served(
         serve_err = (serve_res.stderr or serve_res.stdout or "").strip()
         return False, f"Failed to start model '{endpoint.model_id}': {serve_err}", None
 
+    wait_verify_cmd = [verify_script, endpoint.model_id, "--wait", str(wait_seconds)]
+    if target_port is not None:
+        wait_verify_cmd.extend(["--port", str(target_port)])
     wait_res = run_cmd(
-        [verify_script, endpoint.model_id, "--wait", str(wait_seconds)],
+        wait_verify_cmd,
         cwd=str(ROOT),
         capture_output=True,
         text=True,
@@ -710,10 +840,10 @@ def ensure_model_served(
             except LocalAssistError as exc:
                 return False, str(exc), None
         else:
-            rec_max_reqs = max_chat_requests
-            rec_max_bytes = max_request_bytes
-            rec_max_tokens = max_tokens_cap
-            rec_ttl = ttl_seconds
+            rec_max_reqs = serve_reqs
+            rec_max_bytes = serve_bytes
+            rec_max_tokens = serve_tokens
+            rec_ttl = serve_ttl
         try:
             started_est = check_session_spend_ceiling(
                 endpoint,
@@ -725,6 +855,10 @@ def ensure_model_served(
             )
         except LocalAssistError as exc:
             return False, str(exc), None
+        resolved_port = int(
+            (active_rec or {}).get("port")
+            or (target_port if target_port is not None else endpoint.port)
+        )
         return (
             True,
             None,
@@ -732,6 +866,8 @@ def ensure_model_served(
                 **started_est,
                 "attached": False,
                 "ttl_seconds": rec_ttl,
+                "thinking_enabled": bool(thinking),
+                "allocated_port": resolved_port,
             },
         )
 
@@ -826,6 +962,12 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
         default=DEFAULT_MAX_SESSION_USD,
         help="Optional maximum worst-case session spend in USD permitted before launch (when omitted, prints pricing and caps without blocking interactive launch).",
     )
+    parser.add_argument(
+        "--thinking",
+        action="store_true",
+        default=False,
+        help="Allow model reasoning/thinking chains (<think>) instead of injecting model passthrough thinking=false defaults.",
+    )
     add_common_launcher_arguments(
         parser,
         default_output_limit=DEFAULT_OUTPUT_LIMIT,
@@ -835,7 +977,25 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
         print_config_help="Verify/start the proxy, write the isolated opencode.json, print redacted metadata and JSON, and exit.",
         unattended_help="Enforce the default unattended_worker security profile (Seatbelt OS sandbox + default-deny permissions + loopback token relay).",
     )
-    return split_launcher_argv(parser, argv)
+    args, opencode_args = split_launcher_argv(parser, argv)
+    our_argv = (
+        argv[1 : argv.index("--", 1)]
+        if "--" in argv[1:]
+        else argv[1:]
+    )
+    cap_flag_map = {
+        "--max-chat-requests": "max_chat_requests",
+        "--max-tokens-cap": "max_tokens_cap",
+        "--max-request-bytes": "max_request_bytes",
+        "--ttl-seconds": "ttl_seconds",
+    }
+    explicit_caps: set[str] = set()
+    for flag_tok, dest_name in cap_flag_map.items():
+        if any(tok == flag_tok or tok.startswith(f"{flag_tok}=") for tok in our_argv):
+            explicit_caps.add(dest_name)
+    args.explicit_cap_flags = frozenset(explicit_caps)
+    args.explicit_thinking = any(tok == "--thinking" for tok in our_argv)
+    return args, opencode_args
 
 
 def main(argv: list[str]) -> int:
@@ -924,12 +1084,32 @@ def main(argv: list[str]) -> int:
         )
         return 1
 
+    effective_no_serve = True if active_profile is not None else args.no_serve
+
     try:
         model_id = args.model or resolve_default_attested_model_id()
         model = load_model(model_id)
         initial_pid_record = read_pid_record_for_model(model_id)
+        if args.port is not None and isinstance(initial_pid_record, dict):
+            init_active, init_unavail = pid_record_is_live_or_starting(initial_pid_record)
+            existing_port = initial_pid_record.get("port")
+            if (
+                (init_active or init_unavail)
+                and isinstance(existing_port, int)
+                and existing_port != args.port
+                and (effective_no_serve or not bool(getattr(args, "refresh_session", False)))
+            ):
+                print(
+                    f"Refusing to launch '{model_id}' on --port {args.port}: '{model_id}' is already active on port {existing_port}. "
+                    f"Omit --port (or pass --port {existing_port}) to attach, or pass --refresh-session to move it to port {args.port}.",
+                    file=sys.stderr,
+                )
+                return 1
         endpoint_pre = resolve_endpoint(
-            model, pid_record=initial_pid_record, require_api_key=False
+            model,
+            pid_record=initial_pid_record,
+            require_api_key=False,
+            port_override=args.port,
         )
         validate_private_attested_endpoint(
             endpoint_pre,
@@ -957,7 +1137,6 @@ def main(argv: list[str]) -> int:
         print(worker_err or "Worker preflight validation failed", file=sys.stderr)
         return 1
 
-    effective_no_serve = True if active_profile is not None else args.no_serve
     ok, err_msg, session_meta = ensure_model_served(
         endpoint_pre,
         no_serve=effective_no_serve,
@@ -969,6 +1148,10 @@ def main(argv: list[str]) -> int:
         ttl_seconds=eff_ttl,
         stream_timeout_seconds=args.stream_timeout_seconds,
         max_session_usd=effective_max_session_usd,
+        explicit_port=args.port,
+        explicit_cap_flags=getattr(args, "explicit_cap_flags", ()),
+        thinking=bool(getattr(args, "thinking", False)),
+        explicit_thinking=bool(getattr(args, "explicit_thinking", False)),
     )
     if not ok or session_meta is None:
         print(err_msg or "Failed to verify served model", file=sys.stderr)
@@ -978,10 +1161,23 @@ def main(argv: list[str]) -> int:
 
     try:
         active_pid_record = read_pid_record_for_model(model_id)
-        endpoint = resolve_endpoint(
-            model, pid_record=active_pid_record, require_api_key=True
+        post_port_override = (
+            (session_meta.get("allocated_port") or args.port)
+            if active_pid_record is None
+            else None
         )
-    except RegistryError as exc:
+        endpoint = resolve_endpoint(
+            model,
+            pid_record=active_pid_record,
+            require_api_key=True,
+            port_override=post_port_override,
+        )
+        validate_private_attested_endpoint(
+            endpoint,
+            allow_uncleared_model=effective_allow_uncleared,
+            allow_deprecated_model=bool(getattr(args, "allow_deprecated_model", False)),
+        )
+    except (RegistryError, LocalAssistError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
 
@@ -1017,6 +1213,18 @@ def main(argv: list[str]) -> int:
             else 9181
         )
 
+        worker_default_chat_params: dict[str, Any] | None = None
+        if isinstance(active_pid_record, dict) and isinstance(
+            active_pid_record.get("default_chat_params"), dict
+        ):
+            worker_default_chat_params = dict(active_pid_record["default_chat_params"])
+        elif not bool(getattr(args, "thinking", False)):
+            raw_prov = model.get("promptfoo_provider")
+            raw_cfg = raw_prov.get("config") if isinstance(raw_prov, dict) else None
+            raw_pt = raw_cfg.get("passthrough") if isinstance(raw_cfg, dict) else None
+            if isinstance(raw_pt, dict) and raw_pt:
+                worker_default_chat_params = dict(raw_pt)
+
         def _build_att_base_cfg(relay: _WorkerTokenRelay | None) -> dict[str, Any]:
             assert relay is not None
             base_config_text = render_private_attested_config(
@@ -1026,6 +1234,7 @@ def main(argv: list[str]) -> int:
                 max_tokens_cap=sess_tokens_cap,
                 max_request_bytes=sess_bytes_cap,
                 edit_permission="allow",
+                allow_subagents=bool(active_profile.allow_subagents),
                 workspace_dir=caller_cwd,
                 api_base_url_override=relay.api_base_url,
             )
@@ -1065,6 +1274,7 @@ def main(argv: list[str]) -> int:
                 max_request_bytes=sess_bytes_cap,
                 max_tokens_cap=sess_tokens_cap,
                 upstream_timeout_seconds=float(args.stream_timeout_seconds),
+                default_chat_params=worker_default_chat_params,
             ),
             upstream_port=upstream_port_val,
             use_token_relay=True,
@@ -1083,54 +1293,45 @@ def main(argv: list[str]) -> int:
         max_tokens_cap=sess_tokens_cap,
         max_request_bytes=sess_bytes_cap,
         edit_permission=edit_permission,
+        allow_subagents=bool(getattr(args, "allow_subagents", False)),
         workspace_dir=caller_cwd,
     )
-    opencode_config_path = isolated_home / "opencode.json"
-    opencode_config_path.write_text(config_text)
 
-    env = build_private_attested_env(
-        caller_cwd,
-        isolated_home,
-        opencode_config_path,
-        endpoint,
-        preserve_host_home=args.preserve_host_home,
-    )
-
-    if args.print_config:
-        print(
-            json.dumps(
-                {
-                    "model_id": endpoint.model_id,
-                    "served_model_id": endpoint.served_model_id,
-                    "trust_tier": endpoint.trust_tier,
-                    "data_control_rung": endpoint.data_control_rung,
-                    "usage_policy": endpoint.usage_policy,
-                    "api_base_url": endpoint.api_base_url,
-                    "session_token": "<redacted-se-session-token>",
-                    "session_caps": session_meta,
-                    "opencode_config_path": str(opencode_config_path),
-                    "isolated_home": str(isolated_home),
-                    "config": json.loads(config_text),
-                },
-                indent=2,
-            )
-        )
-        return 0
-
-    assert opencode_bin is not None
     token_sha = hashlib.sha256((endpoint.api_key or "").encode("utf-8")).hexdigest()
     current_sync = {
         "model_id": endpoint.model_id,
         "startup_nonce": (active_pid_record or {}).get("startup_nonce"),
         "token_sha256": token_sha,
     }
-    return sync_and_run_opencode(
-        opencode_bin,
-        opencode_args,
+    return publish_and_run_opencode(
+        opencode_bin=opencode_bin,
+        opencode_args=opencode_args,
         caller_cwd=caller_cwd,
         isolated_home=isolated_home,
-        env=env,
+        endpoint=endpoint,
+        config_text=config_text,
+        build_env_fn=lambda cfg_path: build_private_attested_env(
+            caller_cwd,
+            isolated_home,
+            cfg_path,
+            endpoint,
+            preserve_host_home=args.preserve_host_home,
+        ),
         current_sync=current_sync,
+        print_config=bool(args.print_config),
+        build_print_config_payload_fn=lambda cfg_path, parsed_cfg: {
+            "model_id": endpoint.model_id,
+            "served_model_id": endpoint.served_model_id,
+            "trust_tier": endpoint.trust_tier,
+            "data_control_rung": endpoint.data_control_rung,
+            "usage_policy": endpoint.usage_policy,
+            "api_base_url": endpoint.api_base_url,
+            "session_token": "<redacted-se-session-token>",
+            "session_caps": session_meta,
+            "opencode_config_path": str(cfg_path),
+            "isolated_home": str(isolated_home),
+            "config": parsed_cfg,
+        },
     )
 
 

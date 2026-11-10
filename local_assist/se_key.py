@@ -19,7 +19,7 @@ TEST_BINARY_PATH = BIN_DIR / "se-key-proxy-test"
 LEGACY_BINARY_PATH = BIN_DIR / ".se-key-proxy-legacy"
 STAMP_PATH = BIN_DIR / ".se-key-proxy.stamp"
 
-EXPECTED_SWIFT_SOURCE_SHA256 = "0b549dce5ee1cba2d772714bd02558b0313f0d5b154163b594e408c6ac412e18"
+EXPECTED_SWIFT_SOURCE_SHA256 = "f467d1e7e6c256d03c858fb26d2a8f239ab49b4ba7a05bd5387763cc8859b128"
 EXPECTED_LEGACY_BINARY_SHA256 = "012f4414ad3c9889915aaf9318e77d28d145b3a973ecf190fe7b017342fe04c2"
 DEFAULT_ENVELOPE_ACCOUNT = "free-inference"
 SKIP_EXIT_CODE = 77
@@ -449,6 +449,11 @@ def build_se_key_proxy(
             test_bin,
             target_dir,
         )
+    elif not reuse_existing_release and test_bin.is_file():
+        try:
+            test_bin.unlink()
+        except OSError:
+            pass
 
     stamp_data = {
         "source_sha256": source_sha,
