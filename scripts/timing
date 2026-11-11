@@ -16,6 +16,7 @@ if __name__ == "__main__" and VENV_PYTHON.exists() and Path(sys.executable) != V
 
 sys.path.insert(0, str(ROOT))
 
+from local_assist.client import open_loopback_http
 from local_assist.registry import (
     RegistryError,
     load_model,
@@ -133,7 +134,12 @@ def main(argv: list[str]) -> int:
     tool_calls_by_index: dict[int, dict[str, str]] = {}
     usage: dict[str, Any] | None = None
 
-    with urlopen(req, timeout=120) as resp:
+    resp_ctx = (
+        open_loopback_http(req, timeout=120)
+        if endpoint.is_local_host
+        else urlopen(req, timeout=120)
+    )
+    with resp_ctx as resp:
         for raw in resp:
             line = raw.decode("utf-8", errors="replace").strip()
             if not line.startswith("data: "):

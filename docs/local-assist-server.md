@@ -192,4 +192,83 @@ If you find yourself wanting one of these, measure that you need it in JSONL log
 
 ## Installing as an MCP server
 
-Register `scripts/local-assist-server` (absolute path) in your MCP client's config. The script is a thin entry point that starts the Python MCP server defined in `local_assist/server.py`. The package resolves `models.yaml` and other repo-local files via paths relative to its own `__file__`, so the working directory of the MCP client doesn't matter.
+Register `/path/to/free-inference/scripts/local-assist-server` (absolute path) in your MCP client's config. The script is a thin entry point that starts the Python MCP server defined in `local_assist/server.py` (auto-detecting both `Content-Length:` framed and newline-delimited stdio JSON-RPC). The package resolves `models.yaml` and other repo-local files via paths relative to its own `__file__`, while capturing the caller's working directory in `LOCAL_ASSIST_WORKSPACE_ROOT` so `delegate_task` `context_path` resolves relative to your active workspace.
+
+See `docs/decisions/2026-11-10-codex-claude-agy-wire-discovery.md` for the wire-protocol study and verification matrix across `opencode`, `codex`, `claude`, and `agy`.
+
+### Tool annotations, approval behavior, and timeout budgets
+
+- **Truthful MCP `ToolAnnotations` (`readOnlyHint: false`, `openWorldHint: false`)**: Every `local_assist` tool persists local run audit logs under `runs/local-assist/` and, when `--auto-serve` (`LOCAL_ASSIST_AUTO_SERVE=1`) is enabled, can start a persistent detached local MLX server via `scripts/serve-model --started-by auto-serve`. Therefore all four tools advertise `annotations: {"readOnlyHint": false, "openWorldHint": false}` rather than claiming `readOnlyHint: true`.
+- **Timeout budget (`180` seconds recommended)**: `local_assist` defaults to a `120`-second request budget (`LOCAL_ASSIST_TIMEOUT_SECONDS=120`), shared across optional `--auto-serve` cold-start (`45`s default wait), `/v1/models` + smoke health check, and completion. Set your MCP client's tool timeout to `180` seconds (`tool_timeout_sec = 180` in Codex, `timeout: 180000` in OpenCode) so the client does not cut off a valid cold-start or long completion after `60` seconds. If you increase `LOCAL_ASSIST_TIMEOUT_SECONDS` above `120`, keep `tool_timeout_sec >= LOCAL_ASSIST_TIMEOUT_SECONDS + 60`.
+- **Data-control boundary when called from a Rung 4/5 planner**: When `codex`, `claude`, or `agy` calls `local_assist`, the subtask inference runs locally on Rung 1 (`127.0.0.1:8080/v1`, `$0` marginal API cost). `local_assist/client.py` (`open_loopback_http`) and `scripts/verify-served-model` open loopback connections via `ProxyHandler({})` and refuse HTTP redirects, so ambient `HTTP_PROXY` / `ALL_PROXY` variables or macOS system proxy settings inherited by a bare MCP registration never divert local Rung 1 requests to an external proxy. Passing `context_path` to `delegate_task` reads the file directly inside the local tool without putting the raw file contents into the remote planner's outbound prompt, but the returned tool output enters the calling planner's session context and data-control rung.
+
+### 1. OpenCode (`opencode`)
+
+`./scripts/opencode-local` and `./scripts/opencode-attested` pre-configure `mcp.servers.local_assist` automatically with `"timeout": 180000` and `"local_assist*": "allow"`.
+
+### 2. OpenAI Codex CLI (`codex`)
+
+Register `local_assist` (add `--auto-serve` at the end if you want on-demand Rung 1 model startup when port `8080` is down):
+
+```bash
+codex mcp add local_assist -- /path/to/free-inference/scripts/local-assist-server
+codex mcp list
+```
+
+In `~/.codex/config.toml` (or `$CODEX_HOME/config.toml`), set `tool_timeout_sec = 180` and disable analytics/feedback. For unattended `codex exec -s read-only` runs (where `approval_policy` is `never`), explicitly approve the `local_assist` tools you want non-interactive sessions to call:
+
+```toml
+[analytics]
+enabled = false
+
+[feedback]
+enabled = false
+
+[mcp_servers.local_assist]
+command = "/path/to/free-inference/scripts/local-assist-server"
+# Optional: args = ["--auto-serve"]
+tool_timeout_sec = 180
+
+# Optional: explicit per-tool approval for non-interactive `codex exec`
+[mcp_servers.local_assist.tools.extract_fields]
+approval_mode = "approve"
+
+[mcp_servers.local_assist.tools.compress_context]
+approval_mode = "approve"
+
+[mcp_servers.local_assist.tools.delegate_task]
+approval_mode = "approve"
+
+[mcp_servers.local_assist.tools.propose_eval_prompts]
+approval_mode = "approve"
+```
+
+### 3. Claude Code (`claude`)
+
+Register `local_assist` in your project or user configuration:
+
+```bash
+claude mcp add local_assist -- /path/to/free-inference/scripts/local-assist-server
+claude mcp get local_assist
+```
+
+For a self-contained `-p` / `--bare` call with nonessential telemetry disabled and explicit tool permission:
+
+```bash
+CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
+DISABLE_TELEMETRY=1 \
+CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL=1 \
+claude --bare --no-session-persistence \
+  --mcp-config '{"mcpServers":{"local_assist":{"type":"stdio","command":"/path/to/free-inference/scripts/local-assist-server"}}}' \
+  --allowedTools mcp__local_assist__extract_fields,mcp__local_assist__compress_context,mcp__local_assist__delegate_task \
+  -p "Use mcp__local_assist__extract_fields to extract fields from ..."
+```
+
+### 4. Google Antigravity CLI (`agy`)
+
+Register `local_assist` in `~/.gemini/config/mcp_config.json`:
+
+```bash
+agy mcp add local_assist -- /path/to/free-inference/scripts/local-assist-server
+agy mcp list
+```

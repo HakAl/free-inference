@@ -3863,10 +3863,10 @@ class RegistryAndToolsTests(unittest.TestCase):
         from local_assist.server import SERVER_INFO
 
         # 1. Version parity across __init__.py, server.py, package.json, and scripts/models --version (A4)
-        self.assertEqual(local_assist.__version__, "0.1.4")
-        self.assertEqual(SERVER_INFO["version"], "0.1.4")
+        self.assertEqual(local_assist.__version__, "0.1.5")
+        self.assertEqual(SERVER_INFO["version"], "0.1.5")
         pkg_json = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))
-        self.assertEqual(pkg_json["version"], "0.1.4")
+        self.assertEqual(pkg_json["version"], "0.1.5")
 
         # 2. requirements-local.txt closure check (Phase 2 / PLAN-MINOR-2 / WORK-MINOR-4)
         req_local_lines = [
@@ -4013,7 +4013,7 @@ class RegistryAndToolsTests(unittest.TestCase):
                 text=True,
                 check=True,
             )
-            self.assertEqual(models_ver_clean.stdout.strip(), "free-inference-lab 0.1.4")
+            self.assertEqual(models_ver_clean.stdout.strip(), "free-inference-lab 0.1.5")
 
             for launcher_rel in ("opencode-local", "opencode-attested"):
                 hlp = subprocess.run(

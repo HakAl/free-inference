@@ -14,7 +14,7 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 from unittest.mock import patch
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNS = ROOT / "runs"
@@ -24,6 +24,7 @@ if __name__ == "__main__" and VENV_PYTHON.exists() and Path(sys.executable) != V
 
 sys.path.insert(0, str(ROOT))
 
+from local_assist.client import open_loopback_http
 from local_assist.registry import pid_file_for_model, session_token_file_for_model
 from local_assist.se_key import verify_se_key_proxy_binary
 
@@ -276,7 +277,7 @@ def main(argv: list[str]) -> int:
                     headers={"Authorization": f"Bearer {session_tok_1}"},
                     method="GET",
                 )
-                with urlopen(req, timeout=5) as resp:
+                with open_loopback_http(req, timeout=5) as resp:
                     models_resp = json.loads(resp.read().decode("utf-8"))
                 summary["unlock_1_models_ok"] = models_resp["data"][0]["id"] == SERVED_REPO
             else:

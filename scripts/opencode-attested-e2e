@@ -15,7 +15,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
-from urllib.request import Request, urlopen
+from urllib.request import Request
 
 ROOT = Path(__file__).resolve().parents[1]
 VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
@@ -24,6 +24,7 @@ if __name__ == "__main__" and VENV_PYTHON.exists() and Path(sys.executable) != V
 
 sys.path.insert(0, str(ROOT))
 
+from local_assist.client import open_loopback_http
 from local_assist.registry import (
     get_process_lstart,
     load_model,
@@ -533,7 +534,7 @@ def main(argv: list[str]) -> int:
                     method="POST",
                 )
                 try:
-                    with urlopen(req, timeout=15) as resp:
+                    with open_loopback_http(req, timeout=15) as resp:
                         _ = resp.read()
                 except HTTPError as exc:
                     cap_status_code = exc.code

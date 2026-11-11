@@ -5,26 +5,31 @@ import argparse
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Any
-from urllib.error import URLError
-from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 ROOT = Path(__file__).resolve().parents[1]
 VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
 if (
     __name__ == "__main__"
     and os.environ.get("LOCAL_ASSIST_WORKER_SANDBOX") != "1"
+    and os.environ.get("_LOCAL_ASSIST_VENV_REEXEC") != "1"
     and VENV_PYTHON.exists()
+    and (ROOT / ".venv" / "pyvenv.cfg").is_file()
     and Path(sys.executable) != VENV_PYTHON
 ):
+    os.environ["_LOCAL_ASSIST_VENV_REEXEC"] = "1"
     os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), __file__, *sys.argv[1:]])
 
 sys.path.insert(0, str(ROOT))
 
+from local_assist.client import open_loopback_http
 from local_assist.registry import (
     EndpointConfig,
     RegistryError,
@@ -39,6 +44,25 @@ from local_assist.registry import (
 
 EXIT_UNREACHABLE = 1
 EXIT_MODEL_MISMATCH = 3
+
+
+class _NoRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        req: Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> Request | None:
+        raise HTTPError(
+            req.full_url,
+            code,
+            f"HTTP redirects are refused by verify-served-model ({code})",
+            headers,
+            fp,
+        )
 
 
 def _pid_is_alive(pid: int) -> bool:
@@ -59,9 +83,15 @@ def extract_model_arg_from_command(cmd_text: str) -> str | None:
 
 
 def inspect_port_listeners(port: int) -> list[tuple[int, str]]:
+    lsof_bin = shutil.which("lsof") or (
+        "/usr/sbin/lsof"
+        if os.access("/usr/sbin/lsof", os.X_OK)
+        else ("/usr/bin/lsof" if os.access("/usr/bin/lsof", os.X_OK) else "lsof")
+    )
+    ps_bin = shutil.which("ps") or ("/bin/ps" if os.access("/bin/ps", os.X_OK) else "ps")
     try:
         cp = subprocess.run(
-            ["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-Fp"],
+            [lsof_bin, "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-Fp"],
             capture_output=True,
             text=True,
             timeout=3,
@@ -80,7 +110,7 @@ def inspect_port_listeners(port: int) -> list[tuple[int, str]]:
     for pid in pids:
         try:
             ps_cp = subprocess.run(
-                ["ps", "-p", str(pid), "-o", "command="],
+                [ps_bin, "-p", str(pid), "-o", "command="],
                 capture_output=True,
                 text=True,
                 timeout=3,
@@ -343,8 +373,15 @@ def check_once_detailed(
         method="GET",
     )
     try:
-        with urlopen(req, timeout=timeout_seconds) as resp:
+        if endpoint.is_local_host:
+            resp_ctx = open_loopback_http(req, timeout=timeout_seconds)
+        else:
+            resp_ctx = build_opener(_NoRedirectHandler()).open(req, timeout=timeout_seconds)
+        with resp_ctx as resp:
             payload = json.loads(resp.read().decode("utf-8"))
+    except HTTPError as exc:
+        exc.close()
+        return False, f"could not read {models_url}: {exc}", False
     except (OSError, URLError, json.JSONDecodeError) as exc:
         return False, f"could not read {models_url}: {exc}", False
     served_ids = [item.get("id") for item in payload.get("data", []) if isinstance(item, dict)]

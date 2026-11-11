@@ -8,7 +8,13 @@ from dataclasses import dataclass
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
-from urllib.request import Request, urlopen
+from urllib.request import (
+    HTTPRedirectHandler,
+    OpenerDirector,
+    ProxyHandler,
+    Request,
+    build_opener,
+)
 
 from .errors import EndpointUnavailable, LocalAssistError, ModelTimeout
 from .registry import (
@@ -151,11 +157,18 @@ def _resolve_effective_connection(model: str | None = None) -> tuple[str, str]:
     env_url = os.environ.get("LOCAL_ASSIST_BASE_URL")
     if env_url is not None and env_url.strip() != "":
         effective_url = env_url.strip().rstrip("/")
-        host = urlparse(effective_url).hostname or ""
-        if host not in LOCAL_HOSTS:
+        parsed_env = urlparse(effective_url)
+        scheme = (parsed_env.scheme or "").lower()
+        host = (parsed_env.hostname or "").lower()
+        if (
+            scheme not in ("http", "https")
+            or host not in LOCAL_HOSTS
+            or parsed_env.username is not None
+            or parsed_env.password is not None
+        ):
             raise LocalAssistError(
                 "trust_tier_blocked",
-                f"LOCAL_ASSIST_BASE_URL must target localhost, got '{effective_url}'.",
+                f"LOCAL_ASSIST_BASE_URL must be an http(s) localhost URL without credentials, got '{effective_url}'.",
                 details={"api_base_url": effective_url},
             )
     elif selected_ep is not None:
@@ -350,6 +363,43 @@ def chat(
     )
 
 
+class _LoopbackNoRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        req: Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> Request | None:
+        raise HTTPError(
+            req.full_url,
+            code,
+            f"Refusing HTTP redirect ({code}) from loopback endpoint",
+            headers,
+            fp,
+        )
+
+
+def _build_loopback_opener() -> OpenerDirector:
+    return build_opener(ProxyHandler({}), _LoopbackNoRedirectHandler())
+
+
+def open_loopback_http(req: Request, *, timeout: float | int) -> Any:
+    parsed = urlparse(req.full_url)
+    scheme = (parsed.scheme or "").lower()
+    host = (parsed.hostname or "").lower()
+    if (
+        scheme not in ("http", "https")
+        or host not in LOCAL_HOSTS
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise URLError(f"Refusing non-loopback HTTP request to {req.full_url!r}")
+    return _build_loopback_opener().open(req, timeout=timeout)
+
+
 def _request_json(
     method: str,
     url: str,
@@ -371,7 +421,7 @@ def _request_json(
         method=method,
     )
     try:
-        with urlopen(req, timeout=timeout_seconds) as resp:
+        with open_loopback_http(req, timeout=timeout_seconds) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except TimeoutError as exc:
         raise ModelTimeout(

@@ -215,3 +215,83 @@ cd /path/to/free-inference
 # Stop all active model servers and proxies
 ./scripts/stop-model --all
 ```
+
+---
+
+## 6. Using `local_assist` MCP from Codex CLI, Claude Code, and Antigravity (`agy`)
+
+While `./scripts/opencode-local` and `./scripts/opencode-attested` run the primary coding planner directly on Rung 1 (`local`) or Rung 3 (`enclave_runtime_attested`) via OpenAI Chat Completions (`/v1/chat/completions`), OpenAI Codex CLI (`codex`), Claude Code (`claude`), and Google Antigravity CLI (`agy`) can delegate bounded subtasks (`extract_fields`, `compress_context`, `delegate_task`, `propose_eval_prompts`) to the local Rung 1 model (`qwen3-30b-a3b-2507-mlx-4bit` on `127.0.0.1:8080/v1` at `$0` marginal API cost) via native stdio MCP (`scripts/local-assist-server`) or CLI delegation (`scripts/delegate-local`).
+
+See `docs/decisions/2026-11-10-codex-claude-agy-wire-discovery.md` for the wire-protocol study explaining why `codex` (`/v1/responses`), `claude` (`/v1/messages`), and `agy` integrate via MCP rather than a protocol-translation proxy.
+
+> **Data-control boundary note**: When calling `local_assist` from a Rung 4/5 remote planner (`codex`, `claude`, `agy`), passing `context_path` to `delegate_task` reads the file directly inside the local Rung 1 tool without sending the raw file in the planner's outbound prompt, but the returned tool output enters the calling planner's session context and data-control rung.
+
+### OpenAI Codex CLI (`codex`)
+
+```bash
+# Register local_assist (append --auto-serve to start the Rung 1 model on demand)
+codex mcp add local_assist -- /path/to/free-inference/scripts/local-assist-server
+codex mcp list
+```
+
+Recommended `~/.codex/config.toml` (or `$CODEX_HOME/config.toml`) settings to disable telemetry, raise `tool_timeout_sec` to `180` (above `local_assist`'s `120`s default `LOCAL_ASSIST_TIMEOUT_SECONDS` budget), and optionally pre-approve specific `local_assist` tools for non-interactive `codex exec` runs:
+
+```toml
+[analytics]
+enabled = false
+
+[feedback]
+enabled = false
+
+[mcp_servers.local_assist]
+command = "/path/to/free-inference/scripts/local-assist-server"
+# Optional: args = ["--auto-serve"]
+tool_timeout_sec = 180
+
+# Optional: explicit per-tool approval for unattended `codex exec -s read-only`
+[mcp_servers.local_assist.tools.extract_fields]
+approval_mode = "approve"
+
+[mcp_servers.local_assist.tools.compress_context]
+approval_mode = "approve"
+
+[mcp_servers.local_assist.tools.delegate_task]
+approval_mode = "approve"
+```
+
+### Claude Code (`claude`)
+
+```bash
+# Register local_assist in your project or user configuration
+claude mcp add local_assist -- /path/to/free-inference/scripts/local-assist-server
+claude mcp get local_assist
+```
+
+Recommended environment variables and `~/.claude/settings.json` keys to suppress nonessential background traffic:
+
+```bash
+export CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
+export DISABLE_TELEMETRY=1
+export CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL=1
+```
+
+In `~/.claude/settings.json`:
+
+```json
+{
+  "skipWebFetchPreflight": true,
+  "env": {
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    "DISABLE_TELEMETRY": "1",
+    "CLAUDE_CODE_DISABLE_OFFICIAL_MARKETPLACE_AUTOINSTALL": "1"
+  }
+}
+```
+
+### Google Antigravity CLI (`agy`)
+
+```bash
+# Register local_assist in ~/.gemini/config/mcp_config.json
+agy mcp add local_assist -- /path/to/free-inference/scripts/local-assist-server
+agy mcp list
+```

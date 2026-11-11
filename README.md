@@ -131,7 +131,7 @@ To try another evaluated Rung 3 candidate (`tinfoil-kimi-k3-1-pro`, `tinfoil-glm
 ./scripts/models --active
 ```
 
-See [`docs/runbooks.md`](docs/runbooks.md) for copy-paste operator runbooks covering multi-model side-by-side sessions, session recovery (`--refresh-session -- -c`), extended thinking (`--thinking`), subagents (`--allow-subagents`), and spend controls.
+See [`docs/runbooks.md`](docs/runbooks.md) for copy-paste operator runbooks covering multi-model side-by-side sessions, session recovery (`--refresh-session -- -c`), extended thinking (`--thinking`), subagents (`--allow-subagents`), spend controls, and registering `scripts/local-assist-server` as a Rung 1 stdio MCP server in OpenAI Codex CLI (`codex`), Claude Code (`claude`), and Google Antigravity CLI (`agy`) (see also [`docs/decisions/2026-11-10-codex-claude-agy-wire-discovery.md`](docs/decisions/2026-11-10-codex-claude-agy-wire-discovery.md)).
 
 ---
 

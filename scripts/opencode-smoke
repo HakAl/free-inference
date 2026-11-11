@@ -17,7 +17,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
-from urllib.request import HTTPRedirectHandler, Request, build_opener
+from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
 ROOT = Path(__file__).resolve().parents[1]
 VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
@@ -377,7 +377,7 @@ class MeteringForwarder:
         self.requests_log: list[dict[str, Any]] = []
         self._server: _ThreadedHTTPServer | None = None
         self._thread: threading.Thread | None = None
-        self._opener = build_opener(_NoRedirectHandler())
+        self._opener = build_opener(ProxyHandler({}), _NoRedirectHandler())
 
     @property
     def bound_host(self) -> str:

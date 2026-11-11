@@ -23,9 +23,22 @@ SUPPORTED_PROTOCOL_VERSIONS = (
     "2024-11-05",
 )
 
+# Truthful MCP ToolAnnotations (R2-MAJOR-1): tools persist audit logs under
+# runs/local-assist/ and, when --auto-serve / LOCAL_ASSIST_AUTO_SERVE=1 is
+# enabled, can spawn a detached persistent local MLX server and write PID
+# records, so readOnlyHint is False while openWorldHint is False (strictly
+# locked to localhost endpoints). Omitting destructiveHint=False ensures
+# codex-cli 0.164.0 does not auto-approve state-changing calls in unattended
+# read-only sessions unless the operator sets approval_mode = "approve".
+LOCAL_TOOL_ANNOTATIONS = {
+    "readOnlyHint": False,
+    "openWorldHint": False,
+}
+
 PROPOSE_EVAL_PROMPTS_SCHEMA = {
     "name": "propose_eval_prompts",
     "description": "Generate candidate promptfoo eval prompts with executable JavaScript assertions. Candidates must be externally validated across at least two models.",
+    "annotations": dict(LOCAL_TOOL_ANNOTATIONS),
     "inputSchema": {
         "type": "object",
         "properties": {
@@ -51,6 +64,7 @@ PROPOSE_EVAL_PROMPTS_SCHEMA = {
 EXTRACT_FIELDS_SCHEMA = {
     "name": "extract_fields",
     "description": "Extract structured fields from a block of text using the local model. Caller supplies a flat schema; scalar values (string/integer/number/boolean) are returned with matching JSON types or null when absent. string_list always returns an array (never null): empty array collapses 'text said no items' and 'text did not mention the list' together; add a paired boolean field if you need to distinguish those.",
+    "annotations": dict(LOCAL_TOOL_ANNOTATIONS),
     "inputSchema": {
         "type": "object",
         "properties": {
@@ -81,6 +95,7 @@ EXTRACT_FIELDS_SCHEMA = {
 COMPRESS_CONTEXT_SCHEMA = {
     "name": "compress_context",
     "description": "Compress noisy context (a diff, test output, or log dump) into a structured summary that preserves action-critical facts. For kind=diff, changed_files entries are mechanically verified against diff headers in the input. Output is advisory; risks/commands/followups are model judgment, not extracted facts.",
+    "annotations": dict(LOCAL_TOOL_ANNOTATIONS),
     "inputSchema": {
         "type": "object",
         "properties": {
@@ -110,6 +125,7 @@ COMPRESS_CONTEXT_SCHEMA = {
 DELEGATE_TASK_SCHEMA = {
     "name": "delegate_task",
     "description": "Delegate a bounded text/code generation, test-case drafting, text transformation, or focused Q&A subtask to the Rung 1 local model (qwen3-30b-a3b-2507-mlx-4bit on 127.0.0.1:8080/v1) at $0 marginal cost. Advisory only: self-reported assumptions and unverified_claims are model judgment (empty lists do not mean verified); ungrounded_identifiers is mechanically computed as a review cue. Note: any context read by a remote planner or any tool output returned to a remote planner enters that planner's data-control rung; only context_path read directly by the local tool stays off the planner's outbound prompt until the result is returned.",
+    "annotations": dict(LOCAL_TOOL_ANNOTATIONS),
     "inputSchema": {
         "type": "object",
         "properties": {
