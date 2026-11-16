@@ -8,10 +8,14 @@ from typing import Any
 
 from . import __version__
 from .errors import LocalAssistError
+from .logging import caller_context, sanitize_caller_field
+from .tools.assist_status import run as assist_status
+from .tools.check_eval_assertion import run as check_eval_assertion
 from .tools.compress_context import run as compress_context
 from .tools.delegate_task import run as delegate_task
 from .tools.extract_fields import run as extract_fields
 from .tools.propose_eval_prompts import run as propose_eval_prompts
+from .tools.select_context import run as select_context
 
 
 SERVER_INFO = {"name": "local-assist-server", "version": __version__}
@@ -23,21 +27,28 @@ SUPPORTED_PROTOCOL_VERSIONS = (
     "2024-11-05",
 )
 
-# Truthful MCP ToolAnnotations (R2-MAJOR-1): tools persist audit logs under
-# runs/local-assist/ and, when --auto-serve / LOCAL_ASSIST_AUTO_SERVE=1 is
-# enabled, can spawn a detached persistent local MLX server and write PID
-# records, so readOnlyHint is False while openWorldHint is False (strictly
-# locked to localhost endpoints). Omitting destructiveHint=False ensures
-# codex-cli 0.164.0 does not auto-approve state-changing calls in unattended
-# read-only sessions unless the operator sets approval_mode = "approve".
+# Truthful MCP ToolAnnotations (R2-MAJOR-1 & LDF2): logged/model-backed tools
+# persist audit logs under runs/local-assist/ and, when --auto-serve /
+# LOCAL_ASSIST_AUTO_SERVE=1 is enabled, can spawn a detached persistent local
+# MLX server and write PID records, so readOnlyHint is False while openWorldHint
+# is False (strictly locked to localhost endpoints). Omitting destructiveHint
+# ensures codex-cli 0.164.0 does not auto-approve state-changing calls in
+# unattended read-only sessions unless the operator sets approval_mode = "approve".
 LOCAL_TOOL_ANNOTATIONS = {
     "readOnlyHint": False,
     "openWorldHint": False,
 }
 
+# Only genuinely side-effect-free tools (zero LogCall audit writes, zero model
+# inference, zero auto-serve startup, zero secret reads) advertise readOnlyHint=True.
+READONLY_TOOL_ANNOTATIONS = {
+    "readOnlyHint": True,
+    "openWorldHint": False,
+}
+
 PROPOSE_EVAL_PROMPTS_SCHEMA = {
     "name": "propose_eval_prompts",
-    "description": "Generate candidate promptfoo eval prompts with executable JavaScript assertions. Candidates must be externally validated across at least two models.",
+    "description": "Generate candidate promptfoo eval prompts with syntax-checked synchronous JavaScript assertions. Candidates must be validated with check_eval_assertion and across at least two models.",
     "annotations": dict(LOCAL_TOOL_ANNOTATIONS),
     "inputSchema": {
         "type": "object",
@@ -63,12 +74,19 @@ PROPOSE_EVAL_PROMPTS_SCHEMA = {
 
 EXTRACT_FIELDS_SCHEMA = {
     "name": "extract_fields",
-    "description": "Extract structured fields from a block of text using the local model. Caller supplies a flat schema; scalar values (string/integer/number/boolean) are returned with matching JSON types or null when absent. string_list always returns an array (never null): empty array collapses 'text said no items' and 'text did not mention the list' together; add a paired boolean field if you need to distinguish those.",
+    "description": "Extract structured fields from text or a workspace-confined context_path using the local Rung 1 model. Provide exactly one of text or context_path. Scalar values (string/integer/number/boolean) are returned with matching JSON types or null when absent; string_list always returns an array (never null). Returned values enter the caller's data-control rung.",
     "annotations": dict(LOCAL_TOOL_ANNOTATIONS),
     "inputSchema": {
         "type": "object",
         "properties": {
-            "text": {"type": "string", "description": "Source text to extract from."},
+            "text": {
+                "type": ["string", "null"],
+                "description": "Source text to extract from (mutually exclusive with context_path).",
+            },
+            "context_path": {
+                "type": ["string", "null"],
+                "description": "Workspace-confined regular file path read directly by the local tool (no '..' or symlinks; mutually exclusive with text).",
+            },
             "fields": {
                 "type": "object",
                 "description": "Mapping of field_name to its spec.",
@@ -87,14 +105,14 @@ EXTRACT_FIELDS_SCHEMA = {
                 },
             },
         },
-        "required": ["text", "fields"],
+        "required": ["fields"],
         "additionalProperties": False,
     },
 }
 
 COMPRESS_CONTEXT_SCHEMA = {
     "name": "compress_context",
-    "description": "Compress noisy context (a diff, test output, or log dump) into a structured summary that preserves action-critical facts. For kind=diff, changed_files entries are mechanically verified against diff headers in the input. Output is advisory; risks/commands/followups are model judgment, not extracted facts.",
+    "description": "Compress noisy context (a diff, test output, or log dump) from inline text or a workspace-confined context_path into a structured summary that preserves action-critical facts. Provide exactly one of text or context_path. Returned summary fields enter the caller's data-control rung.",
     "annotations": dict(LOCAL_TOOL_ANNOTATIONS),
     "inputSchema": {
         "type": "object",
@@ -104,7 +122,14 @@ COMPRESS_CONTEXT_SCHEMA = {
                 "enum": ["diff", "test_output", "logs"],
                 "description": "What kind of input is being compressed.",
             },
-            "text": {"type": "string", "description": "Source text to compress."},
+            "text": {
+                "type": ["string", "null"],
+                "description": "Source text to compress (mutually exclusive with context_path).",
+            },
+            "context_path": {
+                "type": ["string", "null"],
+                "description": "Workspace-confined regular file path read directly by the local tool (no '..' or symlinks; mutually exclusive with text).",
+            },
             "focus": {
                 "type": ["string", "null"],
                 "description": "Optional short string describing what to emphasize.",
@@ -117,7 +142,7 @@ COMPRESS_CONTEXT_SCHEMA = {
                 "description": "Maximum length of every list field in the output.",
             },
         },
-        "required": ["kind", "text"],
+        "required": ["kind"],
         "additionalProperties": False,
     },
 }
@@ -167,15 +192,115 @@ DELEGATE_TASK_SCHEMA = {
     },
 }
 
+ASSIST_STATUS_SCHEMA = {
+    "name": "assist_status",
+    "description": "Return side-effect-free, credential-free status for local_assist: server version, advertised tools, confined workspace_root, passive Rung 1 readiness, and sanitized active local/proxy session metadata (zero disk writes, zero auto-serve, zero secret access).",
+    "annotations": dict(READONLY_TOOL_ANNOTATIONS),
+    "inputSchema": {
+        "type": "object",
+        "properties": {},
+        "additionalProperties": False,
+    },
+}
+
+CHECK_EVAL_ASSERTION_SCHEMA = {
+    "name": "check_eval_assertion",
+    "description": "Deterministically test a candidate promptfoo assertion (javascript, regex, icontains, or is-json) against supplied passing_outputs and failing_outputs inside an OS Seatbelt + Node --permission sandbox. Reports false_rejects, false_accepts, and runtime_errors without requiring a live LLM.",
+    "annotations": dict(LOCAL_TOOL_ANNOTATIONS),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "assertion": {
+                "type": "object",
+                "properties": {
+                    "type": {
+                        "type": "string",
+                        "enum": ["javascript", "regex", "icontains", "is-json"],
+                    },
+                    "value": {
+                        "type": "string",
+                        "maxLength": 8192,
+                    },
+                },
+                "required": ["type"],
+                "additionalProperties": False,
+                "description": "Promptfoo assertion object to evaluate.",
+            },
+            "passing_outputs": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+                "maxItems": 20,
+                "description": "Sample outputs that MUST pass the assertion.",
+            },
+            "failing_outputs": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+                "maxItems": 20,
+                "description": "Sample outputs that MUST fail the assertion.",
+            },
+        },
+        "required": ["assertion", "passing_outputs", "failing_outputs"],
+        "additionalProperties": False,
+    },
+}
+
+SELECT_CONTEXT_SCHEMA = {
+    "name": "select_context",
+    "description": "Select minimal relevant excerpts from 1..10 workspace-confined files for a query using Rung 1 coordinate selection, then mechanically slice verbatim lines from disk with SHA-256 provenance. Returned excerpts enter the caller's data-control rung.",
+    "annotations": dict(LOCAL_TOOL_ANNOTATIONS),
+    "inputSchema": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "maxLength": 2000,
+                "description": "Question or lookup objective (1..2000 characters).",
+            },
+            "paths": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+                "maxItems": 10,
+                "description": "1..10 workspace-confined regular file paths (<= 32768 bytes each, <= 96000 bytes combined).",
+            },
+            "max_excerpts": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 10,
+                "default": 5,
+                "description": "Maximum number of excerpts to return (1..10).",
+            },
+            "max_lines_per_excerpt": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 120,
+                "default": 40,
+                "description": "Maximum lines per returned excerpt (1..120).",
+            },
+        },
+        "required": ["query", "paths"],
+        "additionalProperties": False,
+    },
+}
+
 TOOL_SCHEMAS = [
     PROPOSE_EVAL_PROMPTS_SCHEMA,
     EXTRACT_FIELDS_SCHEMA,
     COMPRESS_CONTEXT_SCHEMA,
     DELEGATE_TASK_SCHEMA,
+    ASSIST_STATUS_SCHEMA,
+    CHECK_EVAL_ASSERTION_SCHEMA,
+    SELECT_CONTEXT_SCHEMA,
 ]
 
 
-def handle_request(message: dict[str, Any]) -> dict[str, Any] | None:
+def handle_request(
+    message: dict[str, Any],
+    *,
+    session_state: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     method = message.get("method")
     msg_id = message.get("id")
     if (isinstance(method, str) and method.startswith("notifications/")) or msg_id is None:
@@ -188,6 +313,15 @@ def handle_request(message: dict[str, Any]) -> dict[str, Any] | None:
             if isinstance(requested_version, str) and requested_version in SUPPORTED_PROTOCOL_VERSIONS
             else DEFAULT_PROTOCOL_VERSION
         )
+        if session_state is not None:
+            client_info = (
+                params.get("clientInfo") if isinstance(params.get("clientInfo"), dict) else {}
+            )
+            session_state["caller"] = {
+                "client_name": sanitize_caller_field(client_info.get("name")),
+                "client_version": sanitize_caller_field(client_info.get("version")),
+                "protocol_version": negotiated_version,
+            }
         return result(
             msg_id,
             {
@@ -202,35 +336,77 @@ def handle_request(message: dict[str, Any]) -> dict[str, Any] | None:
         params = message.get("params") if isinstance(message.get("params"), dict) else {}
         name = params.get("name")
         args = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
+        session_caller = (
+            session_state.get("caller")
+            if isinstance(session_state, dict) and isinstance(session_state.get("caller"), dict)
+            else {}
+        )
         try:
-            if name == "propose_eval_prompts":
-                output = propose_eval_prompts(
-                    category=str(args.get("category", "")),
-                    n=int(args.get("n", 5)),
-                )
-            elif name == "extract_fields":
-                output = extract_fields(
-                    text=args.get("text"),
-                    fields=args.get("fields"),
-                )
-            elif name == "compress_context":
-                output = compress_context(
-                    kind=args.get("kind"),
-                    text=args.get("text"),
-                    focus=args.get("focus"),
-                    max_items=args.get("max_items", 10),
-                )
-            elif name == "delegate_task":
-                output = delegate_task(
-                    kind=args.get("kind"),
-                    instruction=args.get("instruction"),
-                    context=args.get("context"),
-                    context_path=args.get("context_path"),
-                    constraints=args.get("constraints"),
-                    max_tokens=args.get("max_tokens", 1536),
-                )
-            else:
-                return error(msg_id, -32601, f"Unknown tool: {name}")
+            with caller_context(
+                transport="mcp",
+                client_name=session_caller.get("client_name"),
+                client_version=session_caller.get("client_version"),
+                protocol_version=session_caller.get("protocol_version"),
+            ):
+                if name == "propose_eval_prompts":
+                    output: dict[str, Any] = propose_eval_prompts(
+                        category=str(args.get("category", "")),
+                        n=int(args.get("n", 5)),
+                    )
+                elif name == "extract_fields":
+                    if args.get("context_path") is not None:
+                        output = extract_fields(
+                            text=args.get("text"),
+                            fields=args.get("fields"),
+                            context_path=args.get("context_path"),
+                        )
+                    else:
+                        output = extract_fields(
+                            text=args.get("text"),
+                            fields=args.get("fields"),
+                        )
+                elif name == "compress_context":
+                    if args.get("context_path") is not None:
+                        output = compress_context(
+                            kind=args.get("kind"),
+                            text=args.get("text"),
+                            focus=args.get("focus"),
+                            max_items=args.get("max_items", 10),
+                            context_path=args.get("context_path"),
+                        )
+                    else:
+                        output = compress_context(
+                            kind=args.get("kind"),
+                            text=args.get("text"),
+                            focus=args.get("focus"),
+                            max_items=args.get("max_items", 10),
+                        )
+                elif name == "delegate_task":
+                    output = delegate_task(
+                        kind=args.get("kind"),
+                        instruction=args.get("instruction"),
+                        context=args.get("context"),
+                        context_path=args.get("context_path"),
+                        constraints=args.get("constraints"),
+                        max_tokens=args.get("max_tokens", 1536),
+                    )
+                elif name == "assist_status":
+                    output = assist_status()
+                elif name == "check_eval_assertion":
+                    output = check_eval_assertion(
+                        assertion=args.get("assertion"),
+                        passing_outputs=args.get("passing_outputs"),
+                        failing_outputs=args.get("failing_outputs"),
+                    )
+                elif name == "select_context":
+                    output = select_context(
+                        query=args.get("query"),
+                        paths=args.get("paths"),
+                        max_excerpts=args.get("max_excerpts", 5),
+                        max_lines_per_excerpt=args.get("max_lines_per_excerpt", 40),
+                    )
+                else:
+                    return error(msg_id, -32601, f"Unknown tool: {name}")
             return result(
                 msg_id,
                 {
@@ -385,6 +561,7 @@ def write_message(
 
 def serve_stdio(in_stream: Any = None, out_stream: Any = None) -> int:
     session_framing: str | None = None
+    session_state: dict[str, Any] = {}
     while True:
         try:
             incoming, detected_framing = read_message_with_framing(
@@ -404,7 +581,7 @@ def serve_stdio(in_stream: Any = None, out_stream: Any = None) -> int:
             return 0
         if session_framing is None:
             session_framing = detected_framing
-        response = handle_request(incoming)
+        response = handle_request(incoming, session_state=session_state)
         if response is not None and incoming.get("id") is not None:
             write_message(response, framing=session_framing, stream=out_stream)
 
@@ -414,7 +591,7 @@ def self_test() -> int:
     return 0
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="local-assist MCP server")
     parser.add_argument("--self-test", action="store_true", help="Print server metadata without starting MCP stdio.")
     parser.add_argument(
@@ -422,7 +599,7 @@ def main() -> int:
         action="store_true",
         help="Opt in to auto-starting the cleared Rung 1 local MLX server on tool call if port 8080 is down.",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.auto_serve:
         os.environ["LOCAL_ASSIST_AUTO_SERVE"] = "1"
     if args.self_test:

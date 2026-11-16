@@ -2,22 +2,72 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Mapping, Sequence
 import contextlib
 from datetime import datetime
 import hashlib
 import json
 import math
 import os
+try:
+    import pwd
+except ImportError:  # pragma: no cover
+    pwd = None  # type: ignore[assignment]
+import shlex
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parents[1]
 VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
-if __name__ == "__main__" and VENV_PYTHON.exists() and Path(sys.executable) != VENV_PYTHON:
-    os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), __file__, *sys.argv[1:]])
+if __name__ == "__main__":
+    _SENSITIVE_LAUNCH_ENV_KEYS = (
+        "LOCAL_ASSIST_SESSION_TOKEN",
+        "OPENCODE_PASSWORD",
+        "OPENCODE_SERVER_PASSWORD",
+    )
+    if any(_k in os.environ for _k in _SENSITIVE_LAUNCH_ENV_KEYS):
+        _clean_env = dict(os.environ)
+        _raw_tok = _clean_env.pop("LOCAL_ASSIST_SESSION_TOKEN", "")
+        _clean_env.pop("OPENCODE_PASSWORD", None)
+        _clean_env.pop("OPENCODE_SERVER_PASSWORD", None)
+        if isinstance(_raw_tok, str) and _raw_tok.strip():
+            _tok_bytes = _raw_tok.strip().encode("utf-8")
+            if len(_tok_bytes) > 512:
+                print(
+                    "Refusing LOCAL_ASSIST_SESSION_TOKEN exceeding 512 bytes.",
+                    file=sys.stderr,
+                )
+                raise SystemExit(1)
+            _rfd, _wfd = os.pipe()
+            try:
+                os.write(_wfd, _tok_bytes)
+            finally:
+                os.close(_wfd)
+            os.set_inheritable(_rfd, True)
+            _clean_env["_FREE_INFERENCE_TOKEN_FD"] = str(_rfd)
+        elif "_FREE_INFERENCE_TOKEN_FD" in _clean_env:
+            try:
+                os.set_inheritable(int(_clean_env["_FREE_INFERENCE_TOKEN_FD"]), True)
+            except (OSError, ValueError):
+                pass
+        _target_py = str(VENV_PYTHON) if VENV_PYTHON.exists() else sys.executable
+        os.execve(
+            _target_py,
+            [_target_py, str(Path(__file__).resolve()), *sys.argv[1:]],
+            _clean_env,
+        )
+    if VENV_PYTHON.exists() and Path(sys.executable) != VENV_PYTHON:
+        if "_FREE_INFERENCE_TOKEN_FD" in os.environ:
+            try:
+                os.set_inheritable(int(os.environ["_FREE_INFERENCE_TOKEN_FD"]), True)
+            except (OSError, ValueError):
+                pass
+        os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), __file__, *sys.argv[1:]])
 
 sys.path.insert(0, str(ROOT))
 
@@ -33,6 +83,8 @@ from local_assist.launch import (
     allocate_side_by_side_port,
     build_isolated_opencode_env,
     check_endpoint_lifecycle_status,
+    check_uncontained_legacy_home,
+    classify_pid_identity,
     execute_worker_profile_session,
     is_port_owned_by_different_active_model,
     json_escape as _json_escape,
@@ -46,6 +98,8 @@ from local_assist.launch import (
 )
 from local_assist.registry import (
     ATTESTED_ENCLAVE_TIERS,
+    DATA_CONTROL_RUNGS,
+    DEFAULT_RUNS_DIR,
     LEGACY_TIER_ALIASES,
     EndpointConfig,
     RegistryError,
@@ -56,10 +110,11 @@ from local_assist.registry import (
     read_pid_record_for_model,
     resolve_endpoint,
 )
+from local_assist.relay import SessionAuthRelay, _WorkerTokenRelay
+from local_assist.se_key import DEFAULT_ENVELOPE_ACCOUNT
 from local_assist.security_profile import (
     SecurityProfileError,
     WorkerSecurityProfile,
-    _WorkerTokenRelay,
     allocate_worker_home,
 )
 
@@ -69,7 +124,7 @@ DEFAULT_WAIT_SECONDS = 60.0
 DEFAULT_MAX_CHAT_REQUESTS = 1000
 DEFAULT_MAX_TOKENS_CAP = 16384
 DEFAULT_MAX_REQUEST_BYTES = 8388608
-DEFAULT_TTL_SECONDS = 43200
+DEFAULT_TTL_SECONDS = 7200
 DEFAULT_STREAM_TIMEOUT_SECONDS = 300
 DEFAULT_MAX_SESSION_USD: float | None = None
 MIN_ATTACHED_REQUEST_BYTES = 65536
@@ -81,6 +136,209 @@ RUNG1_LOCAL_ASSIST_BASE_URL = "http://127.0.0.1:8080/v1"
 
 TEMPLATE_CONFIG = ROOT / "config" / "opencode-private-attested.json.tmpl"
 DEFAULT_ISOLATED_HOME = ROOT / ".home" / "opencode-private-attested"
+DEFAULT_ATTESTED_MODEL_ENV_VAR = "FREE_INFERENCE_DEFAULT_ATTESTED_MODEL"
+ISOLATED_HOME_ENV_VAR = "FREE_INFERENCE_OPENCODE_ATTESTED_HOME"
+LOCAL_ASSIST_BASE_URL_ENV_VAR = "FREE_INFERENCE_LOCAL_ASSIST_BASE_URL"
+
+
+def _consume_handoff_token() -> tuple[bool, str | None, str | None]:
+    raw_fd = os.environ.pop("_FREE_INFERENCE_TOKEN_FD", None)
+    os.environ.pop("OPENCODE_PASSWORD", None)
+    os.environ.pop("OPENCODE_SERVER_PASSWORD", None)
+    if raw_fd is not None:
+        os.environ.pop("LOCAL_ASSIST_SESSION_TOKEN", None)
+        try:
+            fd = int(raw_fd)
+        except ValueError:
+            return False, None, "Invalid _FREE_INFERENCE_TOKEN_FD descriptor."
+        if fd < 3:
+            return False, None, "Refusing _FREE_INFERENCE_TOKEN_FD below fd 3."
+        try:
+            os.set_inheritable(fd, False)
+            data = os.read(fd, 4096)
+        except OSError as exc:
+            return False, None, f"Failed to read _FREE_INFERENCE_TOKEN_FD: {exc}"
+        finally:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            tok = data.decode("utf-8").strip()
+        except UnicodeDecodeError:
+            return False, None, "Invalid UTF-8 in _FREE_INFERENCE_TOKEN_FD."
+        if not tok or len(data) > 512:
+            return False, None, "Empty or oversized token in _FREE_INFERENCE_TOKEN_FD."
+        return True, tok, None
+
+    if "LOCAL_ASSIST_SESSION_TOKEN" in os.environ:
+        inproc_tok = os.environ.pop("LOCAL_ASSIST_SESSION_TOKEN", "").strip()
+        return True, (inproc_tok or None), None
+
+    return True, None, None
+
+
+def _resolve_local_assist_base_url() -> tuple[str, int]:
+    raw_override = os.environ.get(LOCAL_ASSIST_BASE_URL_ENV_VAR, "").strip()
+    if not raw_override:
+        return RUNG1_LOCAL_ASSIST_BASE_URL, 8080
+    parsed = urlparse(raw_override)
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in ("127.0.0.1", "localhost", "::1")
+        or parsed.port is None
+        or not (1 <= int(parsed.port) <= 65535)
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise LocalAssistError(
+            "trust_tier_blocked",
+            f"{LOCAL_ASSIST_BASE_URL_ENV_VAR} must be an explicit loopback http URL with port "
+            f"(127.0.0.1, localhost, or ::1), got {raw_override!r}.",
+        )
+    return raw_override, int(parsed.port)
+
+
+def _resolve_isolated_home() -> Path:
+    raw = os.environ.get(ISOLATED_HOME_ENV_VAR, "").strip()
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return DEFAULT_ISOLATED_HOME
+
+
+def _check_owned_directory_for_envelope(path: Path, *, require_mode_0700: bool) -> bool:
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        return False
+    if hasattr(os, "geteuid") and st.st_uid != os.geteuid():
+        return False
+    if require_mode_0700:
+        if (st.st_mode & 0o077) != 0:
+            return False
+    elif (st.st_mode & 0o022) != 0:
+        return False
+    return True
+
+
+def _resolve_production_envelope_dir(envelope_dir: Path | None) -> Path | None:
+    if envelope_dir is not None:
+        return (
+            envelope_dir
+            if _check_owned_directory_for_envelope(envelope_dir, require_mode_0700=True)
+            else None
+        )
+    # Intentionally ignore FREE_INFERENCE_SE_ENVELOPE_DIR: production bin/se-key-proxy
+    # compiles that override out outside #if SE_KEY_TESTING and resolves envelopes
+    # exclusively from getpwuid(geteuid()).pw_dir/.config/free-inference/se-envelopes.
+    if pwd is None or not hasattr(os, "geteuid"):
+        return None
+    try:
+        home_raw = pwd.getpwuid(os.geteuid()).pw_dir
+    except (KeyError, OSError):
+        return None
+    if not isinstance(home_raw, str) or not home_raw.startswith("/"):
+        return None
+    segments = [seg for seg in home_raw.split("/") if seg]
+    if not segments or ".." in segments or "." in segments:
+        return None
+    home_dir = Path("/" + "/".join(segments))
+    dot_config = home_dir / ".config"
+    free_inf_dir = dot_config / "free-inference"
+    env_dir = free_inf_dir / "se-envelopes"
+    if not _check_owned_directory_for_envelope(home_dir, require_mode_0700=False):
+        return None
+    if not _check_owned_directory_for_envelope(dot_config, require_mode_0700=False):
+        return None
+    if not _check_owned_directory_for_envelope(free_inf_dir, require_mode_0700=True):
+        return None
+    if not _check_owned_directory_for_envelope(env_dir, require_mode_0700=True):
+        return None
+    return env_dir
+
+
+def _entry_has_sealed_envelope(entry: dict[str, Any], env_dir: Path | None) -> bool:
+    if env_dir is None:
+        return False
+    pf = entry.get("promptfoo_provider")
+    if not isinstance(pf, dict):
+        return False
+    service = str(pf.get("apiKeyKeychainService") or "").strip()
+    if not service:
+        return False
+    stem = hashlib.sha256(f"{service}\0{DEFAULT_ENVELOPE_ACCOUNT}".encode("utf-8")).hexdigest()
+    env_file = env_dir / f"{stem}.json"
+    try:
+        st = os.lstat(env_file)
+    except OSError:
+        return False
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        return False
+    if hasattr(os, "geteuid") and st.st_uid != os.geteuid():
+        return False
+    if (st.st_mode & 0o077) != 0 or st.st_size <= 0:
+        return False
+    state_file = env_dir / f"{stem}.state.json"
+    try:
+        st_state = os.lstat(state_file)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    if stat.S_ISLNK(st_state.st_mode) or not stat.S_ISREG(st_state.st_mode):
+        return False
+    if hasattr(os, "geteuid") and st_state.st_uid != os.geteuid():
+        return False
+    if (st_state.st_mode & 0o077) != 0:
+        return False
+    try:
+        state_obj = json.loads(state_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(state_obj, dict) or state_obj.get("lifecycle_state") == "deleted":
+        return False
+    return True
+
+
+def _entry_has_installed_proxy_binary(entry: dict[str, Any], eff_root: Path) -> bool:
+    raw_cmd = entry.get("serve_command")
+    if not isinstance(raw_cmd, str) or not raw_cmd.strip():
+        return False
+    try:
+        tokens = shlex.split(raw_cmd)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+    bin_token = tokens[0]
+    if "/" in bin_token:
+        cand = Path(bin_token)
+        if not cand.is_absolute():
+            cand = eff_root / cand
+        try:
+            st = os.stat(cand)
+        except OSError:
+            return False
+        return stat.S_ISREG(st.st_mode) and os.access(cand, os.X_OK)
+    return bool(shutil.which(bin_token))
+
+
+def _entry_has_verified_ready_session(model_id: str, eff_runs: Path) -> bool:
+    rec = read_pid_record_for_model(model_id, runs_dir=eff_runs)
+    if not isinstance(rec, dict):
+        return False
+    if str(rec.get("model_id") or "") != model_id:
+        return False
+    if rec.get("status") == "starting":
+        return False
+    if classify_pid_identity(rec.get("pid"), rec.get("pid_lstart")) != "matched":
+        return False
+    if rec.get("upstream_pid") is not None:
+        if classify_pid_identity(rec.get("upstream_pid"), rec.get("upstream_pid_lstart")) != "matched":
+            return False
+    return True
 
 
 @contextlib.contextmanager
@@ -107,51 +365,160 @@ def _scoped_admission_env(*, allow_uncleared_model: bool):
 
 def resolve_default_attested_model_id(
     models_list: list[dict[str, Any]] | None = None,
+    *,
+    env: Mapping[str, str] | None = None,
+    root_dir: Path | None = None,
+    runs_dir: Path | None = None,
+    envelope_dir: Path | None = None,
+    prefer_host_state: bool | None = None,
 ) -> str:
     models = models_list if models_list is not None else load_models()
-    cleared_ids: list[str] = []
+    cleared_entries: list[tuple[str, dict[str, Any], int]] = []
     candidate_ids: list[str] = []
+    pinned_entries: list[tuple[str, int]] = []
+
     for entry in models:
+        routing = entry.get("routing")
+        raw_dpa = routing.get("default_private_attested", False) if isinstance(routing, dict) else False
+        if not isinstance(raw_dpa, bool):
+            raise RegistryError(
+                f"Model {entry.get('id')}: routing.default_private_attested must be a boolean, got {raw_dpa!r}."
+            )
         rt = entry.get("remote_trust")
         if not isinstance(rt, dict):
+            if raw_dpa is True:
+                raise LocalAssistError(
+                    "routing_gate_blocked",
+                    f"Model '{entry.get('id')}' sets routing.default_private_attested=true outside Rung 2/3.",
+                    details={"model_id": entry.get("id")},
+                )
             continue
         raw_tier = rt.get("tier")
         tier = LEGACY_TIER_ALIASES.get(str(raw_tier), raw_tier) if isinstance(raw_tier, str) else raw_tier
         if tier not in ATTESTED_ENCLAVE_TIERS:
+            if raw_dpa is True:
+                raise LocalAssistError(
+                    "routing_gate_blocked",
+                    f"Model '{entry.get('id')}' sets routing.default_private_attested=true outside Rung 2/3.",
+                    details={"model_id": entry.get("id")},
+                )
             continue
         mid = str(entry.get("id") or "").strip()
         if not mid:
             continue
+        rung = DATA_CONTROL_RUNGS.index(str(tier)) + 1
         if entry.get("status") == "archived" or is_model_effectively_deprecated(
             bool(entry.get("deprecated") is True),
             entry.get("deprecation_date"),
         ):
+            if raw_dpa is True:
+                raise LocalAssistError(
+                    "routing_gate_blocked",
+                    f"Model '{mid}' sets routing.default_private_attested=true while archived or deprecated.",
+                    details={"model_id": mid},
+                )
             continue
-        routing = entry.get("routing")
         pa = routing.get("private_attested") if isinstance(routing, dict) else "blocked"
         if pa == "cleared":
-            cleared_ids.append(mid)
+            cleared_entries.append((mid, entry, rung))
+            if raw_dpa is True:
+                pinned_entries.append((mid, rung))
         else:
+            if raw_dpa is True:
+                raise LocalAssistError(
+                    "routing_gate_blocked",
+                    f"Model '{mid}' sets routing.default_private_attested=true while routing.private_attested={pa!r}.",
+                    details={"model_id": mid, "private_attested": pa},
+                )
             candidate_ids.append(mid)
 
-    if len(cleared_ids) == 1:
-        return cleared_ids[0]
-    if len(cleared_ids) > 1:
+    if len(pinned_entries) > 1:
+        dup_ids = [mid for mid, _ in pinned_entries]
         raise LocalAssistError(
             "routing_gate_blocked",
-            f"Multiple Rung 2/3 models have routing.private_attested='cleared' ({cleared_ids}); "
-            "pass --model <id> explicitly.",
-            details={"cleared_models": cleared_ids},
+            f"Multiple Rung 2/3 models set routing.default_private_attested=true ({dup_ids}); "
+            "at most one cleared model may be pinned as the catalog default.",
+            details={"pinned_models": dup_ids},
         )
-    raise LocalAssistError(
-        "routing_gate_blocked",
-        "No Rung 2/3 model in models.yaml is currently cleared for private-attested routing "
-        "(routing.private_attested='cleared' requires passing automated sanity, v1 10/10, "
-        f"tools 4/4, and opencode-smoke). Registered Rung 2/3 candidates: {candidate_ids}. "
-        "To run an uncleared candidate explicitly, pass: "
-        "./scripts/opencode-attested --model <model-id> --allow-uncleared-model",
-        details={"candidate_models": candidate_ids},
-    )
+
+    if not cleared_entries:
+        raise LocalAssistError(
+            "routing_gate_blocked",
+            "No Rung 2/3 model in models.yaml is currently cleared for private-attested routing "
+            "(routing.private_attested='cleared' requires passing automated sanity, v1 10/10, "
+            f"tools 4/4, and opencode-smoke). Registered Rung 2/3 candidates: {candidate_ids}. "
+            "To run an uncleared candidate explicitly, pass: "
+            "./scripts/opencode-attested --model <model-id> --allow-uncleared-model",
+            details={"candidate_models": candidate_ids},
+        )
+
+    eff_env = os.environ if env is None else env
+    raw_env_model = eff_env.get(DEFAULT_ATTESTED_MODEL_ENV_VAR)
+    if raw_env_model is not None and str(raw_env_model).strip():
+        requested_id = str(raw_env_model).strip()
+        cleared_ids = [mid for mid, _, _ in cleared_entries]
+        if requested_id not in cleared_ids:
+            raise LocalAssistError(
+                "routing_gate_blocked",
+                f"{DEFAULT_ATTESTED_MODEL_ENV_VAR}={requested_id!r} is not an active, non-deprecated "
+                f"Rung 2/3 model cleared for private-attested routing (cleared models: {cleared_ids}).",
+                details={
+                    "requested_model": requested_id,
+                    "cleared_models": cleared_ids,
+                },
+            )
+        return requested_id
+
+    best_rung = min(rung for _, _, rung in cleared_entries)
+    if len(pinned_entries) == 1:
+        pinned_id, pinned_rung = pinned_entries[0]
+        if pinned_rung != best_rung:
+            best_ids = [mid for mid, _, r in cleared_entries if r == best_rung]
+            raise LocalAssistError(
+                "routing_gate_blocked",
+                f"Model '{pinned_id}' (Rung {pinned_rung}) sets routing.default_private_attested=true, "
+                f"but higher-control Rung {best_rung} cleared model(s) exist ({best_ids}). "
+                f"Update routing.default_private_attested in models.yaml or pass --model / {DEFAULT_ATTESTED_MODEL_ENV_VAR} explicitly.",
+                details={
+                    "pinned_model": pinned_id,
+                    "pinned_rung": pinned_rung,
+                    "best_rung": best_rung,
+                    "best_rung_models": best_ids,
+                },
+            )
+        return pinned_id
+
+    pool: list[tuple[str, dict[str, Any], int]] = [
+        item for item in cleared_entries if item[2] == best_rung
+    ]
+    if len(pool) == 1:
+        return pool[0][0]
+
+    use_host_state = (models_list is None) if prefer_host_state is None else bool(prefer_host_state)
+    if use_host_state and len(pool) > 1:
+        eff_root = root_dir if root_dir is not None else ROOT
+        eff_runs = (
+            runs_dir
+            if runs_dir is not None
+            else (eff_root / "runs" if root_dir is not None else DEFAULT_RUNS_DIR)
+        )
+
+        live_subset = [item for item in pool if _entry_has_verified_ready_session(item[0], eff_runs)]
+        if live_subset:
+            pool = live_subset
+
+        if len(pool) > 1:
+            bin_subset = [item for item in pool if _entry_has_installed_proxy_binary(item[1], eff_root)]
+            if bin_subset:
+                pool = bin_subset
+
+        if len(pool) > 1:
+            eff_env_dir = _resolve_production_envelope_dir(envelope_dir)
+            env_subset = [item for item in pool if _entry_has_sealed_envelope(item[1], eff_env_dir)]
+            if env_subset:
+                pool = env_subset
+
+    return pool[-1][0]
 
 
 def validate_private_attested_endpoint(
@@ -363,6 +730,13 @@ def _extract_attached_session_caps(
     raw_bytes = active_rec.get("max_request_bytes")
     raw_tokens = active_rec.get("max_tokens_cap")
     raw_ttl = active_rec.get("ttl_seconds")
+    # A renewal changes the live window without rewriting the launch record.
+    from local_assist.session import status_for_record
+    from local_assist.registry import _effective_runs_dir
+    live = (status_for_record(active_rec, _effective_runs_dir())
+            if active_rec.get('model_id') and active_rec.get('repo') else {'state': 'UNKNOWN'})
+    if live['state'] == 'ON':
+        raw_ttl = live['window_seconds']
     if (
         not isinstance(raw_reqs, int)
         or isinstance(raw_reqs, bool)
@@ -412,7 +786,10 @@ def format_session_banner(
     ttl_val = session_meta["ttl_seconds"]
     ttl_str = str(ttl_val)
     started_at = session_meta.get("started_at")
-    if session_meta.get("attached") and isinstance(started_at, str) and started_at.strip():
+    live_status = session_meta.get('live_status')
+    if isinstance(live_status, dict) and live_status.get('state') == 'ON':
+        ttl_str = f"{live_status['window_seconds']} ({live_status['remaining_seconds']}s remaining)"
+    elif session_meta.get("attached") and isinstance(started_at, str) and started_at.strip():
         try:
             started_dt = datetime.strptime(started_at.strip(), "%Y-%m-%dT%H:%M:%S%z")
             now_dt = datetime.now(started_dt.tzinfo)
@@ -430,6 +807,9 @@ def format_session_banner(
         f"[private-attested] Session caps: max_chat_requests={session_meta['max_chat_requests']} (includes small_model title requests), max_tokens_cap={session_meta['max_tokens_cap']}, max_request_bytes={session_meta['max_request_bytes']}, ttl_seconds={ttl_str}",
         f"[private-attested] Pricing: ${session_meta['input_price_per_m']:.2f}/1M input, ${session_meta['output_price_per_m']:.2f}/1M output ({ceiling_str})",
     ]
+    from local_assist.session import format_status
+    live = session_meta.get('live_status') or {'state': 'UNKNOWN', 'model_id': endpoint.model_id}
+    lines.append('[private-attested] Session: ' + format_status(live))
     if session_meta.get("low_caps_warning"):
         lines.append(
             f"[private-attested] WARNING: Attached session has eval-sized caps "
@@ -438,10 +818,9 @@ def format_session_banner(
             f"max_request_bytes={session_meta['max_request_bytes']}). "
             f"For interactive coding, run: ./scripts/opencode-attested --model {endpoint.model_id} --refresh-session"
         )
-    if session_meta.get("attached"):
-        lines.append(
-            "[private-attested] To refresh the 12h session: ./scripts/opencode-attested --refresh-session"
-        )
+    lines.append(
+        f"[private-attested] Session controls: ./scripts/session status|renew|stop --model {endpoint.model_id}"
+    )
     return "\n".join(lines)
 
 
@@ -454,14 +833,20 @@ def render_private_attested_config(
     max_tokens_cap: int | None = None,
     max_request_bytes: int | None = None,
     edit_permission: str = "ask",
+    bash_permission: str = "ask",
     allow_subagents: bool = False,
+    plugins: Sequence[str] = (),
+    local_assist_base_url: str = RUNG1_LOCAL_ASSIST_BASE_URL,
     lab_python: Path | None = None,
     lab_root: Path | None = None,
     workspace_dir: Path | None = None,
     api_base_url_override: str | None = None,
+    api_key_override: str | None = None,
 ) -> str:
     if edit_permission not in ("ask", "allow", "deny"):
         raise ValueError(f"Invalid edit_permission: {edit_permission}")
+    if bash_permission not in ("ask", "allow", "deny"):
+        raise ValueError(f"Invalid bash_permission: {bash_permission}")
     effective_context_limit = (
         context_limit
         if context_limit is not None
@@ -476,7 +861,11 @@ def render_private_attested_config(
         raise ValueError("context_limit and output_limit must be positive integers")
 
     tmpl = template_text if template_text is not None else TEMPLATE_CONFIG.read_text()
-    api_key_placeholder = f"{{env:{SESSION_TOKEN_ENV_VAR}}}"
+    api_key_val = (
+        api_key_override
+        if api_key_override is not None
+        else f"{{env:{SESSION_TOKEN_ENV_VAR}}}"
+    )
     effective_base_url = api_base_url_override or endpoint.api_base_url
     effective_python = lab_python or (
         VENV_PYTHON if VENV_PYTHON.exists() else Path(sys.executable)
@@ -486,18 +875,22 @@ def render_private_attested_config(
     trust_label = f"Rung {endpoint.data_control_rung} {endpoint.trust_tier}"
     subagent_enabled_str = "true" if allow_subagents else "false"
     subagent_perm_str = "allow" if allow_subagents else "deny"
+    plugins_json_str = json.dumps([str(p) for p in plugins])
 
     rendered = (
-        tmpl.replace("__API_BASE_URL__", _json_escape(effective_base_url))
-        .replace("__API_KEY_VALUE__", _json_escape(api_key_placeholder))
+        tmpl.replace("__PLUGINS_JSON__", plugins_json_str)
+        .replace("__API_BASE_URL__", _json_escape(effective_base_url))
+        .replace("__API_KEY_VALUE__", _json_escape(api_key_val))
         .replace("__SERVED_MODEL_ID__", _json_escape(endpoint.served_model_id))
         .replace("__MODEL_ID__", _json_escape(endpoint.model_id))
         .replace("__TRUST_TIER__", _json_escape(trust_label))
         .replace("__CONTEXT_LIMIT__", str(int(effective_context_limit)))
         .replace("__OUTPUT_LIMIT__", str(int(effective_output_limit)))
         .replace("__EDIT_PERMISSION__", _json_escape(edit_permission))
+        .replace("__BASH_PERMISSION__", _json_escape(bash_permission))
         .replace("__SUBAGENT_ENABLED__", subagent_enabled_str)
         .replace("__SUBAGENT_PERMISSION__", _json_escape(subagent_perm_str))
+        .replace("__LOCAL_ASSIST_BASE_URL__", _json_escape(local_assist_base_url))
         .replace("__LAB_PYTHON__", _json_escape(effective_python))
         .replace("__LAB_ROOT__", _json_escape(effective_root))
         .replace("__WORKSPACE_DIR__", _json_escape(effective_workspace))
@@ -512,6 +905,7 @@ def build_private_attested_env(
     opencode_config_path: Path,
     endpoint: EndpointConfig,
     *,
+    local_assist_base_url: str = RUNG1_LOCAL_ASSIST_BASE_URL,
     preserve_host_home: bool = False,
     base_env: dict[str, str] | None = None,
 ) -> dict[str, str]:
@@ -526,14 +920,20 @@ def build_private_attested_env(
         workspace_dir,
         isolated_home,
         opencode_config_path,
-        local_assist_base_url=RUNG1_LOCAL_ASSIST_BASE_URL,
+        local_assist_base_url=local_assist_base_url,
         preserve_host_home=preserve_host_home,
         base_env=base_env,
-        extra_env={SESSION_TOKEN_ENV_VAR: endpoint.api_key},
     )
-    # L2: Never export LOCAL_ASSIST_ALLOW_ATTESTED_TEE or LOCAL_ASSIST_ALLOW_UNCLEARED_TEE
-    env.pop("LOCAL_ASSIST_ALLOW_ATTESTED_TEE", None)
-    env.pop("LOCAL_ASSIST_ALLOW_UNCLEARED_TEE", None)
+    # Never export session tokens, control passwords, or TEE admission flags to child environments.
+    for secret_key in (
+        SESSION_TOKEN_ENV_VAR,
+        "OPENCODE_PASSWORD",
+        "OPENCODE_SERVER_PASSWORD",
+        "_FREE_INFERENCE_TOKEN_FD",
+        "LOCAL_ASSIST_ALLOW_ATTESTED_TEE",
+        "LOCAL_ASSIST_ALLOW_UNCLEARED_TEE",
+    ):
+        env.pop(secret_key, None)
     return env
 
 
@@ -553,6 +953,7 @@ def ensure_model_served(
     explicit_cap_flags: Any = (),
     thinking: bool = False,
     explicit_thinking: bool = False,
+    handoff_token: str | None = None,
     runs_dir: Path | None = None,
     run_cmd: Any = subprocess.run,
 ) -> tuple[bool, str | None, dict[str, Any] | None]:
@@ -580,6 +981,41 @@ def ensure_model_served(
     serve_script = str(ROOT / "scripts" / "serve-model")
     stop_script = str(ROOT / "scripts" / "stop-model")
 
+    def _invoke_verify(verify_cmd_args: list[str]) -> Any:
+        if handoff_token and run_cmd is subprocess.run:
+            rfd, wfd = os.pipe()
+            try:
+                os.write(wfd, handoff_token.encode("utf-8"))
+            finally:
+                os.close(wfd)
+            try:
+                verify_env = dict(os.environ)
+                verify_env.pop(SESSION_TOKEN_ENV_VAR, None)
+                verify_env.pop("OPENCODE_PASSWORD", None)
+                verify_env.pop("OPENCODE_SERVER_PASSWORD", None)
+                verify_env["_FREE_INFERENCE_TOKEN_FD"] = str(rfd)
+                return run_cmd(
+                    verify_cmd_args,
+                    cwd=str(ROOT),
+                    env=verify_env,
+                    pass_fds=(rfd,),
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            finally:
+                try:
+                    os.close(rfd)
+                except OSError:
+                    pass
+        return run_cmd(
+            verify_cmd_args,
+            cwd=str(ROOT),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
     pre_refresh_rec = read_pid_record_for_model(endpoint.model_id, runs_dir)
     rec_port_val = (pre_refresh_rec or {}).get("port")
     if explicit_port is not None:
@@ -597,13 +1033,7 @@ def ensure_model_served(
     initial_verify_cmd = [verify_script, endpoint.model_id]
     if target_port is not None:
         initial_verify_cmd.extend(["--port", str(target_port)])
-    initial = run_cmd(
-        initial_verify_cmd,
-        cwd=str(ROOT),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    initial = _invoke_verify(initial_verify_cmd)
     if initial.returncode == 0 and not refresh_session:
         active_rec = read_pid_record_for_model(endpoint.model_id, runs_dir)
         try:
@@ -820,13 +1250,7 @@ def ensure_model_served(
     wait_verify_cmd = [verify_script, endpoint.model_id, "--wait", str(wait_seconds)]
     if target_port is not None:
         wait_verify_cmd.extend(["--port", str(target_port)])
-    wait_res = run_cmd(
-        wait_verify_cmd,
-        cwd=str(ROOT),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    wait_res = _invoke_verify(wait_verify_cmd)
     if wait_res.returncode == 0:
         active_rec = read_pid_record_for_model(endpoint.model_id, runs_dir)
         if active_rec is not None:
@@ -890,7 +1314,7 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     parser = argparse.ArgumentParser(
         description=(
             "Launch opencode against a Rung 2/3 private-attested enclave proxy "
-            "(tinfoil-proxy + se-key-proxy) with isolated state, project-config "
+            "(attesting proxy + se-key-proxy) with isolated state, project-config "
             "lockdown, session spend ceiling, and Rung 1 local_assist MCP."
         ),
         epilog=(
@@ -899,7 +1323,7 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
             "tool outputs returned to the planner to the attested enclave under the model's "
             "remote_trust.tier (for example enclave_runtime_attested) and usage_policy "
             "(provider_terms_apply). Always place '--' before opencode subcommands or flags "
-            "(for example: opencode-attested --model tinfoil-deepseek-v4-1-flash "
+            "(for example: opencode-attested --model <model-id> "
             "--allow-uncleared-model -- run 'prompt')."
         ),
     )
@@ -907,8 +1331,11 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
         "--model",
         default=None,
         help=(
-            "Rung 2/3 model id from models.yaml. If omitted, selects the single model "
-            "with routing.private_attested='cleared' (or refuses when none is cleared)."
+            "Rung 2/3 model id from models.yaml. If omitted, honors "
+            f"{DEFAULT_ATTESTED_MODEL_ENV_VAR}, then routing.default_private_attested=true "
+            "at the highest cleared data-control rung, then active session / installed proxy / "
+            "sealed envelope narrowing within that rung, then LIFO catalog order (or refuses "
+            "when no model is cleared)."
         ),
     )
     parser.add_argument(
@@ -999,6 +1426,11 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
 
 
 def main(argv: list[str]) -> int:
+    tok_ok, handoff_token, tok_err = _consume_handoff_token()
+    if not tok_ok:
+        print(tok_err or "Failed to consume handoff token.", file=sys.stderr)
+        return 1
+
     caller_cwd = Path.cwd()
     args, opencode_args = parse_args(argv)
 
@@ -1086,7 +1518,16 @@ def main(argv: list[str]) -> int:
 
     effective_no_serve = True if active_profile is not None else args.no_serve
 
+    prechecked_isolated_home: Path | None = None
+    if active_profile is None:
+        prechecked_isolated_home = _resolve_isolated_home()
+        legacy_err = check_uncontained_legacy_home(prechecked_isolated_home)
+        if legacy_err is not None:
+            print(legacy_err, file=sys.stderr)
+            return 1
+
     try:
+        local_assist_base_url, local_assist_port = _resolve_local_assist_base_url()
         model_id = args.model or resolve_default_attested_model_id()
         model = load_model(model_id)
         initial_pid_record = read_pid_record_for_model(model_id)
@@ -1110,6 +1551,7 @@ def main(argv: list[str]) -> int:
             pid_record=initial_pid_record,
             require_api_key=False,
             port_override=args.port,
+            session_token_override=handoff_token,
         )
         validate_private_attested_endpoint(
             endpoint_pre,
@@ -1125,7 +1567,9 @@ def main(argv: list[str]) -> int:
         print("opencode binary not found on PATH", file=sys.stderr)
         return 1
 
-    sandbox_exec_bin = Path("/usr/bin/sandbox-exec")
+    sandbox_exec_bin = Path(
+        os.environ.get("FREE_INFERENCE_SANDBOX_EXEC_BIN", "/usr/bin/sandbox-exec")
+    )
     worker_ok, validated_worker_args, worker_err = validate_worker_binary_and_args(
         args,
         active_profile,
@@ -1152,6 +1596,7 @@ def main(argv: list[str]) -> int:
         explicit_cap_flags=getattr(args, "explicit_cap_flags", ()),
         thinking=bool(getattr(args, "thinking", False)),
         explicit_thinking=bool(getattr(args, "explicit_thinking", False)),
+        handoff_token=handoff_token,
     )
     if not ok or session_meta is None:
         print(err_msg or "Failed to verify served model", file=sys.stderr)
@@ -1171,6 +1616,7 @@ def main(argv: list[str]) -> int:
             pid_record=active_pid_record,
             require_api_key=True,
             port_override=post_port_override,
+            session_token_override=handoff_token,
         )
         validate_private_attested_endpoint(
             endpoint,
@@ -1181,6 +1627,26 @@ def main(argv: list[str]) -> int:
         print(str(exc), file=sys.stderr)
         return 1
 
+    from local_assist.session import SessionLeaseSupplier, status_for_record, control_path, control_node_present
+    from local_assist.registry import _effective_runs_dir
+    session_runs = _effective_runs_dir()
+    lease_supplier = None
+    if isinstance(active_pid_record, dict):
+        session_meta['live_status'] = status_for_record(active_pid_record, session_runs)
+        if handoff_token:
+            pass  # Explicit credential overrides remain authoritative; never replace from disk.
+        elif session_meta['live_status']['state'] == 'ON':
+            lease_supplier = SessionLeaseSupplier(active_pid_record, session_runs)
+            try:
+                lease_supplier()
+            except Exception:
+                print('Cannot verify the active session lease; refusing launch.', file=sys.stderr)
+                return 1
+        elif control_node_present(control_path(session_runs, endpoint.model_id)):
+            print('Session control is present but unverifiable; refusing launch.', file=sys.stderr)
+            return 1
+        else:
+            print('Live session control is unavailable; using the legacy fixed launch window.', file=sys.stderr)
     print(
         format_session_banner(
             endpoint,
@@ -1205,26 +1671,28 @@ def main(argv: list[str]) -> int:
             file=sys.stderr,
         )
 
+    upstream_port_val = (
+        int(active_pid_record["upstream_port"])
+        if isinstance(active_pid_record, dict)
+        and isinstance(active_pid_record.get("upstream_port"), int)
+        else ((endpoint.port + 1000) if endpoint.port is not None else 9181)
+    )
+
+    session_default_chat_params: dict[str, Any] | None = None
+    if isinstance(active_pid_record, dict) and isinstance(
+        active_pid_record.get("default_chat_params"), dict
+    ):
+        session_default_chat_params = dict(active_pid_record["default_chat_params"])
+    elif not bool(getattr(args, "thinking", False)):
+        raw_prov = model.get("promptfoo_provider")
+        raw_cfg = raw_prov.get("config") if isinstance(raw_prov, dict) else None
+        raw_pt = raw_cfg.get("passthrough") if isinstance(raw_cfg, dict) else None
+        if isinstance(raw_pt, dict) and raw_pt:
+            session_default_chat_params = dict(raw_pt)
+
     if active_profile is not None:
-        upstream_port_val = (
-            int(active_pid_record["upstream_port"])
-            if isinstance(active_pid_record, dict)
-            and isinstance(active_pid_record.get("upstream_port"), int)
-            else 9181
-        )
-
-        worker_default_chat_params: dict[str, Any] | None = None
-        if isinstance(active_pid_record, dict) and isinstance(
-            active_pid_record.get("default_chat_params"), dict
-        ):
-            worker_default_chat_params = dict(active_pid_record["default_chat_params"])
-        elif not bool(getattr(args, "thinking", False)):
-            raw_prov = model.get("promptfoo_provider")
-            raw_cfg = raw_prov.get("config") if isinstance(raw_prov, dict) else None
-            raw_pt = raw_cfg.get("passthrough") if isinstance(raw_cfg, dict) else None
-            if isinstance(raw_pt, dict) and raw_pt:
-                worker_default_chat_params = dict(raw_pt)
-
+        worker_ttl = min(session_meta['ttl_seconds'], session_meta.get('live_status', {}).get(
+            'remaining_seconds', session_meta['ttl_seconds']))
         def _build_att_base_cfg(relay: _WorkerTokenRelay | None) -> dict[str, Any]:
             assert relay is not None
             base_config_text = render_private_attested_config(
@@ -1235,6 +1703,7 @@ def main(argv: list[str]) -> int:
                 max_request_bytes=sess_bytes_cap,
                 edit_permission="allow",
                 allow_subagents=bool(active_profile.allow_subagents),
+                local_assist_base_url=local_assist_base_url,
                 workspace_dir=caller_cwd,
                 api_base_url_override=relay.api_base_url,
             )
@@ -1273,19 +1742,25 @@ def main(argv: list[str]) -> int:
                 max_chat_requests=int(session_meta["max_chat_requests"]),
                 max_request_bytes=sess_bytes_cap,
                 max_tokens_cap=sess_tokens_cap,
+                ttl_seconds=float(worker_ttl),
                 upstream_timeout_seconds=float(args.stream_timeout_seconds),
-                default_chat_params=worker_default_chat_params,
+                default_chat_params=session_default_chat_params,
+                lease_provider=lease_supplier,
             ),
             upstream_port=upstream_port_val,
+            endpoint_port=endpoint.port,
+            local_assist_port=local_assist_port,
             use_token_relay=True,
             allocate_worker_home_fn=allocate_worker_home,
         )
 
-    isolated_home = DEFAULT_ISOLATED_HOME
-    for subdir in (".config", ".local/share", ".cache", ".local/state"):
-        (isolated_home / subdir).mkdir(parents=True, exist_ok=True)
-
+    isolated_home = (
+        prechecked_isolated_home
+        if prechecked_isolated_home is not None
+        else _resolve_isolated_home()
+    )
     edit_permission = "allow" if args.allow_edit else "ask"
+    bash_permission = "allow" if bool(getattr(args, "allow_bash", False)) else "ask"
     config_text = render_private_attested_config(
         endpoint,
         context_limit=args.context_limit,
@@ -1293,7 +1768,9 @@ def main(argv: list[str]) -> int:
         max_tokens_cap=sess_tokens_cap,
         max_request_bytes=sess_bytes_cap,
         edit_permission=edit_permission,
+        bash_permission=bash_permission,
         allow_subagents=bool(getattr(args, "allow_subagents", False)),
+        local_assist_base_url=local_assist_base_url,
         workspace_dir=caller_cwd,
     )
 
@@ -1315,6 +1792,7 @@ def main(argv: list[str]) -> int:
             isolated_home,
             cfg_path,
             endpoint,
+            local_assist_base_url=local_assist_base_url,
             preserve_host_home=args.preserve_host_home,
         ),
         current_sync=current_sync,
@@ -1332,6 +1810,28 @@ def main(argv: list[str]) -> int:
             "isolated_home": str(isolated_home),
             "config": parsed_cfg,
         },
+        relay_factory=lambda svc_pw: SessionAuthRelay(
+            upstream_base_url=endpoint.api_base_url,
+            upstream_session_token=endpoint.api_key,
+            token_prefix="oc-relay",
+            extra_canary_secrets=[svc_pw],
+            max_chat_requests=int(session_meta["max_chat_requests"]),
+            max_request_bytes=sess_bytes_cap,
+            max_tokens_cap=sess_tokens_cap,
+            ttl_seconds=float(session_meta.get("ttl_seconds") or eff_ttl),
+            upstream_timeout_seconds=float(args.stream_timeout_seconds),
+            default_chat_params=session_default_chat_params,
+            lease_provider=lease_supplier,
+            follow_session_window=lease_supplier is not None,
+        ),
+        endpoint_port=endpoint.port,
+        upstream_port=upstream_port_val,
+        local_assist_port=local_assist_port,
+        use_token_relay=True,
+        allowed_shell_localhost_ports=tuple(getattr(args, "allow_shell_localhost_port", None) or ()),
+        allow_ssh_remote=bool(getattr(args, "allow_ssh_remote", False)),
+        allow_self_edit=bool(getattr(args, "allow_self_edit", False)),
+        sandbox_exec_bin=sandbox_exec_bin,
     )
 
 

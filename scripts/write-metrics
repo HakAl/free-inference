@@ -15,8 +15,19 @@ if __name__ == "__main__" and VENV_PYTHON.exists() and Path(sys.executable) != V
 
 sys.path.insert(0, str(ROOT))
 
-from local_assist.registry import RegistryError, load_model
-from local_assist.se_key import scan_and_redact_directory_tokens
+from local_assist.registry import (
+    RegistryError,
+    load_model,
+    read_pid_record_for_model,
+    resolve_endpoint,
+)
+from local_assist.se_key import (
+    PROTECTED_REPO_HOME_DIR_NAMES,
+    resolve_authorized_scan_root,
+    scan_and_redact_directory_tokens,
+)
+
+WRITE_METRICS_FORBIDDEN_HOME_DIRS = PROTECTED_REPO_HOME_DIR_NAMES - frozenset({".promptfoo"})
 
 
 def version(package: str) -> Optional[str]:
@@ -51,7 +62,7 @@ def _load_optional_json(path: Path) -> tuple[Optional[dict], Optional[str]]:
         return None, str(exc)
 
 
-def main(argv: list[str]) -> int:
+def main(argv: list[str], *, root_dir: Path = ROOT) -> int:
     if len(argv) != 7:
         print(
             "usage: scripts/write-metrics <suite> <model-id> <provider-id> <config> <promptfoo-status> <out-dir>",
@@ -62,25 +73,91 @@ def main(argv: list[str]) -> int:
     suite, model_id, provider_id, config, promptfoo_status, out_dir_arg = argv[1:]
     out_dir = Path(out_dir_arg)
 
-    # Always scan and redact session tokens first before parsing any JSON artifacts
-    session_token_scan = scan_and_redact_directory_tokens(
-        [out_dir, ROOT / ".home" / ".promptfoo"]
-    )
-    session_token_redactions = int(session_token_scan.get("redactions_applied") or 0)
-    session_token_matches = int(session_token_scan.get("matches_found") or 0)
-
+    active_session_token: str | None = None
+    model: dict | None = None
+    model_err: str | None = None
     try:
         model = load_model(model_id)
+        pid_record = read_pid_record_for_model(model_id, runs_dir=root_dir / "runs")
+        ep = resolve_endpoint(
+            model,
+            pid_record=pid_record,
+            require_api_key=False,
+            require_eval_evidence_file=False,
+        )
+        if ep.api_key.startswith("se-session-"):
+            active_session_token = ep.api_key
     except RegistryError as exc:
-        print(str(exc), file=sys.stderr)
+        model_err = str(exc)
+
+    scan_root_errors: list[str] = []
+    scan_roots: list[Path] = []
+    out_real: Path | None = None
+    try:
+        out_real = resolve_authorized_scan_root(
+            out_dir,
+            root_dir=root_dir,
+            forbidden_home_subdirs=WRITE_METRICS_FORBIDDEN_HOME_DIRS,
+            allow_symlink_alias=False,
+        )
+        scan_roots.append(out_real)
+    except ValueError as exc:
+        scan_root_errors.append(str(exc))
+
+    pf_cache = root_dir / ".home" / ".promptfoo"
+    try:
+        pf_real = resolve_authorized_scan_root(
+            pf_cache,
+            root_dir=root_dir,
+            forbidden_home_subdirs=WRITE_METRICS_FORBIDDEN_HOME_DIRS,
+            allow_symlink_alias=True,
+        )
+        scan_roots.append(pf_real)
+    except ValueError as exc:
+        scan_root_errors.append(str(exc))
+
+    if out_real is None:
+        print(
+            f"ERROR: invalid out_dir scan root '{out_dir}': {'; '.join(scan_root_errors)}",
+            file=sys.stderr,
+        )
         return 1
 
-    timing_path = out_dir / "timing.json"
+    # Always scan and redact session tokens first before parsing any JSON artifacts
+    session_token_scan = scan_and_redact_directory_tokens(
+        scan_roots,
+        active_session_token=active_session_token,
+    )
+    skipped_roots = session_token_scan.get("skipped_roots") or []
+    missing_roots = session_token_scan.get("missing_roots") or []
+    walk_errors = [
+        item
+        for item in (session_token_scan.get("files_skipped") or [])
+        if str(item.get("reason", "")).startswith(("walk_error", "lstat_error"))
+    ]
+    scan_roots_ok = (
+        len(scan_root_errors) == 0
+        and str(out_real) not in missing_roots
+        and len(skipped_roots) == 0
+        and len(walk_errors) == 0
+    )
+    session_token_scan["scan_roots_ok"] = scan_roots_ok
+    if scan_root_errors:
+        session_token_scan["root_validation_errors"] = scan_root_errors
+    session_token_redactions = int(session_token_scan.get("redactions_applied") or 0)
+    session_token_matches = int(session_token_scan.get("matches_found") or 0)
+    active_token_matches = int(session_token_scan.get("active_token_matches_found") or 0)
+
+    if model is None:
+        print(model_err or f"Unknown model: {model_id}", file=sys.stderr)
+        return 1
+
+    timing_path = out_real / "timing.json"
     timing_probe, timing_probe_error = _load_optional_json(timing_path)
-    tools_timing_path = out_dir / "tools_timing.json"
+    tools_timing_path = out_real / "tools_timing.json"
     tools_timing_probe, tools_timing_probe_error = _load_optional_json(tools_timing_path)
 
-    output_path = out_dir / "output.json"
+    output_path = out_real / "output.json"
     suite_requests = 0
     suite_prompt_tokens = 0
     suite_completion_tokens = 0
@@ -152,7 +229,7 @@ def main(argv: list[str]) -> int:
         "provider_id": provider_id,
         "config": config,
         "promptfoo_status": int(promptfoo_status),
-        "promptfoo_output": str(out_dir / "output.json"),
+        "promptfoo_output": str(out_real / "output.json"),
         "timing_probe": timing_probe,
         "timing_probe_error": timing_probe_error,
         "timing_probe_note": "Standalone streaming sanity prompt only; not per-suite prompt timing.",
@@ -176,11 +253,19 @@ def main(argv: list[str]) -> int:
             "promptfoo": node_package_version("promptfoo"),
         },
     }
-    (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
-    if session_token_redactions > 0 or session_token_matches > 0:
+    (out_real / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\n")
+    if not scan_roots_ok:
+        print(
+            f"ERROR: invalid or skipped session-token scan root(s) for {out_dir} or .home/.promptfoo "
+            f"(root_validation_errors={scan_root_errors}, skipped_roots={skipped_roots})",
+            file=sys.stderr,
+        )
+        return 1
+    if session_token_redactions > 0 or session_token_matches > 0 or active_token_matches > 0:
         print(
             f"ERROR: detected leaked se-session-* token(s) in {out_dir} or .home/.promptfoo "
-            f"(redactions_applied={session_token_redactions}, matches_found={session_token_matches})",
+            f"(redactions_applied={session_token_redactions}, matches_found={session_token_matches}, "
+            f"active_token_matches_found={active_token_matches})",
             file=sys.stderr,
         )
         return 1

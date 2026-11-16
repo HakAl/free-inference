@@ -584,6 +584,9 @@ class LocalAssistTests(unittest.TestCase):
                         "extract_fields",
                         "compress_context",
                         "delegate_task",
+                        "assist_status",
+                        "check_eval_assertion",
+                        "select_context",
                     ],
                 )
             finally:
@@ -1010,10 +1013,19 @@ raise SystemExit(main())
                                 "extract_fields",
                                 "compress_context",
                                 "delegate_task",
+                                "assist_status",
+                                "check_eval_assertion",
+                                "select_context",
                             ],
                         )
                         for tool in tools:
-                            self.assertEqual(tool.get("annotations"), expected_annotations)
+                            if tool["name"] == "assist_status":
+                                self.assertEqual(
+                                    tool.get("annotations"),
+                                    {"readOnlyHint": True, "openWorldHint": False},
+                                )
+                            else:
+                                self.assertEqual(tool.get("annotations"), expected_annotations)
 
                         self.assertFalse(call_resp["result"]["isError"])
                         self.assertEqual(
@@ -1507,10 +1519,13 @@ tool_timeout_sec = 180
                 self.assertEqual(
                     sorted(x.get("name") for x in ns_entries[0].get("tools", [])),
                     [
+                        "assist_status",
+                        "check_eval_assertion",
                         "compress_context",
                         "delegate_task",
                         "extract_fields",
                         "propose_eval_prompts",
+                        "select_context",
                     ],
                 )
                 unapproved_fc_outs = [
@@ -1756,10 +1771,13 @@ tool_timeout_sec = 180
                 self.assertEqual(
                     sorted(c_tools),
                     [
+                        "mcp__local_assist__assist_status",
+                        "mcp__local_assist__check_eval_assertion",
                         "mcp__local_assist__compress_context",
                         "mcp__local_assist__delegate_task",
                         "mcp__local_assist__extract_fields",
                         "mcp__local_assist__propose_eval_prompts",
+                        "mcp__local_assist__select_context",
                     ],
                 )
                 last_user_msg = claude_turns[-1]["messages"][-1]
@@ -2418,10 +2436,16 @@ srv.serve_forever()
                         )
                         list_resp = self._recv(proc)
                         for tool in list_resp["result"]["tools"]:
-                            self.assertEqual(
-                                tool.get("annotations"),
-                                {"readOnlyHint": False, "openWorldHint": False},
-                            )
+                            if tool["name"] == "assist_status":
+                                self.assertEqual(
+                                    tool.get("annotations"),
+                                    {"readOnlyHint": True, "openWorldHint": False},
+                                )
+                            else:
+                                self.assertEqual(
+                                    tool.get("annotations"),
+                                    {"readOnlyHint": False, "openWorldHint": False},
+                                )
 
                         self._send(
                             proc,
@@ -2537,6 +2561,682 @@ srv.serve_forever()
                     backend_proc.stderr.close()
             proxy_srv.shutdown()
             proxy_srv.server_close()
+
+    def test_mcp_and_cli_caller_telemetry_sanitization_and_session_isolation(self) -> None:
+        import io
+        import os
+        import tempfile
+        from unittest import mock
+
+        from local_assist import server
+        from local_assist.client import ChatResult
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_dir = Path(tmpdir) / "logs"
+            fake_result = ChatResult(
+                text='{"extracted":{"amount":42},"extraction_note":null}',
+                raw_text='{"extracted":{"amount":42},"extraction_note":null}',
+                served_model="mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit",
+                usage={"prompt_tokens": 20, "completion_tokens": 10, "total_tokens": 30},
+                latency_ms=55,
+                finish_reason="stop",
+            )
+
+            def _make_line_stream(messages: list[dict[str, Any]]) -> io.BytesIO:
+                return io.BytesIO(
+                    b"".join((json.dumps(m) + "\n").encode("utf-8") for m in messages)
+                )
+
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {
+                        "LOCAL_ASSIST_LOG_DIR": str(log_dir),
+                        "LOCAL_ASSIST_CALLER": "codex\r\n\x1b",
+                    },
+                    clear=False,
+                ),
+                mock.patch(
+                    "local_assist.tools.extract_fields.require_chat_succeeds",
+                    return_value="mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit",
+                ),
+                mock.patch("local_assist.tools.extract_fields.chat", return_value=fake_result),
+            ):
+                in1 = _make_line_stream(
+                    [
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "initialize",
+                            "params": {
+                                "protocolVersion": "2025-03-26",
+                                "clientInfo": {
+                                    "name": "codex-mcp\x00\nclient",
+                                    "version": "0.164.0\t" + ("x" * 200),
+                                },
+                            },
+                        },
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 2,
+                            "method": "tools/call",
+                            "params": {
+                                "name": "extract_fields",
+                                "arguments": {
+                                    "text": "Invoice 42",
+                                    "fields": {
+                                        "amount": {"type": "integer", "description": "amt"}
+                                    },
+                                },
+                            },
+                        },
+                    ]
+                )
+                out1 = io.BytesIO()
+                self.assertEqual(server.serve_stdio(in1, out1), 0)
+
+            with (
+                mock.patch.dict(
+                    os.environ,
+                    {"LOCAL_ASSIST_LOG_DIR": str(log_dir)},
+                    clear=False,
+                ),
+                mock.patch(
+                    "local_assist.tools.extract_fields.require_chat_succeeds",
+                    return_value="mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit",
+                ),
+                mock.patch("local_assist.tools.extract_fields.chat", return_value=fake_result),
+            ):
+                os.environ.pop("LOCAL_ASSIST_CALLER", None)
+                in2 = _make_line_stream(
+                    [
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "method": "initialize",
+                            "params": {"protocolVersion": "2024-11-05"},
+                        },
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 2,
+                            "method": "tools/call",
+                            "params": {
+                                "name": "extract_fields",
+                                "arguments": {
+                                    "text": "Invoice 42",
+                                    "fields": {
+                                        "amount": {"type": "integer", "description": "amt"}
+                                    },
+                                },
+                            },
+                        },
+                    ]
+                )
+                out2 = io.BytesIO()
+                self.assertEqual(server.serve_stdio(in2, out2), 0)
+
+                # Unexpected internal Exception inside tool body must be logged as internal_error
+                with mock.patch(
+                    "local_assist.tools.extract_fields.chat",
+                    side_effect=RuntimeError("boom-internal"),
+                ):
+                    err_resp = server.handle_request(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 99,
+                            "method": "tools/call",
+                            "params": {
+                                "name": "extract_fields",
+                                "arguments": {
+                                    "text": "Invoice 42",
+                                    "fields": {
+                                        "amount": {"type": "integer", "description": "amt"}
+                                    },
+                                },
+                            },
+                        }
+                    )
+                    assert err_resp is not None
+                    self.assertTrue(err_resp["result"]["isError"])
+                    self.assertEqual(
+                        err_resp["result"]["structuredContent"]["code"], "internal_error"
+                    )
+
+            # CLI delegate-local invocation (validation failure before network) records cli caller
+            cli_env = dict(os.environ)
+            cli_env["LOCAL_ASSIST_LOG_DIR"] = str(log_dir)
+            cli_env.pop("LOCAL_ASSIST_CALLER", None)
+            cli_res = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "scripts" / "delegate-local"),
+                    "extract_fields",
+                    "--text",
+                    "   ",
+                    "--fields-json",
+                    "{}",
+                ],
+                cwd=str(ROOT),
+                env=cli_env,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            self.assertEqual(cli_res.returncode, 1)
+
+            jsonl_files = sorted(log_dir.glob("*.jsonl"))
+            self.assertEqual(len(jsonl_files), 1)
+            rows = [
+                json.loads(line)
+                for line in jsonl_files[0].read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(len(rows), 4)
+
+            row1, row2, row3, row4 = rows
+            self.assertEqual(row1["caller"]["transport"], "mcp")
+            self.assertEqual(row1["caller"]["client_name"], "codex-mcp client")
+            self.assertEqual(len(row1["caller"]["client_version"]), 128)
+            self.assertEqual(row1["caller"]["protocol_version"], "2025-03-26")
+            self.assertEqual(row1["caller"]["label"], "codex")
+            self.assertTrue(row1["readiness_ok"])
+            self.assertIsInstance(row1["ready_ms"], int)
+            self.assertIsInstance(row1["elapsed_ms"], int)
+
+            # Session 2 must not inherit client_name, client_version, or label from Session 1
+            self.assertEqual(
+                row2["caller"],
+                {"transport": "mcp", "protocol_version": "2024-11-05"},
+            )
+
+            # Row 3: unhandled RuntimeError recorded as internal_error with readiness_ok=True
+            self.assertEqual(row3["finish_reason"], "error")
+            self.assertEqual(row3["observed"]["error"], "internal_error")
+            self.assertTrue(row3["readiness_ok"])
+
+            # Row 4: CLI delegate-local validation failure before readiness
+            self.assertEqual(
+                row4["caller"],
+                {"transport": "cli", "client_name": "delegate-local"},
+            )
+            self.assertIsNone(row4["startup_state"])
+            self.assertIsNone(row4["readiness_ok"])
+            self.assertIsNone(row4["ready_ms"])
+
+    def test_startup_state_readiness_phase_and_slow_warm_vs_autoserve(self) -> None:
+        import os
+        import tempfile
+        import time
+        from unittest import mock
+
+        from local_assist import lifecycle
+        from local_assist.client import ChatResult
+        from local_assist.errors import ModelTimeout, ModelUnavailable
+        from local_assist.tools import extract_fields
+
+        served_id = "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit"
+        smoke_ok = ChatResult(
+            text="OK",
+            raw_text="OK",
+            served_model=served_id,
+            usage={"prompt_tokens": 5, "completion_tokens": 1, "total_tokens": 6},
+            latency_ms=8,
+            finish_reason="stop",
+        )
+        tool_ok = ChatResult(
+            text='{"extracted":{"amount":7},"extraction_note":null}',
+            raw_text='{"extracted":{"amount":7},"extraction_note":null}',
+            served_model=served_id,
+            usage={"prompt_tokens": 25, "completion_tokens": 12, "total_tokens": 37},
+            latency_ms=42,
+            finish_reason="stop",
+        )
+        fields_spec = {"amount": {"type": "integer", "description": "amt"}}
+        orig_ensure = lifecycle.ensure_local_model_served
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_dir = Path(tmpdir) / "logs"
+            with mock.patch.dict(
+                os.environ,
+                {"LOCAL_ASSIST_LOG_DIR": str(log_dir), "LOCAL_ASSIST_AUTO_SERVE": "1"},
+                clear=False,
+            ):
+                # 1. Slow warm call (> 1.0s inside verify-served-model): startup_state == "warm"
+                def slow_warm_runner(cmd: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+                    time.sleep(1.05)
+                    return subprocess.CompletedProcess(cmd, 0, stdout="ok\n", stderr="")
+
+                with (
+                    mock.patch.object(
+                        lifecycle,
+                        "ensure_local_model_served",
+                        wraps=lambda m, **kw: orig_ensure(
+                            m, run_cmd=slow_warm_runner, **kw
+                        ),
+                    ),
+                    mock.patch.object(lifecycle, "get_models", return_value=[served_id]),
+                    mock.patch.object(lifecycle, "chat", return_value=smoke_ok),
+                    mock.patch("local_assist.tools.extract_fields.chat", return_value=tool_ok),
+                ):
+                    extract_fields.run("Amount 7", fields_spec)
+
+                # 2. Fresh auto-serve start ("PID 4242; log ...") -> startup_state == "auto_served"
+                auto_calls: list[list[str]] = []
+
+                def fresh_autoserve_runner(
+                    cmd: list[str], **kwargs: Any
+                ) -> subprocess.CompletedProcess[str]:
+                    auto_calls.append(list(cmd))
+                    script_name = Path(cmd[1]).name
+                    if script_name == "verify-served-model" and "--wait" not in cmd:
+                        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="down")
+                    if script_name == "serve-model":
+                        return subprocess.CompletedProcess(
+                            cmd, 0, stdout="PID 4242; log runs/serve.log\n", stderr=""
+                        )
+                    return subprocess.CompletedProcess(cmd, 0, stdout="ready\n", stderr="")
+
+                with (
+                    mock.patch.object(
+                        lifecycle,
+                        "ensure_local_model_served",
+                        wraps=lambda m, **kw: orig_ensure(
+                            m, run_cmd=fresh_autoserve_runner, **kw
+                        ),
+                    ),
+                    mock.patch.object(lifecycle, "get_models", return_value=[served_id]),
+                    mock.patch.object(lifecycle, "chat", return_value=smoke_ok),
+                    mock.patch("local_assist.tools.extract_fields.chat", return_value=tool_ok),
+                ):
+                    extract_fields.run("Amount 7", fields_spec)
+
+                # 3. Concurrent reuse on auto-serve path -> startup_state == "auto_serve_reused"
+                def reused_autoserve_runner(
+                    cmd: list[str], **kwargs: Any
+                ) -> subprocess.CompletedProcess[str]:
+                    script_name = Path(cmd[1]).name
+                    if script_name == "verify-served-model" and "--wait" not in cmd:
+                        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="transient")
+                    if script_name == "serve-model":
+                        return subprocess.CompletedProcess(
+                            cmd,
+                            0,
+                            stdout=(
+                                "Server for 'qwen3-30b-a3b-2507-mlx-4bit' is already active "
+                                "(or starting) on port 8080 (pid=4242, http://127.0.0.1:8080/v1).\n"
+                            ),
+                            stderr="",
+                        )
+                    return subprocess.CompletedProcess(cmd, 0, stdout="ready\n", stderr="")
+
+                with (
+                    mock.patch.object(
+                        lifecycle,
+                        "ensure_local_model_served",
+                        wraps=lambda m, **kw: orig_ensure(
+                            m, run_cmd=reused_autoserve_runner, **kw
+                        ),
+                    ),
+                    mock.patch.object(lifecycle, "get_models", return_value=[served_id]),
+                    mock.patch.object(lifecycle, "chat", return_value=smoke_ok),
+                    mock.patch("local_assist.tools.extract_fields.chat", return_value=tool_ok),
+                ):
+                    extract_fields.run("Amount 7", fields_spec)
+
+                # 4. Failed auto-serve -> startup_state == "auto_serve_failed", readiness_ok == False
+                def failed_autoserve_runner(
+                    cmd: list[str], **kwargs: Any
+                ) -> subprocess.CompletedProcess[str]:
+                    script_name = Path(cmd[1]).name
+                    if script_name == "verify-served-model":
+                        return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="down")
+                    return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="bind failed")
+
+                with mock.patch.object(
+                    lifecycle,
+                    "ensure_local_model_served",
+                    wraps=lambda m, **kw: orig_ensure(
+                        m, run_cmd=failed_autoserve_runner, **kw
+                    ),
+                ):
+                    with self.assertRaises(ModelUnavailable):
+                        extract_fields.run("Amount 7", fields_spec)
+
+                # 5. Warm readiness succeeds, subsequent completion chat() times out -> readiness_ok == True
+                def fast_warm_runner(
+                    cmd: list[str], **kwargs: Any
+                ) -> subprocess.CompletedProcess[str]:
+                    return subprocess.CompletedProcess(cmd, 0, stdout="ok\n", stderr="")
+
+                with (
+                    mock.patch.object(
+                        lifecycle,
+                        "ensure_local_model_served",
+                        wraps=lambda m, **kw: orig_ensure(
+                            m, run_cmd=fast_warm_runner, **kw
+                        ),
+                    ),
+                    mock.patch.object(lifecycle, "get_models", return_value=[served_id]),
+                    mock.patch.object(lifecycle, "chat", return_value=smoke_ok),
+                    mock.patch(
+                        "local_assist.tools.extract_fields.chat",
+                        side_effect=ModelTimeout("timeout", "completion timed out"),
+                    ),
+                ):
+                    with self.assertRaises(ModelTimeout):
+                        extract_fields.run("Amount 7", fields_spec)
+
+                # 6. Warm ensure_local_model_served succeeds, smoke chat inside require_chat_succeeds times out -> readiness_ok == False
+                with (
+                    mock.patch.object(
+                        lifecycle,
+                        "ensure_local_model_served",
+                        wraps=lambda m, **kw: orig_ensure(
+                            m, run_cmd=fast_warm_runner, **kw
+                        ),
+                    ),
+                    mock.patch.object(lifecycle, "get_models", return_value=[served_id]),
+                    mock.patch.object(
+                        lifecycle,
+                        "chat",
+                        side_effect=ModelTimeout("timeout", "smoke timed out"),
+                    ),
+                ):
+                    with self.assertRaises(ModelTimeout):
+                        extract_fields.run("Amount 7", fields_spec)
+
+            jsonl_files = sorted(log_dir.glob("*.jsonl"))
+            self.assertEqual(len(jsonl_files), 1)
+            rows = [
+                json.loads(line)
+                for line in jsonl_files[0].read_text(encoding="utf-8").splitlines()
+                if line.strip()
+            ]
+            self.assertEqual(len(rows), 6)
+
+            r_slow_warm, r_auto_fresh, r_auto_reused, r_auto_fail, r_comp_to, r_smoke_to = rows
+            self.assertEqual(r_slow_warm["startup_state"], "warm")
+            self.assertTrue(r_slow_warm["readiness_ok"])
+            self.assertGreaterEqual(r_slow_warm["ready_ms"], 1000)
+
+            self.assertEqual(r_auto_fresh["startup_state"], "auto_served")
+            self.assertTrue(r_auto_fresh["readiness_ok"])
+
+            self.assertEqual(r_auto_reused["startup_state"], "auto_serve_reused")
+            self.assertTrue(r_auto_reused["readiness_ok"])
+
+            self.assertEqual(r_auto_fail["startup_state"], "auto_serve_failed")
+            self.assertFalse(r_auto_fail["readiness_ok"])
+            self.assertIsInstance(r_auto_fail["ready_ms"], int)
+
+            self.assertEqual(r_comp_to["startup_state"], "warm")
+            self.assertTrue(r_comp_to["readiness_ok"])
+            self.assertEqual(r_comp_to["finish_reason"], "error")
+
+            self.assertEqual(r_smoke_to["startup_state"], "warm")
+            self.assertFalse(r_smoke_to["readiness_ok"])
+            self.assertEqual(r_smoke_to["finish_reason"], "error")
+
+    def test_local_assist_stats_sparse_dates_legacy_corrupt_and_phase_buckets(self) -> None:
+        import tempfile
+
+        stats_script = ROOT / "scripts" / "local-assist-stats"
+        with tempfile.TemporaryDirectory() as tmpdir:
+            log_dir = Path(tmpdir) / "local-assist"
+            log_dir.mkdir(parents=True, exist_ok=True)
+
+            # Sparse older file (41 days before 2026-11-11): legacy row without caller/startup_state/readiness_ok
+            (log_dir / "2026-10-01.jsonl").write_text(
+                json.dumps(
+                    {
+                        "ts": "2026-10-01T12:00:00-04:00",
+                        "tool": "extract_fields",
+                        "requested_model": "m",
+                        "served_model": "m",
+                        "usage": {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120},
+                        "latency_ms": 200,
+                        "finish_reason": "stop",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            # Within 7-day window: valid row containing literal U+2028 (WORK-MINOR-1)
+            # + invalid UTF-8 byte row (WORK-MINOR-2) + malformed ASCII JSON + slow warm (>1s)
+            # + fresh auto_served + auto_serve_reused
+            (log_dir / "2026-11-09.jsonl").write_bytes(
+                b"\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "ts": "2026-11-09T09:59:00-05:00",
+                                "tool": "propose_eval_prompts",
+                                "caller": {"transport": "mcp", "label": "agy"},
+                                "startup_state": None,
+                                "readiness_ok": None,
+                                "ready_ms": None,
+                                "elapsed_ms": 1,
+                                "latency_ms": 1,
+                                "args_summary": {"category": "bad\u2028sep"},
+                                "observed": {"error": "invalid_arguments"},
+                                "finish_reason": "error",
+                            },
+                            ensure_ascii=False,
+                        ).encode("utf-8"),
+                        b'{"ts":"2026-11-09T09:59:30-05:00","bad":"\xff"}',
+                        b"{not-valid-json",
+                        json.dumps(
+                            {
+                                "ts": "2026-11-09T10:00:00-05:00",
+                                "tool": "extract_fields",
+                                "caller": {"transport": "mcp", "client_name": "agy", "label": "agy"},
+                                "startup_state": "warm",
+                                "readiness_ok": True,
+                                "ready_ms": 1250,
+                                "elapsed_ms": 1350,
+                                "latency_ms": 100,
+                                "usage": {
+                                    "prompt_tokens": 50,
+                                    "completion_tokens": 10,
+                                    "total_tokens": 60,
+                                    "prompt_tokens_details": {"cached_tokens": 20},
+                                },
+                                "finish_reason": "stop",
+                            }
+                        ).encode("utf-8"),
+                        json.dumps(
+                            {
+                                "ts": "2026-11-09T10:05:00-05:00",
+                                "tool": "delegate_task",
+                                "caller": {"transport": "mcp", "client_name": "codex-mcp"},
+                                "startup_state": "auto_served",
+                                "readiness_ok": True,
+                                "ready_ms": 6200,
+                                "elapsed_ms": 7000,
+                                "latency_ms": 800,
+                                "usage": {"prompt_tokens": 200, "completion_tokens": 100, "total_tokens": 300},
+                                "finish_reason": "stop",
+                            }
+                        ).encode("utf-8"),
+                        json.dumps(
+                            {
+                                "ts": "2026-11-09T10:06:00-05:00",
+                                "tool": "compress_context",
+                                "caller": {"transport": "mcp", "client_name": "codex-mcp"},
+                                "startup_state": "auto_serve_reused",
+                                "readiness_ok": True,
+                                "ready_ms": 400,
+                                "elapsed_ms": 900,
+                                "latency_ms": 500,
+                                "usage": {"prompt_tokens": 80, "completion_tokens": 40, "total_tokens": 120},
+                                "finish_reason": "stop",
+                            }
+                        ).encode("utf-8"),
+                    ]
+                )
+                + b"\n"
+            )
+
+            # Reference day 2026-11-11: auto_serve_failed + warm completion timeout (readiness_ok=True)
+            # + warm smoke timeout (readiness_ok=False) + pre-readiness validation error (readiness_ok=None)
+            (log_dir / "2026-11-11.jsonl").write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "ts": "2026-11-11T08:00:00-05:00",
+                                "tool": "delegate_task",
+                                "caller": {"transport": "mcp", "label": "claude"},
+                                "startup_state": "auto_serve_failed",
+                                "readiness_ok": False,
+                                "ready_ms": 300,
+                                "elapsed_ms": 301,
+                                "latency_ms": 301,
+                                "observed": {"error": "model_unavailable"},
+                                "finish_reason": "error",
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "ts": "2026-11-11T08:05:00-05:00",
+                                "tool": "delegate_task",
+                                "caller": {"transport": "mcp", "label": "claude"},
+                                "startup_state": "warm",
+                                "readiness_ok": True,
+                                "ready_ms": 40,
+                                "elapsed_ms": 5040,
+                                "latency_ms": 5040,
+                                "observed": {"error": "timeout"},
+                                "finish_reason": "error",
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "ts": "2026-11-11T08:10:00-05:00",
+                                "tool": "delegate_task",
+                                "caller": {"transport": "mcp", "label": "claude"},
+                                "startup_state": "warm",
+                                "readiness_ok": False,
+                                "ready_ms": 250,
+                                "elapsed_ms": 251,
+                                "latency_ms": 251,
+                                "observed": {"error": "timeout"},
+                                "finish_reason": "error",
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "ts": "2026-11-11T08:15:00-05:00",
+                                "tool": "extract_fields",
+                                "caller": {"transport": "cli", "client_name": "delegate-local"},
+                                "startup_state": None,
+                                "readiness_ok": None,
+                                "ready_ms": None,
+                                "elapsed_ms": 2,
+                                "latency_ms": 2,
+                                "observed": {"error": "invalid_arguments"},
+                                "finish_reason": "error",
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            # 1. Trailing 7-day window as of 2026-11-11 excludes 2026-10-01.jsonl
+            win = subprocess.run(
+                [
+                    sys.executable,
+                    str(stats_script),
+                    "--log-dir",
+                    str(log_dir),
+                    "--days",
+                    "7",
+                    "--as-of",
+                    "2026-11-11",
+                    "--json",
+                ],
+                cwd=str(ROOT),
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            self.assertEqual(win.returncode, 0, win.stderr)
+            report = json.loads(win.stdout)
+            # Only the invalid UTF-8 record and {not-valid-json are corrupt; the U+2028 record is valid
+            self.assertEqual(report["corrupt_lines"], 2)
+            self.assertEqual(report["total_calls"], 8)
+            self.assertEqual(report["succeeded_calls"], 3)
+            self.assertEqual(report["error_calls"], 5)
+            # Slow warm call (1250ms) and auto_serve_reused must NOT count in auto_serve_starts
+            self.assertEqual(report["auto_serve_starts"], 1)
+            self.assertEqual(report["auto_serve_reused"], 1)
+            self.assertEqual(report["auto_serve_failures"], 1)
+            self.assertEqual(report["tokens"]["prompt_tokens"], 330)
+            self.assertEqual(report["tokens"]["completion_tokens"], 150)
+            self.assertEqual(report["tokens"]["cached_tokens"], 20)
+            self.assertNotIn("legacy", report["by_caller"])
+            self.assertEqual(report["by_caller"]["agy"]["calls"], 2)
+            self.assertEqual(report["by_caller"]["agy"]["errors"], 1)
+
+            claude_stats = report["by_caller"]["claude"]
+            # claude had one readiness_ok=True (40ms, completion timed out) and two readiness_ok=False (250ms, 300ms)
+            self.assertEqual(claude_stats["ready_ms"]["count"], 1)
+            self.assertEqual(claude_stats["ready_ms"]["max"], 40)
+            self.assertEqual(claude_stats["failed_ready_ms"]["count"], 2)
+            self.assertEqual(claude_stats["failed_ready_ms"]["max"], 300)
+
+            # 2. All-time summary (no --days/--date) includes 2026-10-01 legacy row
+            all_res = subprocess.run(
+                [sys.executable, str(stats_script), "--log-dir", str(log_dir), "--json"],
+                cwd=str(ROOT),
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            self.assertEqual(all_res.returncode, 0, all_res.stderr)
+            all_report = json.loads(all_res.stdout)
+            self.assertEqual(all_report["total_calls"], 9)
+            self.assertIn("legacy", all_report["by_caller"])
+            self.assertEqual(all_report["startup_states"]["unrecorded"], 3)
+
+            # 3. Single-date filter --date 2026-10-01
+            day_res = subprocess.run(
+                [
+                    sys.executable,
+                    str(stats_script),
+                    "--log-dir",
+                    str(log_dir),
+                    "--date",
+                    "2026-10-01",
+                    "--json",
+                ],
+                cwd=str(ROOT),
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            self.assertEqual(day_res.returncode, 0, day_res.stderr)
+            self.assertEqual(json.loads(day_res.stdout)["total_calls"], 1)
+
+            # 4. Human-readable mode succeeds
+            txt_res = subprocess.run(
+                [sys.executable, str(stats_script), "--log-dir", str(log_dir)],
+                cwd=str(ROOT),
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            self.assertEqual(txt_res.returncode, 0, txt_res.stderr)
+            self.assertIn("By caller:", txt_res.stdout)
+            self.assertIn("By tool:", txt_res.stdout)
 
     def _send(self, proc: subprocess.Popen[bytes], payload: dict) -> None:
         assert proc.stdin is not None

@@ -3,24 +3,24 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 import re
 import sys
 import time
-from pathlib import Path
 from typing import Any, TypedDict
 
 from ..client import chat, default_timeout_seconds
 from ..errors import LocalAssistError, ModelOutputMalformed, ModelTimeout
 from ..lifecycle import require_chat_succeeds
-from ..logging import log_call
+from ..logging import caller_context, log_call
 from ..routing import JOB_TO_MODEL
+from ..workspace import read_confined_workspace_file
 
 
 JOB = "delegate_task"
 ALLOWED_KINDS = {"draft_code", "generate_test_cases", "transform_text", "focused_qa"}
 MAX_INSTRUCTION_CHARS = 8_000
 MAX_CONTEXT_CHARS = 32_000
+MAX_CONTEXT_BYTES = MAX_CONTEXT_CHARS * 4
 MAX_CONSTRAINTS = 20
 MAX_CONSTRAINT_CHARS = 500
 DEFAULT_MAX_TOKENS = 1536
@@ -46,6 +46,30 @@ class DelegateTaskResult(TypedDict):
     unverified_claims: list[str]
 
 
+KIND_GUIDANCE = {
+    "draft_code": (
+        "Dry-run boundary conditions (`0`, `1`, exact cap, `<` vs `<=`, empty inputs) "
+        "and state mutations across repeated calls step by step before emitting code. "
+        "Record any unspecified edge-case behavior in `assumptions`."
+    ),
+    "generate_test_cases": (
+        "Return `output` as a string (for example a serialized JSON array or test code). "
+        "Trace every expected output line by line through the provided implementation, "
+        "paying special attention to `<` vs `<=` boundaries, off-by-one limits, zero/empty "
+        "inputs, and state mutated across sequential calls."
+    ),
+    "transform_text": (
+        "Preserve all factual values, identifiers, and constraints from the input; list any "
+        "ambiguous source spans in `assumptions`."
+    ),
+    "focused_qa": (
+        "Answer strictly from the supplied `context` and `instruction`. Trace boundary and "
+        "stateful logic explicitly; list anything not proven by `context` in `assumptions` "
+        "or `unverified_claims`."
+    ),
+}
+
+
 SYSTEM = """You are a bounded local worker model executing a specific subtask delegated by a planner agent.
 
 You are given:
@@ -60,21 +84,22 @@ Do not add other top-level keys. Do not omit any of these keys.
 
 Field semantics:
 - summary: 1-2 sentence plain-English description of what you produced.
-- output: the requested artifact as a non-empty string (for example the drafted code, JSON/YAML test cases, transformed text, or focused answer). Do not wrap the entire JSON response in markdown fences.
-- assumptions: array of short strings (0 to 20 items) listing any assumptions, simplifications, or defaults you had to choose because the instruction or context left them unspecified.
+- output: the requested artifact as a non-empty string (for example drafted code, serialized JSON/YAML test cases, transformed text, or focused answer). Do not wrap the entire JSON response in markdown fences.
+- assumptions: array of short strings (0 to 20 items) listing EVERY assumption, simplification, tie-break, or default you chose because `instruction` or `context` left it unspecified. Whenever `context` is partial or omitted, populate `assumptions` rather than leaving it empty.
 - unverified_claims: array of short strings (0 to 20 items) listing any external library APIs, proper nouns, citations, hardware interfaces, or regional dialect idioms used in `output` that were NOT explicitly present in `context`.
 
 Hard rules:
 - Follow `instruction` and `constraints` literally.
+- Mentally dry-run boundary values (`0`, `1`, exact limit `N`, `N - 1`, `N + 1`, `<` vs `<=`) and stateful mutations across calls before finalizing `output`.
 - Never invent fake citations, fake person names, or fake dataset/forum names. If an example placeholder is needed, mark it clearly as a placeholder and list it in `unverified_claims`.
-- Both `assumptions` and `unverified_claims` are advisory self-reports for the delegating planner to inspect; return [] when none apply.
+- Both `assumptions` and `unverified_claims` are advisory self-reports for the delegating planner to inspect; return [] only when none apply.
 
 Output JSON only, no commentary, no markdown fences around the JSON object."""
 
 
 _URL_RE = re.compile(r"https?://[^\s\"'<>)\]]+")
 _PY_IMPORT_RE = re.compile(
-    r"^\s*(?:from\s+([A-Za-z_][A-Za-z0-9_.]*)\s+import|import\s+([A-Za-z_][A-Za-z0-9_.]*))",
+    r"^\s*(?:from\s+([A-Za-z_][A-Za-z0-9_.]*)\s+import|import\s+([A-Za-z_][A-Za-z0-9_]*))",
     re.MULTILINE,
 )
 _JS_IMPORT_RE = re.compile(
@@ -120,102 +145,6 @@ def compute_ungrounded_identifiers(output_text: str, grounding_text: str) -> lis
     return sorted(ungrounded)[:50]
 
 
-def _allowed_workspace_root() -> Path:
-    raw = os.environ.get("LOCAL_ASSIST_WORKSPACE_ROOT", "").strip()
-    base = Path(raw) if raw else Path.cwd()
-    return base.resolve()
-
-
-def _resolve_context_path(raw_path: str) -> str:
-    if not isinstance(raw_path, str) or not raw_path.strip():
-        raise ModelOutputMalformed(
-            "invalid_arguments", "context_path must be a non-empty string when provided."
-        )
-    p = Path(raw_path.strip())
-    if ".." in p.parts:
-        raise ModelOutputMalformed(
-            "invalid_arguments",
-            "context_path must not contain '..' path traversal segments.",
-            details={"context_path": raw_path},
-        )
-    workspace_root = _allowed_workspace_root()
-    cand = p if p.is_absolute() else (workspace_root / p)
-
-    if cand.is_symlink():
-        raise ModelOutputMalformed(
-            "invalid_arguments",
-            "context_path must reference a regular file (not a symlink).",
-            details={"context_path": raw_path},
-        )
-    if not cand.exists():
-        raise ModelOutputMalformed(
-            "invalid_arguments",
-            f"context_path file not found: {raw_path}",
-            details={"context_path": raw_path, "workspace_root": str(workspace_root)},
-        )
-
-    real_cand = cand.resolve()
-    if not real_cand.is_relative_to(workspace_root):
-        raise ModelOutputMalformed(
-            "invalid_arguments",
-            "context_path must resolve inside the allowed workspace root.",
-            details={
-                "context_path": raw_path,
-                "resolved_path": str(real_cand),
-                "workspace_root": str(workspace_root),
-            },
-        )
-
-    # Reject symlinks anywhere along the relative path inside workspace_root
-    cur = cand
-    while cur != workspace_root and len(cur.parts) > len(workspace_root.parts):
-        if cur.is_symlink():
-            raise ModelOutputMalformed(
-                "invalid_arguments",
-                "context_path must not traverse symlinks.",
-                details={"context_path": raw_path},
-            )
-        cur = cur.parent
-
-    if not real_cand.is_file():
-        raise ModelOutputMalformed(
-            "invalid_arguments",
-            "context_path must reference a regular file (not a directory).",
-            details={"context_path": raw_path},
-        )
-
-    try:
-        st = real_cand.stat()
-    except OSError as exc:
-        raise ModelOutputMalformed(
-            "invalid_arguments",
-            f"Could not stat context_path: {exc}",
-            details={"context_path": raw_path},
-        ) from exc
-
-    max_bytes = MAX_CONTEXT_CHARS * 4
-    if st.st_size > max_bytes:
-        raise ModelOutputMalformed(
-            "invalid_arguments",
-            "context_path file exceeds maximum size limit.",
-            details={
-                "context_path": raw_path,
-                "size_bytes": st.st_size,
-                "max_bytes": max_bytes,
-                "max_chars": MAX_CONTEXT_CHARS,
-            },
-        )
-
-    try:
-        return real_cand.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as exc:
-        raise ModelOutputMalformed(
-            "invalid_arguments",
-            f"Could not read UTF-8 text from context_path: {exc}",
-            details={"context_path": raw_path},
-        ) from exc
-
-
 def validate_inputs(
     kind: Any,
     instruction: Any,
@@ -256,8 +185,14 @@ def validate_inputs(
         )
 
     resolved_context = ""
+    source_path: str | None = None
     if context_path:
-        resolved_context = _resolve_context_path(context_path)
+        source_path, resolved_context, _ = read_confined_workspace_file(
+            context_path,
+            max_bytes=MAX_CONTEXT_BYTES,
+            max_chars=MAX_CONTEXT_CHARS,
+            param_name="context_path",
+        )
     elif context:
         resolved_context = context
 
@@ -311,23 +246,30 @@ def validate_inputs(
         if resolved_context
         else None
     )
-    return {
+    out: dict[str, Any] = {
         "kind": kind,
         "instruction": instruction,
         "context": resolved_context,
-        "context_path": context_path,
+        "context_path": source_path if source_path is not None else context_path,
         "context_chars": len(resolved_context),
         "context_sha256": context_sha256,
         "constraints": clean_constraints,
         "max_tokens": max_tokens,
     }
+    if source_path is not None:
+        out["source_path"] = source_path
+    return out
 
 
 def build_prompt(validated: dict[str, Any], *, redact_context: bool = False) -> str:
+    kind = validated["kind"]
     parts = [
-        f"kind: {validated['kind']}",
-        f"instruction:\n{validated['instruction']}",
+        f"kind: {kind}",
     ]
+    guidance = KIND_GUIDANCE.get(kind)
+    if guidance:
+        parts.append(f"kind_guidance: {guidance}")
+    parts.append(f"instruction:\n{validated['instruction']}")
     if validated["constraints"]:
         parts.append("constraints:")
         for item in validated["constraints"]:
@@ -344,7 +286,10 @@ def build_prompt(validated: dict[str, Any], *, redact_context: bool = False) -> 
     return "\n".join(parts)
 
 
-def parse_and_validate(model_text: str, validated: dict[str, Any]) -> DelegateTaskResult:
+def parse_and_validate_with_meta(
+    model_text: str,
+    validated: dict[str, Any],
+) -> tuple[DelegateTaskResult, dict[str, Any]]:
     try:
         raw = json.loads(model_text)
     except json.JSONDecodeError as exc:
@@ -382,10 +327,27 @@ def parse_and_validate(model_text: str, validated: dict[str, Any]) -> DelegateTa
             "malformed_model_output", "summary must be a non-empty string."
         )
 
-    output_text = raw["output"]
-    if not isinstance(output_text, str) or not output_text.strip():
+    raw_output = raw["output"]
+    coerced_structured = False
+    if isinstance(raw_output, str):
+        if not raw_output.strip():
+            raise ModelOutputMalformed(
+                "malformed_model_output", "output must be a non-empty string."
+            )
+        output_text = raw_output
+    elif isinstance(raw_output, (list, dict)):
+        if not raw_output:
+            raise ModelOutputMalformed(
+                "malformed_model_output",
+                "structured output array/object must not be empty.",
+            )
+        output_text = json.dumps(raw_output, indent=2, ensure_ascii=False)
+        coerced_structured = True
+    else:
         raise ModelOutputMalformed(
-            "malformed_model_output", "output must be a non-empty string."
+            "malformed_model_output",
+            "output must be a non-empty string (or non-empty structured array/object).",
+            details={"observed_type": type(raw_output).__name__},
         )
 
     lists_out: dict[str, list[str]] = {}
@@ -414,7 +376,7 @@ def parse_and_validate(model_text: str, validated: dict[str, Any]) -> DelegateTa
     )
     ungrounded = compute_ungrounded_identifiers(output_text, grounding_blob)
 
-    return {
+    result: DelegateTaskResult = {
         "id": stable_id(output_text),
         "kind": validated["kind"],
         "summary": summary.strip(),
@@ -423,6 +385,12 @@ def parse_and_validate(model_text: str, validated: dict[str, Any]) -> DelegateTa
         "assumptions": lists_out["assumptions"],
         "unverified_claims": lists_out["unverified_claims"],
     }
+    return result, {"coerced_structured_output": coerced_structured}
+
+
+def parse_and_validate(model_text: str, validated: dict[str, Any]) -> DelegateTaskResult:
+    result, _ = parse_and_validate_with_meta(model_text, validated)
+    return result
 
 
 def run(
@@ -466,7 +434,8 @@ def run(
             )
             started_mono = time.monotonic()
             deadline = started_mono + float(default_timeout_seconds())
-            require_chat_succeeds(model, deadline=deadline)
+            with call.measure_readiness():
+                require_chat_succeeds(model, deadline=deadline)
             ready_seconds = round(time.monotonic() - started_mono, 4)
             rem_chat = deadline - time.monotonic()
             if rem_chat <= 0:
@@ -487,11 +456,22 @@ def run(
                 temperature=0.2,
                 timeout_seconds=max(1, int(rem_chat)),
             )
+            call.record_completion(result)
             call.record_raw_response(
                 raw_response=result.raw_text, normalized_response=result.text
             )
-            parsed = parse_and_validate(result.text, validated)
-            observed = {
+            if result.finish_reason == "length":
+                raise ModelOutputMalformed(
+                    "output_truncated",
+                    "Model output hit max_tokens completion ceiling before finishing.",
+                    details={
+                        "max_tokens": validated["max_tokens"],
+                        "finish_reason": result.finish_reason,
+                        "preview": result.text[:500],
+                    },
+                )
+            parsed, meta = parse_and_validate_with_meta(result.text, validated)
+            observed: dict[str, Any] = {
                 "id": parsed["id"],
                 "kind": parsed["kind"],
                 "ready_seconds": ready_seconds,
@@ -501,7 +481,10 @@ def run(
                 "n_ungrounded_identifiers": len(parsed["ungrounded_identifiers"]),
                 "n_assumptions": len(parsed["assumptions"]),
                 "n_unverified_claims": len(parsed["unverified_claims"]),
+                "coerced_structured_output": meta["coerced_structured_output"],
             }
+            if validated.get("source_path") is not None:
+                observed["source_path"] = validated["source_path"]
             call.record_result(
                 parsed,
                 observed=observed,
@@ -539,14 +522,15 @@ def main() -> int:
     parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
     args = parser.parse_args()
     try:
-        result = run(
-            kind=args.kind,
-            instruction=args.instruction,
-            context=args.context,
-            context_path=args.context_path,
-            constraints=args.constraints,
-            max_tokens=args.max_tokens,
-        )
+        with caller_context(transport="cli", client_name=f"local_assist.tools.{JOB}"):
+            result = run(
+                kind=args.kind,
+                instruction=args.instruction,
+                context=args.context,
+                context_path=args.context_path,
+                constraints=args.constraints,
+                max_tokens=args.max_tokens,
+            )
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0
     except LocalAssistError as exc:

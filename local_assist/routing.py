@@ -6,6 +6,7 @@ JOB_TO_MODEL = {
     "extract_fields": "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit",
     "compress_context": "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit",
     "delegate_task": "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit",
+    "select_context": "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit",
 }
 
 MODEL_TO_REGISTRY_ID = {

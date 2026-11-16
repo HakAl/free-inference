@@ -10,15 +10,19 @@ All commands below assume `/path/to/free-inference` is your local checkout root 
 
 Always launch `opencode-attested` or `opencode-local` **from inside the target repository** you want the coding agent to inspect or edit (`cd /path/to/your/project`), never from `$HOME` (`~`). OpenCode's file tools and `LOCAL_ASSIST_WORKSPACE_ROOT` inherit the working directory where the launcher is invoked.
 
-### Rung 3: Attested Enclave Default (`tinfoil-deepseek-v4-1-flash`)
+### Rung 3: Attested Enclave Cleared Models (`tinfoil-deepseek-v4-1-flash` default, `privatemode-glm-5-3-flash` DE/EU)
 
 ```bash
 cd /path/to/your/project
 
-# Starts a 12-hour interactive proxy session (1,000 chat requests, 16,384 output tokens/turn,
-# 8 MiB max request body, subagents disabled, reasoning tokens off by default).
+# Starts a 2-hour interactive proxy session on the configured catalog default
+# (tinfoil-deepseek-v4-1-flash via routing.default_private_attested: true in models.yaml;
+# override per shell with FREE_INFERENCE_DEFAULT_ATTESTED_MODEL=<cleared-model-id> or --model <id>).
 # Prompts Touch ID once if the proxy is not already running.
 /path/to/free-inference/scripts/opencode-attested
+
+# Launch cleared DE/EU Privatemode GLM 5.3 Flash (127.0.0.1:8082 -> 127.0.0.1:9082, no --allow-uncleared-model needed)
+/path/to/free-inference/scripts/opencode-attested --model privatemode-glm-5-3-flash
 ```
 
 ### Rung 3: Frontier Enclave Candidate (`tinfoil-kimi-k3-1-pro`)
@@ -49,13 +53,40 @@ cd /path/to/your/project
 
 ## 2. Running a Second Model Side-by-Side (Parallel Sessions)
 
+### Explicit authorization windows
+
+Run these commands in an operator terminal, outside the coding agent:
+
+```bash
+/path/to/free-inference/scripts/session start --model tinfoil-deepseek-v4-1-flash --for 2h
+/path/to/free-inference/scripts/session status --model tinfoil-deepseek-v4-1-flash
+/path/to/free-inference/scripts/session watch --model tinfoil-deepseek-v4-1-flash --notify
+# In another terminal before expiry, authorize a replacement window with Touch ID:
+/path/to/free-inference/scripts/session renew --model tinfoil-deepseek-v4-1-flash --for 12h
+/path/to/free-inference/scripts/session stop --model tinfoil-deepseek-v4-1-flash
+```
+
+Start defaults to 2 hours. An already ON session is reported unchanged; use renew to change its window. Windows accept positive integer seconds, minutes, or hours, up to 24 hours. Renew measures the new window from successful authorization, rotates the proxy credential, preserves the process/listener, and does not refill requests or raise spend caps. Attached interactive relays follow the new window. Workers follow credential rotation while keeping their own time/request limits.
+
+A session permits at most 32 authorization generations (the initial start plus 31 renewals). After that, explicitly stop/start to authorize a new session. This bounds retired-credential history. Relays cache credentials with a sleep-aware deadline and kernel process-lifetime observation. They refresh through identity-checked control on stale-token refusal or cached expiry, without authorizing a new window. They recheck lifetime after TCP connect before sending credentials or prompts. The key holder remains the authority for live expiry and request admission. Explicit handoff credentials are never replaced by a disk-backed lease.
+
+Control sockets remain under the protected runs directory. Long checkout paths use directory-relative Unix socket addresses: the key holder binds before accepting traffic, and the trusted client uses a short-lived helper rather than changing a multithreaded launcher's working directory. Stop removes an owned inactive socket left after SIGKILL, but refuses to unlink a listener or an unverifiable node.
+
+Containment accepts legacy token files and complete JSON envelopes, and recognizes encoded exposure. It attributes known current tokens across sessions before treating unknown retired exposure as ambiguous. When an exposed token predates the current envelope, automatic attribution can still be uncertain; containment preserves forensic state and requires explicit attribution or stopping ambiguous sessions rather than replaying credentials to an unverified listener.
+
+Status reports ON, OFF, or UNKNOWN with authoritative time and shared requests remaining; UNKNOWN never triggers automatic replacement. With multiple active sessions, specify `--model`. `--json` produces sanitized status for scripts. The foreground watcher warns once per authorization at five minutes remaining and at the smaller of ten requests or ten percent remaining (minimum one). Notifications need `--notify`; there is no background auto-renewal.
+
+Stop and hard expiry cancel active streams and remove the in-memory authorization and proxy credential file. The sealed provider key remains available for a later start. An expired or exhausted session cannot be renewed. Older helpers lack the control socket and show UNKNOWN; explicitly stop and restart them with the new helper. `--refresh-session` still restarts a proxy, resets its budgets, and can interrupt other attached clients; reserve it for cap changes or recovery.
+
+Complete Touch ID before the current window expires. Hard expiry also terminates a pending renewal prompt; starting renewal does not grant a grace period. The watcher warns five minutes ahead so there is time to authorize the replacement window.
+
 You do **not** need to stop your default model to try or run a second model in another terminal tab or project directory.
 
 ### Automatic side-by-side port allocation (recommended)
 
-When you run `opencode-attested --model <second-model>` while another model already owns port `8081`, `opencode-attested` checks `runs/.pids/*.json`:
+When you run `opencode-attested --model <second-model>` while another model already owns port `8081`, `opencode-attested` checks `runs/.serve*.pid`:
 1. If port `8081` is owned by a live PID record for a different model, `opencode-attested` automatically selects the next free localhost port pair (`8082`/`9082`, `8083`/`9083`, ...) and starts the second model's proxy there.
-2. Each OpenCode invocation writes its own immutable per-invocation config file (`.home/opencode-private-attested/.configs/opencode-<model>-<pid>-<nonce>.json`), tracks active client PIDs in `.active-opencode-clients.json`, and runs with `--standalone` whenever another OpenCode client is already active in the isolated home. Neither terminal overwrites the other's model routing or session token.
+2. Each OpenCode invocation creates its own `0700` per-invocation runtime directory (`.home/opencode-private-attested/.invocations/<inv_id>/`) with a dedicated `0400` `opencode.json`, dedicated per-invocation `service.json` port and password, parent-process `SessionAuthRelay` (`oc-relay-*`), and Seatbelt sandbox (`interactive.sb`), while sharing `.local/share/opencode/opencode.db` for conversation history (`--continue`). Neither terminal overwrites the other's model routing or session credentials.
 
 ```bash
 # Terminal 1 (in project A): serves tinfoil-deepseek-v4-1-flash on 127.0.0.1:8081
@@ -92,7 +123,7 @@ cd /path/to/free-inference
 
 ## 3. Continuing or Recovering an Interrupted Session
 
-If an interactive session hits a request cap, output token cap, or 12-hour TTL expiry (for example `Session chat request cap (50) reached` or `Compaction summary reached the output token limit`), your conversation history is still saved in OpenCode's local SQLite database (`.home/opencode-private-attested/.local/share/opencode/opencode.db`).
+If an interactive session hits a request cap, output token cap, or authorization expiry (for example `Session chat request cap (50) reached` or `Compaction summary reached the output token limit`), your conversation history is still saved in OpenCode's local SQLite database (`.home/opencode-private-attested/.local/share/opencode/opencode.db`).
 
 Recover and continue the exact conversation in one command:
 
@@ -100,7 +131,7 @@ Recover and continue the exact conversation in one command:
 cd /path/to/your/project
 
 # --refresh-session restarts the model's proxy with fresh interactive caps
-# (1,000 requests, 16,384 output tokens, 8 MiB payload, 12h TTL; 1 Touch ID tap).
+# (1,000 requests, 16,384 output tokens, 8 MiB payload, 2h TTL; 1 Touch ID tap).
 # -- -c tells OpenCode to resume the most recent conversation in this directory.
 /path/to/free-inference/scripts/opencode-attested \
   --model tinfoil-kimi-k3-1-pro \
@@ -202,7 +233,32 @@ cd /path/to/free-inference
 
 # Machine-readable JSON output
 ./scripts/models --active --json
+
+# Credential-free Rung 1 + active session status (safe for agents and scripts)
+./scripts/assist-status
+./scripts/assist-status --json
 ```
+
+### Credential containment check and legacy-home cleanup (`./scripts/check-credential-containment`)
+
+If an isolated OpenCode home still holds legacy uncontained `service.json` files from an earlier session, `opencode-attested` and `opencode-local` refuse to launch until containment is inspected and applied:
+
+```bash
+cd /path/to/free-inference
+
+# Strictly read-only check (emits booleans and counts only; zero secret values or hashes)
+./scripts/check-credential-containment --check
+
+# Operator-approved containment cleanup (requires valid sanitized evidence snapshot)
+./scripts/check-credential-containment --apply --operator-approved
+```
+
+Containment authority and lifecycle notes:
+
+- `--evidence-path` must point to an operator-supplied sanitized evidence record outside the target OpenCode home and outside agent-writable Seatbelt roots. Provenance records canonicalize `source_sha256` paths (`SECURITY.md` and `tools/se_key_proxy/main.swift` are required protected baselines), strictly type-check `worktree_dirty_before_diagnosis` as a JSON boolean, and report any uncaptured pre-diagnosis modified tracked files via `dirty_unverified_sources`.
+- Revocation probes never scrape or replay bearer tokens to localhost URLs found in untrusted SQLite/log/config text; authentication probes only contact ports positively owned by verified `runs/` `se-key-proxy` PID records, and any live current-UID production `se-key-proxy` process outside verified-distinct `runs/` records (regardless of its `--session-token-file` directory) fails closed without signaling or probing it.
+- `--check` and `--apply` enumerate directories via explicit `os.lstat` and `os.scandir` traversal (rather than `Path.glob`/`Path.rglob`), separating metadata/directory-listing/unlink errors (`sink_inspection_ok`, `unlink_failures`) from confirmed absence or zero-match outcomes and including top-level and `.configs/opencode-*.json` config sinks (`legacy_config_files_present`, `config_matching_files`).
+- Before authorized `--apply` deletes `opencode.db`, it writes a value-free, secret-free `0400` receipt (`.containment-state-<incident>-<hash>.json` next to `--evidence-path`) recording pre-cleanup SQLite event verification so subsequent `--check` runs, partial-failure retries, and later clean OpenCode sessions remain valid.
 
 ### Stop one model or all models (`./scripts/stop-model`)
 
@@ -220,7 +276,7 @@ cd /path/to/free-inference
 
 ## 6. Using `local_assist` MCP from Codex CLI, Claude Code, and Antigravity (`agy`)
 
-While `./scripts/opencode-local` and `./scripts/opencode-attested` run the primary coding planner directly on Rung 1 (`local`) or Rung 3 (`enclave_runtime_attested`) via OpenAI Chat Completions (`/v1/chat/completions`), OpenAI Codex CLI (`codex`), Claude Code (`claude`), and Google Antigravity CLI (`agy`) can delegate bounded subtasks (`extract_fields`, `compress_context`, `delegate_task`, `propose_eval_prompts`) to the local Rung 1 model (`qwen3-30b-a3b-2507-mlx-4bit` on `127.0.0.1:8080/v1` at `$0` marginal API cost) via native stdio MCP (`scripts/local-assist-server`) or CLI delegation (`scripts/delegate-local`).
+While `./scripts/opencode-local` and `./scripts/opencode-attested` run the primary coding planner directly on Rung 1 (`local`) or Rung 3 (`enclave_runtime_attested`) via OpenAI Chat Completions (`/v1/chat/completions`), OpenAI Codex CLI (`codex`), Claude Code (`claude`), and Google Antigravity CLI (`agy`) can delegate bounded subtasks (`assist_status`, `check_eval_assertion`, `select_context`, `extract_fields`, `compress_context`, `delegate_task`, `propose_eval_prompts`) to the local Rung 1 model (`qwen3-30b-a3b-2507-mlx-4bit` on `127.0.0.1:8080/v1` at `$0` marginal API cost) via native stdio MCP (`scripts/local-assist-server`) or CLI delegation (`scripts/delegate-local`).
 
 See `docs/decisions/2026-11-10-codex-claude-agy-wire-discovery.md` for the wire-protocol study explaining why `codex` (`/v1/responses`), `claude` (`/v1/messages`), and `agy` integrate via MCP rather than a protocol-translation proxy.
 
@@ -291,7 +347,29 @@ In `~/.claude/settings.json`:
 ### Google Antigravity CLI (`agy`)
 
 ```bash
-# Register local_assist in ~/.gemini/config/mcp_config.json
+# Register local_assist globally in ~/.gemini/config/mcp_config.json
 agy mcp add local_assist -- /path/to/free-inference/scripts/local-assist-server
 agy mcp list
+```
+
+For workspace-only scoping in Antigravity (without editing `~/.gemini/config/mcp_config.json`), place a workspace plugin at `<workspace>/.agents/plugins/local-assist/plugin.json` (`{"name": "local-assist", "version": "0.2.0"}`) and `<workspace>/.agents/plugins/local-assist/mcp_config.json`, then validate with `agy plugin validate <workspace>/.agents/plugins/local-assist --strict`.
+
+### Inspecting `local_assist` Telemetry (`./scripts/local-assist-stats`)
+
+Every `local_assist` call logs self-reported `caller` (`mcp` `clientInfo` / `cli` / `LOCAL_ASSIST_CALLER` label), `startup_state` (`warm`, `auto_served`, `auto_serve_reused`, `auto_serve_failed`, `not_served`, `worker_handoff`), `readiness_ok`, `ready_ms`, `latency_ms`, `elapsed_ms`, and token counts to `runs/local-assist/<YYYY-MM-DD>.jsonl`:
+
+```bash
+cd /path/to/free-inference
+
+# Trailing 7-day summary in America/New_York grouped by caller and tool
+./scripts/local-assist-stats --days 7
+
+# Full all-time machine-readable JSON summary (reports inclusive tokens.* plus nested error_tokens.*)
+./scripts/local-assist-stats --json
+
+# Offline fixture + behavioral-oracle validation (default when --live is omitted; 0 live model calls)
+./scripts/eval-local-assist-dogfood --validate-fixtures
+
+# Operator-approved live 3-5x Rung 1 benchmark against 127.0.0.1:8080
+./scripts/eval-local-assist-dogfood --live --operator-approved --repeats 3
 ```

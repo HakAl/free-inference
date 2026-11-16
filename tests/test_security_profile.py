@@ -258,7 +258,11 @@ class SecurityProfileSchemaTests(unittest.TestCase):
             validate_worker_opencode_args(["run", "--format", "json"])
 
         validated = validate_worker_opencode_args(["run", "--format", "json", "Say OK"])
-        self.assertEqual(validated, ["run", "--standalone", "--format", "json", "Say OK"])
+        self.assertEqual(validated, ["run", "--format", "json", "Say OK"])
+        self.assertEqual(
+            validate_worker_opencode_args(["run", "--standalone", "--format", "json", "Say OK"]),
+            ["run", "--format", "json", "Say OK"],
+        )
 
     def test_compile_opencode_security_config_and_env(self) -> None:
         prof = parse_security_profile_dict(
@@ -1019,7 +1023,7 @@ class LauncherSecurityCliGateTests(unittest.TestCase):
             self.assertEqual(rc, 0, err_buf.getvalue())
             self.assertTrue(recorded_sandbox_cmd)
             self.assertEqual(recorded_sandbox_cmd[0], "/usr/bin/sandbox-exec")
-            self.assertIn("--standalone", recorded_sandbox_cmd)
+            self.assertNotIn("--standalone", recorded_sandbox_cmd)
 
         # Also verify that if TESTED_OPENCODE_VERSION differs, main() fails closed with rc=1.
         with patch("local_assist.security_profile.TESTED_OPENCODE_VERSION", "0.0.0-mismatch"):
@@ -2754,7 +2758,7 @@ class Phase2LookoutRemediationTests(unittest.TestCase):
                             "pid_lstart": srv_lstart,
                             "model_id": model_id,
                             "served_repo": served_repo,
-                            "port": 8080,
+                            "port": chat_port,
                             "runtime": "mlx-lm",
                             "hf_offline": True,
                         }
@@ -2847,6 +2851,15 @@ class Phase2LookoutRemediationTests(unittest.TestCase):
                         encoding="utf-8",
                     )
                     os.chmod(sb_path, 0o400)
+                    staged_models = isolated_home / "runtime" / "models.yaml"
+                    os.chmod(staged_models, 0o600)
+                    staged_models.write_text(
+                        staged_models.read_text(encoding="utf-8").replace(
+                            "http://127.0.0.1:8080/v1", f"http://127.0.0.1:{chat_port}/v1"
+                        ),
+                        encoding="utf-8",
+                    )
+                    os.chmod(staged_models, 0o400)
 
                 worker_env = build_worker_environment(
                     prof,
@@ -4349,6 +4362,11 @@ class Phase2LookoutRemediationTests(unittest.TestCase):
                 )
                 for sub_d in ("scripts", "bin", "config", "tools", ".venv", "runs", ".home"):
                     (mirror_root / sub_d).mkdir(parents=True, exist_ok=True)
+                shutil.copytree(
+                    ROOT / "config" / "plugins",
+                    mirror_root / "config" / "plugins",
+                    symlinks=False,
+                )
                 shutil.copy2(ROOT / "models.yaml", mirror_root / "models.yaml")
                 for doc_sub in ("evals", "attestations"):
                     if (ROOT / "docs" / doc_sub).is_dir():
@@ -4463,6 +4481,15 @@ class Phase2LookoutRemediationTests(unittest.TestCase):
                         encoding="utf-8",
                     )
                     os.chmod(sb_path, 0o400)
+                    staged_models = isolated_home / "runtime" / "models.yaml"
+                    os.chmod(staged_models, 0o600)
+                    staged_models.write_text(
+                        staged_models.read_text(encoding="utf-8").replace(
+                            "http://127.0.0.1:8080/v1", f"http://127.0.0.1:{chat_port}/v1"
+                        ),
+                        encoding="utf-8",
+                    )
+                    os.chmod(staged_models, 0o400)
 
                 runtime_dir = isolated_home / "runtime"
                 self.assertTrue((runtime_dir / "local_assist" / "server.py").is_file())
@@ -5236,6 +5263,45 @@ class Phase2LookoutRemediationTests(unittest.TestCase):
             relay.close()
             up_srv.shutdown()
             up_srv.server_close()
+
+    def test_privatemode_ports_and_dynamic_endpoint_port_denied_in_seatbelt(self) -> None:
+        from local_assist.security_profile import RESERVED_PORT_DENYLIST
+
+        for reserved_port in (8082, 9082, 9182):
+            self.assertIn(reserved_port, RESERVED_PORT_DENYLIST)
+
+        profile = default_unattended_worker_profile()
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp) / "ws"
+            iso = Path(tmp) / "iso"
+            ws.mkdir()
+            iso.mkdir()
+            sb_pm = compile_seatbelt_profile(
+                profile,
+                workspace_dir=ws,
+                isolated_home=iso,
+                opencode_bin=Path("/usr/bin/true"),
+                sandbox_exec_bin=Path("/usr/bin/true"),
+                upstream_port=9082,
+                endpoint_port=8082,
+                use_token_relay=True,
+            )
+            self.assertIn('(remote ip "localhost:8082")', sb_pm)
+            self.assertIn('(remote ip "localhost:9082")', sb_pm)
+            self.assertIn('(remote ip "localhost:9182")', sb_pm)
+
+            sb_custom = compile_seatbelt_profile(
+                profile,
+                workspace_dir=ws,
+                isolated_home=iso,
+                opencode_bin=Path("/usr/bin/true"),
+                sandbox_exec_bin=Path("/usr/bin/true"),
+                upstream_port=9123,
+                endpoint_port=8123,
+                use_token_relay=True,
+            )
+            self.assertIn('(remote ip "localhost:8123")', sb_custom)
+            self.assertIn('(remote ip "localhost:9123")', sb_custom)
 
 
 if __name__ == "__main__":

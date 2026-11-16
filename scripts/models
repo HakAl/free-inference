@@ -33,7 +33,7 @@ from local_assist.registry import (
 )
 
 
-def _classify_session_record(rec: dict[str, Any]) -> dict[str, Any]:
+def _classify_session_record(rec: dict[str, Any], runs_dir: Path | None = None) -> dict[str, Any]:
     model_id = str(rec.get("model_id") or "unknown")
     runtime = str(rec.get("runtime") or "unknown")
     host = str(rec.get("host") or "127.0.0.1")
@@ -148,6 +148,13 @@ def _classify_session_record(rec: dict[str, Any]) -> dict[str, Any]:
         if trust_tier == "local" or runtime in ("mlx-lm", "mlx_lm")
         else "./scripts/opencode-attested"
     )
+    from local_assist.session import status_for_record
+    from local_assist.registry import _effective_runs_dir
+    authorization = status_for_record(rec, _effective_runs_dir(runs_dir)) if is_proxy else None
+    if authorization and authorization['state'] == 'ON':
+        remaining_ttl_seconds = authorization['remaining_seconds']
+        ttl_seconds = authorization['window_seconds']
+        expires_at = datetime.fromtimestamp(authorization['expires_at'], timezone.utc).isoformat()
     uncleared_arg = " --allow-uncleared-model" if needs_uncleared_flag else ""
     port_arg = (
         f" --port {port}"
@@ -184,6 +191,7 @@ def _classify_session_record(rec: dict[str, Any]) -> dict[str, Any]:
         "started_at": started_at,
         "expires_at": expires_at,
         "remaining_ttl_seconds": remaining_ttl_seconds,
+        "authorization": authorization,
         "commands": {
             "attach": attach_cmd,
             "refresh": refresh_cmd,
@@ -215,7 +223,7 @@ def list_active_sessions(
         if dedup_key in seen_keys:
             continue
         seen_keys.add(dedup_key)
-        classified = _classify_session_record(rec)
+        classified = _classify_session_record(rec, runs_dir)
         if include_stale or classified["active"]:
             out.append(classified)
     return out
@@ -296,6 +304,9 @@ def main(argv: list[str] | None = None, *, runs_dir: Path | None = None) -> int:
                     f"ttl={ttl_info}  thinking={'on' if s.get('thinking_enabled') else 'off'}"
                 )
             cmds = s["commands"]
+            if s.get('authorization'):
+                from local_assist.session import format_status
+                print('  session: ' + format_status(s['authorization']))
             print(f"  attach:  {cmds['attach']}")
             print(f"  refresh: {cmds['refresh']}")
             print(f"  stop:    {cmds['stop']}")

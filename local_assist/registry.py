@@ -133,6 +133,7 @@ class EndpointConfig:
     capabilities: dict[str, Any] = field(default_factory=dict)
     routing_private_local: str | None = None
     routing_private_attested: str = "blocked"
+    default_private_attested: bool = False
     api_key_keychain_service: str | None = None
     upstream_base_url: str | None = None
     pricing_per_m_tokens: dict[str, float] | None = None
@@ -503,6 +504,30 @@ def _validate_https_upstream_url(model_id: str, upstream_url: str) -> str:
     return cleaned
 
 
+def parse_session_token_raw(raw: str) -> str | None:
+    """Read legacy tokens or complete version-1 credential envelopes; never echo input."""
+    def unique_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError('Duplicate credential field.')
+            result[key] = value
+        return result
+    try:
+        token = raw.strip()
+        if token.startswith('{'):
+            envelope = json.loads(token, object_pairs_hook=unique_object)
+            if (not isinstance(envelope, dict) or set(envelope) != {'token', 'generation', 'session_id'}
+                    or type(envelope['generation']) is not int or envelope['generation'] < 1
+                    or not isinstance(envelope['session_id'], str)
+                    or not re.fullmatch(r'[A-Za-z0-9-]{1,64}', envelope['session_id'])):
+                return None
+            token = envelope['token']
+        return token if isinstance(token, str) and re.fullmatch(r'se-session-[A-Za-z0-9_-]{9,}', token) else None
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
 def resolve_endpoint(
     model: dict[str, Any],
     *,
@@ -510,6 +535,7 @@ def resolve_endpoint(
     require_api_key: bool = True,
     require_eval_evidence_file: bool = True,
     port_override: int | None = None,
+    session_token_override: str | None = None,
 ) -> EndpointConfig:
     model_id = str(model.get("id") or "").strip()
     if not model_id:
@@ -667,16 +693,20 @@ def resolve_endpoint(
             upstream_base_url = _validate_https_upstream_url(model_id, upstream_base_url)
 
         session_token: str | None = None
-        if isinstance(pid_record, dict):
+        if isinstance(session_token_override, str):
+            cand_tok = session_token_override.strip()
+            if cand_tok.startswith("se-session-") and len(cand_tok) >= 20:
+                session_token = cand_tok
+        if session_token is None and isinstance(pid_record, dict):
             token_path_str = pid_record.get("session_token_file")
             if isinstance(token_path_str, str) and token_path_str.strip():
                 token_path = Path(token_path_str)
                 if token_path.is_file():
                     try:
-                        raw_tok = token_path.read_text(encoding="utf-8").strip()
-                        if raw_tok.startswith("se-session-") and len(raw_tok) >= 20:
+                        raw_tok = parse_session_token_raw(token_path.read_text(encoding="utf-8"))
+                        if raw_tok is not None:
                             session_token = raw_tok
-                    except OSError:
+                    except (OSError, ValueError, TypeError, AttributeError):
                         session_token = None
 
         if session_token is not None:
@@ -706,10 +736,16 @@ def resolve_endpoint(
     raw_routing = model.get("routing")
     routing_private_local: str | None = None
     routing_private_attested: str = "blocked"
+    default_private_attested: bool = False
     if raw_routing is not None:
         if not isinstance(raw_routing, dict):
             raise RegistryError(f"Model {model_id}: routing must be null or a mapping")
-        allowed_routing_keys = {"private_local", "private_attested", "eval_evidence_artifact"}
+        allowed_routing_keys = {
+            "private_local",
+            "private_attested",
+            "default_private_attested",
+            "eval_evidence_artifact",
+        }
         unknown_routing_keys = set(raw_routing.keys()) - allowed_routing_keys
         if unknown_routing_keys:
             raise RegistryError(
@@ -747,6 +783,19 @@ def resolve_endpoint(
                         f"Model {model_id}: routing.private_attested='cleared' requires capabilities.tool_calling=true."
                     )
             routing_private_attested = raw_pa
+
+        if "default_private_attested" in raw_routing:
+            raw_dpa = raw_routing["default_private_attested"]
+            if not isinstance(raw_dpa, bool):
+                raise RegistryError(
+                    f"Model {model_id}: routing.default_private_attested must be a boolean (true or false), "
+                    f"got {raw_dpa!r}."
+                )
+            if raw_dpa is True and routing_private_attested != "cleared":
+                raise RegistryError(
+                    f"Model {model_id}: routing.default_private_attested=true requires routing.private_attested='cleared'."
+                )
+            default_private_attested = raw_dpa
 
     raw_eval_artifact = model.get("eval_evidence_artifact")
     if raw_eval_artifact is None and isinstance(raw_routing, dict):
@@ -883,6 +932,7 @@ def resolve_endpoint(
         capabilities=capabilities,
         routing_private_local=routing_private_local,
         routing_private_attested=routing_private_attested,
+        default_private_attested=default_private_attested,
         api_key_keychain_service=api_key_keychain_service,
         upstream_base_url=upstream_base_url,
         pricing_per_m_tokens=pricing_per_m_tokens,
@@ -941,7 +991,7 @@ def validate_custom_command_localhost(
     if not cmd:
         return "serve_command produced an empty command"
 
-    bind_flags = {"--host", "-H", "--bind", "--listen", "--address"}
+    bind_flags = {"--host", "-H", "--bind", "--listen", "--address", "--listen-address"}
     port_flags = {"--port", "-p"}
     valid_loopbacks = {"127.0.0.1", "localhost", "::1", "[::1]"}
 
@@ -1042,35 +1092,44 @@ def validate_custom_command_localhost(
     return None
 
 
+def _effective_runs_dir(runs_dir: Path | None = None) -> Path:
+    if runs_dir is not None:
+        return runs_dir
+    raw_env = os.environ.get("FREE_INFERENCE_RUNS_DIR", "").strip()
+    if raw_env:
+        return Path(raw_env).expanduser().resolve()
+    return DEFAULT_RUNS_DIR
+
+
 def pid_file_for_model(model_id: str, runs_dir: Path | None = None) -> Path:
-    base = runs_dir or DEFAULT_RUNS_DIR
+    base = _effective_runs_dir(runs_dir)
     safe_id = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "-" for ch in model_id)
     digest = hashlib.sha256(model_id.encode("utf-8")).hexdigest()[:8]
     return base / f".serve-{safe_id}-{digest}.pid"
 
 
 def session_token_file_for_model(model_id: str, runs_dir: Path | None = None) -> Path:
-    base = runs_dir or DEFAULT_RUNS_DIR
+    base = _effective_runs_dir(runs_dir)
     safe_id = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "-" for ch in model_id)
     digest = hashlib.sha256(model_id.encode("utf-8")).hexdigest()[:8]
     return base / f".se-session-{safe_id}-{digest}.token"
 
 
 def _legacy_unhashed_pid_file(model_id: str, runs_dir: Path | None = None) -> Path:
-    base = runs_dir or DEFAULT_RUNS_DIR
+    base = _effective_runs_dir(runs_dir)
     safe_id = "".join(ch if ch.isalnum() or ch in ("-", "_", ".") else "-" for ch in model_id)
     return base / f".serve-{safe_id}.pid"
 
 
 def legacy_pid_file(runs_dir: Path | None = None) -> Path:
-    base = runs_dir or DEFAULT_RUNS_DIR
+    base = _effective_runs_dir(runs_dir)
     return base / ".serve.pid"
 
 
 def read_pid_record_for_model(
     model_id: str, runs_dir: Path | None = None
 ) -> dict[str, Any] | None:
-    base = runs_dir or DEFAULT_RUNS_DIR
+    base = _effective_runs_dir(runs_dir)
     for candidate in (
         pid_file_for_model(model_id, base),
         _legacy_unhashed_pid_file(model_id, base),
@@ -1099,7 +1158,7 @@ def read_pid_record_for_model(
 
 
 def list_pid_records(runs_dir: Path | None = None) -> list[tuple[Path, dict[str, Any]]]:
-    base = runs_dir or DEFAULT_RUNS_DIR
+    base = _effective_runs_dir(runs_dir)
     try:
         if not base.exists():
             return []

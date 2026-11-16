@@ -6,8 +6,10 @@ import http.server
 import json
 import os
 import re
+import shlex
 import shutil
 import socketserver
+import stat
 import subprocess
 import sys
 import tempfile
@@ -36,8 +38,12 @@ from local_assist.registry import (
     resolve_endpoint,
 )
 from local_assist.se_key import (
+    DEFAULT_EXCLUDED_DIR_NAMES,
+    count_exact_session_token,
     redact_and_count_session_tokens,
+    resolve_authorized_scan_root,
     scan_and_redact_directory_tokens,
+    validate_non_symlink_scan_root,
 )
 
 TEMPLATE_DIR = ROOT / "evals" / "opencode_smoke"
@@ -55,6 +61,153 @@ HOST_STATE_CHECK_SCOPE = (
     "~/Library/Application Support/opencode"
 )
 SAFE_ENV_ALLOWLIST = tuple(sorted(BASE_SAFE_ENV_ALLOWLIST))
+SMOKE_EXCLUDED_REPO_HOME_DIRS = frozenset({
+    "opencode-private-attested",
+    "opencode-private-local",
+    ".promptfoo",
+    "workers",
+    "dogfood",
+})
+FORBIDDEN_PROXY_WORKSPACE_HOME_DIRS = (
+    DEFAULT_EXCLUDED_DIR_NAMES | SMOKE_EXCLUDED_REPO_HOME_DIRS
+)
+
+
+def extract_proxy_workspace_paths(model: dict[str, Any], root_dir: Path) -> list[Path]:
+    if model.get("runtime") != "proxy":
+        return []
+    raw_cmd = model.get("serve_command")
+    if not isinstance(raw_cmd, str) or not raw_cmd.strip():
+        return []
+    try:
+        tokens = shlex.split(raw_cmd)
+    except ValueError as exc:
+        raise ValueError(f"Invalid shell syntax in serve_command: {exc}") from exc
+
+    workspaces: list[Path] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok == "--":
+            break
+        if tok == "--workspace":
+            if i + 1 >= len(tokens) or not tokens[i + 1].strip() or tokens[i + 1].startswith("-"):
+                raise ValueError("serve_command flag '--workspace' is missing a valid directory argument")
+            raw_val = tokens[i + 1].strip()
+            i += 2
+        elif tok.startswith("--workspace="):
+            raw_val = tok.partition("=")[2].strip()
+            if not raw_val or raw_val.startswith("-"):
+                raise ValueError("serve_command flag '--workspace=' has an empty or invalid directory argument")
+            i += 1
+        else:
+            i += 1
+            continue
+        p = Path(raw_val)
+        workspaces.append(p if p.is_absolute() else (root_dir / p))
+    return workspaces
+
+
+def build_smoke_scan_plan(
+    out_dir: Path,
+    root_dir: Path,
+    model: dict[str, Any],
+) -> tuple[list[Path], frozenset[str]]:
+    out_scan_root = resolve_authorized_scan_root(
+        out_dir,
+        root_dir=root_dir,
+        forbidden_home_subdirs=FORBIDDEN_PROXY_WORKSPACE_HOME_DIRS,
+        allow_symlink_alias=False,
+    )
+    out_real = out_scan_root.resolve()
+    repo_home = validate_non_symlink_scan_root(
+        root_dir / ".home",
+        root_dir=root_dir,
+        must_exist=False,
+    )
+    repo_home_real = repo_home.resolve()
+
+    scan_roots: list[Path] = [out_scan_root, repo_home]
+    seen_reals: set[Path] = {out_real, repo_home_real}
+    for ws in extract_proxy_workspace_paths(model, root_dir):
+        ws_scan_root = resolve_authorized_scan_root(
+            ws,
+            root_dir=root_dir,
+            forbidden_home_subdirs=FORBIDDEN_PROXY_WORKSPACE_HOME_DIRS,
+            allow_symlink_alias=True,
+        )
+        ws_real = ws_scan_root.resolve()
+        if ws_real in seen_reals or ws_real.is_relative_to(out_real):
+            continue
+        seen_reals.add(ws_real)
+        scan_roots.append(ws_scan_root)
+
+    return scan_roots, FORBIDDEN_PROXY_WORKSPACE_HOME_DIRS
+
+
+def _escape_seatbelt_string(val: str) -> str:
+    return val.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def build_smoke_seatbelt_profile(root_dir: Path) -> str:
+    repo_home = root_dir / ".home"
+    deny_targets: list[Path] = [repo_home.resolve()]
+    try:
+        if repo_home.is_dir():
+            with os.scandir(repo_home) as it:
+                for entry in sorted(it, key=lambda e: e.name):
+                    try:
+                        if entry.is_symlink():
+                            deny_targets.append(Path(entry.path).resolve())
+                    except OSError:
+                        continue
+    except OSError:
+        pass
+
+    unique_targets: list[str] = []
+    seen_targets: set[str] = set()
+    for t in deny_targets:
+        ts = str(t)
+        if ts not in seen_targets:
+            seen_targets.add(ts)
+            unique_targets.append(ts)
+
+    lines = [
+        "(version 1)",
+        "(allow default)",
+    ]
+    for target_str in unique_targets:
+        esc = _escape_seatbelt_string(target_str)
+        lines.append(f'(deny file-write* (subpath "{esc}"))')
+        lines.append(f'(deny file-read-data (subpath "{esc}"))')
+    return "\n".join(lines) + "\n"
+
+
+def wrap_command_with_smoke_seatbelt(
+    cmd: list[str],
+    profile_text: str,
+    *,
+    platform_name: str = sys.platform,
+    sandbox_exec_path: str | None = None,
+) -> tuple[list[str], bool, str | None]:
+    if platform_name != "darwin":
+        return list(cmd), True, None
+    if sandbox_exec_path is not None:
+        resolved_sb = (
+            sandbox_exec_path
+            if (os.path.isfile(sandbox_exec_path) and os.access(sandbox_exec_path, os.X_OK))
+            else None
+        )
+    else:
+        default_sb = "/usr/bin/sandbox-exec"
+        resolved_sb = (
+            default_sb
+            if (os.path.isfile(default_sb) and os.access(default_sb, os.X_OK))
+            else shutil.which("sandbox-exec")
+        )
+    if not resolved_sb:
+        return list(cmd), False, "Required macOS sandbox-exec binary is missing or not executable"
+    return [resolved_sb, "-p", profile_text, *cmd], True, None
 
 
 def _json_escape(val: Any) -> str:
@@ -865,6 +1018,9 @@ def evaluate_smoke_gate(
     parsed_events: dict[str, Any],
     session_token_redactions: int = 0,
     session_token_matches: int = 0,
+    active_token_matches: int = 0,
+    smoke_seatbelt_ok: bool = True,
+    scan_roots_ok: bool = True,
 ) -> dict[str, bool]:
     network_observation_ok = (
         observer_available
@@ -882,6 +1038,8 @@ def evaluate_smoke_gate(
     )
     passed = (
         returncode == 0
+        and smoke_seatbelt_ok
+        and scan_roots_ok
         and opencode_host_dirs_unchanged
         and network_observation_ok
         and len(non_localhost_lines) == 0
@@ -889,6 +1047,7 @@ def evaluate_smoke_gate(
         and request_budget_ok
         and session_token_redactions == 0
         and session_token_matches == 0
+        and active_token_matches == 0
         and bool(parsed_events.get("read_tool_called"))
         and bool(parsed_events.get("only_read_tool_called"))
         and bool(parsed_events.get("read_target_only"))
@@ -963,6 +1122,48 @@ def main(argv: list[str]) -> int:
     )
     (out_dir / "served-model.txt").write_text(verify_proc.stdout)
 
+    try:
+        scan_roots, scan_excluded_names = build_smoke_scan_plan(out_dir, ROOT, model)
+    except ValueError as exc:
+        summary = {
+            "model_id": model_id,
+            "repo": endpoint.served_model_id,
+            "passed": False,
+            "reason": str(exc),
+            "out_dir": str(out_dir.relative_to(ROOT)),
+        }
+        (out_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+        print(json.dumps(summary, indent=2))
+        return 1
+
+    seatbelt_profile = build_smoke_seatbelt_profile(ROOT)
+    help_cmd_wrapped, seatbelt_ok, seatbelt_err = wrap_command_with_smoke_seatbelt(
+        [opencode_bin, "run", "--help"],
+        seatbelt_profile,
+    )
+    if not seatbelt_ok:
+        summary = {
+            "model_id": model_id,
+            "repo": endpoint.served_model_id,
+            "passed": False,
+            "smoke_seatbelt_enforced": False,
+            "reason": seatbelt_err or "Seatbelt enforcement unavailable",
+            "out_dir": str(out_dir.relative_to(ROOT)),
+        }
+        (out_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+        print(json.dumps(summary, indent=2))
+        return 1
+
+    smoke_seatbelt_enforced = bool(sys.platform == "darwin" and seatbelt_ok)
+    repo_home_isolation_method = (
+        "darwin_seatbelt_subpath_read_write_deny on <repo>/.home and top-level symlink targets "
+        "for the smoke opencode process tree; pre-existing serve-model/proxy daemon is outside "
+        "this child sandbox (se-key-proxy terminates Bearer se-session-* locally and non-excluded "
+        "proxy state under <repo>/.home plus out_dir are scanned)"
+        if smoke_seatbelt_enforced
+        else "non_darwin_process_env_only (no kernel sandbox-exec write denial)"
+    )
+
     workspace_dir = out_dir / "workspace"
     workspace_dir.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(TEMPLATE_TARGET, workspace_dir / "target.txt")
@@ -1002,7 +1203,7 @@ def main(argv: list[str]) -> int:
             observer_errors.append("Required observer binary missing (lsof or pgrep not found on PATH)")
 
         help_res = run_sampled_command(
-            [opencode_bin, "run", "--help"],
+            help_cmd_wrapped,
             cwd=workspace_dir,
             env=env,
             timeout_s=30,
@@ -1024,6 +1225,7 @@ def main(argv: list[str]) -> int:
                 "model_id": model_id,
                 "repo": endpoint.served_model_id,
                 "passed": False,
+                "smoke_seatbelt_enforced": smoke_seatbelt_enforced,
                 "reason": "opencode run --help missing required flags (--standalone, --format, --model)",
                 "out_dir": str(out_dir.relative_to(ROOT)),
             }
@@ -1045,12 +1247,13 @@ def main(argv: list[str]) -> int:
             "local_mlx/local_model",
             prompt,
         ]
+        run_cmd_wrapped, _, _ = wrap_command_with_smoke_seatbelt(cmd, seatbelt_profile)
 
         serve_log_path = runs_dir / "serve.log"
         serve_posts_before = _count_serve_log_chat_posts(serve_log_path)
 
         run_res = run_sampled_command(
-            cmd,
+            run_cmd_wrapped,
             cwd=workspace_dir,
             env=env,
             timeout_s=180,
@@ -1071,6 +1274,13 @@ def main(argv: list[str]) -> int:
         else None
     )
 
+    active_session_token = (
+        endpoint.api_key if endpoint.api_key.startswith("se-session-") else None
+    )
+    in_memory_active_matches = (
+        count_exact_session_token(run_res["stdout"], active_session_token)
+        + count_exact_session_token(run_res["stderr"], active_session_token)
+    )
     scrubbed_stdout, stdout_redactions = redact_and_count_session_tokens(run_res["stdout"])
     scrubbed_stderr, stderr_redactions = redact_and_count_session_tokens(run_res["stderr"])
     session_token_redactions = stdout_redactions + stderr_redactions
@@ -1085,12 +1295,51 @@ def main(argv: list[str]) -> int:
     (out_dir / "host-state-after.txt").write_text(after_snapshot)
     opencode_host_dirs_unchanged = before_snapshot == after_snapshot
 
-    session_token_scan = scan_and_redact_directory_tokens([out_dir, ROOT / ".home"])
+    post_run_root_error: str | None = None
+    fallback_out_root: Path | None = None
+    try:
+        scan_roots, scan_excluded_names = build_smoke_scan_plan(out_dir, ROOT, model)
+        fallback_out_root = scan_roots[0]
+    except ValueError as exc:
+        post_run_root_error = str(exc)
+        scan_excluded_names = FORBIDDEN_PROXY_WORKSPACE_HOME_DIRS
+        try:
+            fallback_out_root = validate_non_symlink_scan_root(out_dir, root_dir=ROOT, must_exist=True)
+            scan_roots = [fallback_out_root]
+        except ValueError:
+            scan_roots = []
+
+    session_token_scan = scan_and_redact_directory_tokens(
+        scan_roots,
+        excluded_dir_names=scan_excluded_names,
+        active_session_token=active_session_token,
+    )
+    skipped_roots = session_token_scan.get("skipped_roots") or []
+    missing_roots = session_token_scan.get("missing_roots") or []
+    walk_errors = [
+        item
+        for item in (session_token_scan.get("files_skipped") or [])
+        if str(item.get("reason", "")).startswith(("walk_error", "lstat_error"))
+    ]
+    scan_roots_ok = (
+        post_run_root_error is None
+        and fallback_out_root is not None
+        and len(skipped_roots) == 0
+        and len(walk_errors) == 0
+        and str(fallback_out_root) not in missing_roots
+    )
+    session_token_scan["scan_roots_ok"] = scan_roots_ok
+    if post_run_root_error is not None:
+        session_token_scan["root_validation_errors"] = [post_run_root_error]
     in_memory_redactions = stdout_redactions + stderr_redactions
     session_token_redactions = in_memory_redactions + int(session_token_scan.get("redactions_applied") or 0)
     session_token_matches = in_memory_redactions + int(session_token_scan.get("matches_found") or 0)
+    active_token_matches = in_memory_active_matches + int(
+        session_token_scan.get("active_token_matches_found") or 0
+    )
     session_token_scan["redactions_applied"] = session_token_redactions
     session_token_scan["matches_found"] = session_token_matches
+    session_token_scan["active_token_matches_found"] = active_token_matches
 
     parsed = parse_events(scrubbed_stdout, workspace_dir)
     token_summary = forwarder.summarize_tokens()
@@ -1111,6 +1360,9 @@ def main(argv: list[str]) -> int:
         parsed_events=parsed,
         session_token_redactions=session_token_redactions,
         session_token_matches=session_token_matches,
+        active_token_matches=active_token_matches,
+        smoke_seatbelt_ok=seatbelt_ok,
+        scan_roots_ok=scan_roots_ok,
     )
 
     summary = {
@@ -1120,6 +1372,9 @@ def main(argv: list[str]) -> int:
         "opencode_version": "v2.0.32",
         "exit_code": run_res["returncode"],
         "elapsed_seconds": run_res["elapsed"],
+        "smoke_seatbelt_enforced": smoke_seatbelt_enforced,
+        "scan_roots_ok": scan_roots_ok,
+        "repo_home_isolation_method": repo_home_isolation_method,
         "opencode_host_dirs_unchanged": opencode_host_dirs_unchanged,
         "host_state_unchanged": opencode_host_dirs_unchanged,
         "host_state_check_scope": HOST_STATE_CHECK_SCOPE,

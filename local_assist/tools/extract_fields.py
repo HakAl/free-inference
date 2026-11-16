@@ -10,13 +10,15 @@ from typing import Any, TypedDict
 from ..client import chat, default_timeout_seconds
 from ..errors import LocalAssistError, ModelOutputMalformed
 from ..lifecycle import require_chat_succeeds
-from ..logging import log_call
+from ..logging import caller_context, log_call
 from ..routing import JOB_TO_MODEL
+from ..workspace import read_confined_workspace_file
 
 
 JOB = "extract_fields"
 ALLOWED_TYPES = {"string", "integer", "number", "boolean", "string_list"}
 MAX_TEXT_CHARS = 100_000
+MAX_TEXT_BYTES = MAX_TEXT_CHARS * 4
 MAX_FIELDS = 25
 MAX_FIELD_NAME_LEN = 64
 
@@ -58,7 +60,12 @@ Output JSON only, no commentary, no markdown. Do not add fields that were not
 requested. Do not omit fields that were requested."""
 
 
-def run(text: Any, fields: Any) -> ExtractFieldsResult:
+def run(
+    text: Any = None,
+    fields: Any = None,
+    *,
+    context_path: Any = None,
+) -> ExtractFieldsResult:
     model = JOB_TO_MODEL[JOB]
     text_chars = len(text) if isinstance(text, str) else 0
     text_sha256 = (
@@ -73,15 +80,40 @@ def run(text: Any, fields: Any) -> ExtractFieldsResult:
         args={
             "text_chars": text_chars,
             "text_sha256": text_sha256,
+            "context_path": context_path,
             "fields": fields,
         },
         redact_prompt=True,
     ) as call:
         try:
-            validated_fields = validate_field_specs(text, fields)
+            if text is not None and context_path is not None:
+                raise ModelOutputMalformed(
+                    "invalid_arguments",
+                    "Provide either text or context_path, not both.",
+                )
+            source_path: str | None = None
+            if context_path is not None:
+                source_path, resolved_text, resolved_sha = read_confined_workspace_file(
+                    context_path,
+                    max_bytes=MAX_TEXT_BYTES,
+                    max_chars=MAX_TEXT_CHARS,
+                    param_name="context_path",
+                )
+                call.args.update(
+                    {
+                        "text_chars": len(resolved_text),
+                        "text_sha256": resolved_sha,
+                        "context_path": source_path,
+                    }
+                )
+            else:
+                resolved_text = text
+
+            validated_fields = validate_field_specs(resolved_text, fields)
             deadline = time.monotonic() + float(default_timeout_seconds())
-            require_chat_succeeds(model, deadline=deadline)
-            prompt = build_prompt(text, validated_fields)
+            with call.measure_readiness():
+                require_chat_succeeds(model, deadline=deadline)
+            prompt = build_prompt(resolved_text, validated_fields)
             call.record_prompt(system=SYSTEM, prompt=prompt)
             result = chat(
                 model,
@@ -91,15 +123,18 @@ def run(text: Any, fields: Any) -> ExtractFieldsResult:
                 temperature=0.1,
                 timeout_seconds=max(1, int(deadline - time.monotonic())),
             )
+            call.record_completion(result)
             call.record_raw_response(raw_response=result.raw_text, normalized_response=result.text)
             parsed = parse_and_validate(result.text, validated_fields)
             output: ExtractFieldsResult = parsed
-            observed = {
+            observed: dict[str, Any] = {
                 "n_fields_requested": len(validated_fields),
                 "n_fields_found": sum(1 for v in parsed["extracted"].values() if v is not None),
                 "n_missing_required": len(parsed["missing_required"]),
                 "extraction_note_present": parsed["extraction_note"] is not None,
             }
+            if source_path is not None:
+                observed["source_path"] = source_path
             call.record_result(
                 output,
                 observed=observed,
@@ -280,17 +315,24 @@ def check_value_type(name: str, type_name: str, value: Any) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Extract structured fields from text via the local model.")
-    parser.add_argument("--text", required=True, help="Source text (or @path to read from a file).")
+    parser.add_argument("--text", default=None, help="Source text (or @path to read from a file).")
+    parser.add_argument(
+        "--context-path",
+        dest="context_path",
+        default=None,
+        help="Workspace-confined file path read directly by extract_fields.",
+    )
     parser.add_argument(
         "--fields",
         required=True,
         help='JSON object mapping field_name to {"type":..., "description":..., "required":...} (or @path).',
     )
     args = parser.parse_args()
-    text = _read_arg(args.text)
+    text = _read_arg(args.text) if args.text is not None else None
     fields = json.loads(_read_arg(args.fields))
     try:
-        result = run(text, fields)
+        with caller_context(transport="cli", client_name=f"local_assist.tools.{JOB}"):
+            result = run(text, fields, context_path=args.context_path)
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0
     except LocalAssistError as exc:

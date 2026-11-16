@@ -2,14 +2,21 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import hashlib
 import importlib.machinery
 import importlib.util
 import json
 import os
+try:
+    import pwd
+except ImportError:  # pragma: no cover
+    pwd = None  # type: ignore[assignment]
 import subprocess
 import sys
 import tempfile
 import time
+from unittest.mock import patch
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -26,12 +33,18 @@ sys.path.insert(0, str(ROOT))
 
 from local_assist.client import open_loopback_http
 from local_assist.registry import (
+    ATTESTED_ENCLAVE_TIERS,
+    DATA_CONTROL_RUNGS,
+    LEGACY_TIER_ALIASES,
     get_process_lstart,
+    is_model_effectively_deprecated,
     load_model,
+    load_models,
     pid_file_for_model,
     read_pid_record_for_model,
     resolve_endpoint,
 )
+from local_assist.se_key import DEFAULT_ENVELOPE_ACCOUNT, validate_non_symlink_scan_root
 
 
 def _load_script_module(name: str, rel_path: str) -> Any:
@@ -47,6 +60,64 @@ def _load_script_module(name: str, rel_path: str) -> Any:
 smoke = _load_script_module("opencode_smoke", "scripts/opencode-smoke")
 attested_mod = _load_script_module("opencode_attested", "scripts/opencode-attested")
 verify_mod = _load_script_module("verify_served_model", "scripts/verify-served-model")
+
+
+def run_live_attested_token_scan(
+    run_dir: Path,
+    repo_home: Path,
+    *,
+    root_dir: Path = ROOT,
+) -> tuple[dict[str, Any], bool]:
+    root_errors: list[str] = []
+    valid_roots: list[Path] = []
+    run_checked: Path | None = None
+    try:
+        run_checked = validate_non_symlink_scan_root(run_dir, root_dir=root_dir, must_exist=True)
+        valid_roots.append(run_checked)
+    except ValueError as exc:
+        root_errors.append(str(exc))
+
+    try:
+        home_checked = validate_non_symlink_scan_root(repo_home, root_dir=root_dir, must_exist=False)
+        valid_roots.append(home_checked)
+    except ValueError as exc:
+        root_errors.append(str(exc))
+
+    if valid_roots:
+        token_scan = smoke.scan_and_redact_directory_tokens(valid_roots)
+    else:
+        token_scan = {
+            "roots": [],
+            "missing_roots": [],
+            "skipped_roots": [],
+            "excluded_dirs": [],
+            "files_scanned": 0,
+            "bytes_scanned": 0,
+            "files_skipped": [],
+            "matches_found": 0,
+            "redactions_applied": 0,
+            "remaining_unredacted_matches": 0,
+            "active_token_checked": False,
+            "active_token_matches_found": 0,
+            "matched_files": [],
+        }
+
+    walk_errors = [
+        item
+        for item in (token_scan.get("files_skipped") or [])
+        if str(item.get("reason", "")).startswith(("walk_error", "lstat_error"))
+    ]
+    roots_ok = (
+        len(root_errors) == 0
+        and run_checked is not None
+        and str(run_checked) not in (token_scan.get("missing_roots") or [])
+        and len(token_scan.get("skipped_roots") or []) == 0
+        and len(walk_errors) == 0
+    )
+    token_scan["scan_roots_ok"] = roots_ok
+    if root_errors:
+        token_scan["root_validation_errors"] = root_errors
+    return token_scan, roots_ok
 
 
 def find_service_pids() -> list[int]:
@@ -117,11 +188,257 @@ def run_check_with_sampling(
     return int(res["returncode"] or 0), res["stdout"], res["stderr"], net_summary
 
 
+def _compute_expected_catalog_default_and_cleared(
+    catalog: list[dict[str, Any]],
+) -> tuple[str, list[dict[str, Any]]]:
+    eligible: list[tuple[str, dict[str, Any], int, bool]] = []
+    for entry in catalog:
+        rt = entry.get("remote_trust")
+        if not isinstance(rt, dict):
+            continue
+        raw_tier = rt.get("tier")
+        tier = LEGACY_TIER_ALIASES.get(str(raw_tier), raw_tier) if isinstance(raw_tier, str) else raw_tier
+        if tier not in ATTESTED_ENCLAVE_TIERS:
+            continue
+        if entry.get("status") == "archived" or is_model_effectively_deprecated(
+            bool(entry.get("deprecated") is True),
+            entry.get("deprecation_date"),
+        ):
+            continue
+        routing = entry.get("routing")
+        if not isinstance(routing, dict) or routing.get("private_attested") != "cleared":
+            continue
+        mid = str(entry.get("id") or "").strip()
+        if not mid:
+            continue
+        rung = DATA_CONTROL_RUNGS.index(str(tier)) + 1
+        pinned = routing.get("default_private_attested") is True
+        eligible.append((mid, entry, rung, pinned))
+    if not eligible:
+        raise RuntimeError("Expected at least one cleared Rung 2/3 model in models.yaml")
+    best_rung = min(r for _, _, r, _ in eligible)
+    best_pool = [item for item in eligible if item[2] == best_rung]
+    pinned_best = [item[0] for item in best_pool if item[3]]
+    expected_default = pinned_best[0] if len(pinned_best) == 1 else best_pool[-1][0]
+    return expected_default, [copy.deepcopy(item[1]) for item in best_pool]
+
+
 def run_offline_checks() -> dict[str, Any]:
     launcher = str(ROOT / "scripts" / "opencode-attested")
 
-    # Check 1: Default resolution selects cleared tinfoil-deepseek-v4-1-flash, uncleared models (tinfoil-kimi-k3-1-pro) are refused without --allow-uncleared-model, and deprecated models (tinfoil-kimi-k3) are refused without --allow-deprecated-model
-    resolved_default = attested_mod.resolve_default_attested_model_id()
+    # Check 1: Config-driven default resolution (highest cleared rung, catalog pin, LIFO,
+    # FREE_INFERENCE_DEFAULT_ATTESTED_MODEL override/refusal, host narrowing, CPF2 env non-influence),
+    # plus uncleared and deprecated CLI refusals
+    expected_catalog_default, best_rung_cleared = _compute_expected_catalog_default_and_cleared(load_models())
+    resolved_default = attested_mod.resolve_default_attested_model_id(
+        prefer_host_state=False,
+        env={},
+    )
+
+    unpinned_pool = [copy.deepcopy(m) for m in best_rung_cleared]
+    for m in unpinned_pool:
+        if isinstance(m.get("routing"), dict):
+            m["routing"].pop("default_private_attested", None)
+    lifo_ok = (
+        attested_mod.resolve_default_attested_model_id(unpinned_pool, env={}) == str(unpinned_pool[-1]["id"])
+        and attested_mod.resolve_default_attested_model_id(list(reversed(unpinned_pool)), env={})
+        == str(unpinned_pool[0]["id"])
+    )
+
+    env_override_target = str(unpinned_pool[-1]["id"])
+    if len(unpinned_pool) > 1 and env_override_target == expected_catalog_default:
+        env_override_target = str(unpinned_pool[0]["id"])
+    env_override_ok = (
+        attested_mod.resolve_default_attested_model_id(
+            prefer_host_state=False,
+            env={"FREE_INFERENCE_DEFAULT_ATTESTED_MODEL": env_override_target},
+        )
+        == env_override_target
+    )
+
+    bad_env_refused = False
+    try:
+        attested_mod.resolve_default_attested_model_id(
+            prefer_host_state=False,
+            env={"FREE_INFERENCE_DEFAULT_ATTESTED_MODEL": "tinfoil-kimi-k3-1-pro"},
+        )
+    except Exception as exc:
+        bad_env_refused = "not an active, non-deprecated Rung 2/3 model cleared" in str(exc)
+
+    dup_pin_refused = True
+    if len(unpinned_pool) >= 2:
+        dup_pool = copy.deepcopy(unpinned_pool[:2])
+        dup_pool[0]["routing"]["default_private_attested"] = True
+        dup_pool[1]["routing"]["default_private_attested"] = True
+        dup_pin_refused = False
+        try:
+            attested_mod.resolve_default_attested_model_id(dup_pool, env={})
+        except Exception as exc:
+            dup_pin_refused = "Multiple Rung 2/3 models set routing.default_private_attested=true" in str(exc)
+
+    # CPF1 & host-state narrowing + CPF2 check in isolated temp dirs
+    rung2_synth = copy.deepcopy(unpinned_pool[0])
+    rung2_synth["id"] = "synthetic-rung2-check"
+    rung2_synth["serve_command"] = "./bin/missing-rung2-proxy --bind {host} --port {port}"
+    rung2_synth["promptfoo_provider"]["apiKeyKeychainService"] = "free-inference.rung2-check"
+    rung2_synth["remote_trust"]["tier"] = "enclave_weights_attested"
+
+    rung3_synth_a = copy.deepcopy(unpinned_pool[0])
+    rung3_synth_a["id"] = "synthetic-rung3-alpha"
+    rung3_synth_a["serve_command"] = "./bin/alpha-proxy --bind {host} --port {port}"
+    rung3_synth_a["promptfoo_provider"]["apiKeyKeychainService"] = "free-inference.alpha-check"
+    rung3_synth_a["remote_trust"]["tier"] = "enclave_runtime_attested"
+
+    rung3_synth_b = copy.deepcopy(unpinned_pool[-1])
+    rung3_synth_b["id"] = "synthetic-rung3-beta"
+    rung3_synth_b["serve_command"] = "./bin/beta-proxy --bind {host} --port {port}"
+    rung3_synth_b["promptfoo_provider"]["apiKeyKeychainService"] = "free-inference.beta-check"
+    rung3_synth_b["remote_trust"]["tier"] = "enclave_runtime_attested"
+
+    with tempfile.TemporaryDirectory() as tmp_c1_str:
+        tmp_c1 = Path(tmp_c1_str)
+        c1_root = tmp_c1 / "repo"
+        (c1_root / "bin").mkdir(parents=True)
+        c1_runs = c1_root / "runs"
+        c1_runs.mkdir(parents=True)
+        c1_envs = tmp_c1 / "envelopes"
+        c1_envs.mkdir(parents=True, mode=0o700)
+        os.chmod(c1_envs, 0o700)
+        my_lstart = get_process_lstart(os.getpid())
+
+        pid_beta = pid_file_for_model("synthetic-rung3-beta", c1_runs)
+        pid_beta.write_text(
+            json.dumps(
+                {
+                    "model_id": "synthetic-rung3-beta",
+                    "pid": os.getpid(),
+                    "pid_lstart": my_lstart,
+                    "status": "ready",
+                }
+            ),
+            encoding="utf-8",
+        )
+        # CPF1: Rung 2 beats Rung 3 even when Rung 3 appears later and has a live session
+        cpf1_rank_ok = (
+            attested_mod.resolve_default_attested_model_id(
+                [rung2_synth, rung3_synth_b],
+                env={},
+                root_dir=c1_root,
+                runs_dir=c1_runs,
+                envelope_dir=c1_envs,
+                prefer_host_state=True,
+            )
+            == "synthetic-rung2-check"
+        )
+        rung3_stale_pin = copy.deepcopy(rung3_synth_b)
+        rung3_stale_pin["routing"]["default_private_attested"] = True
+        cpf1_stale_pin_refused = False
+        try:
+            attested_mod.resolve_default_attested_model_id(
+                [rung2_synth, rung3_stale_pin],
+                env={},
+                root_dir=c1_root,
+                runs_dir=c1_runs,
+                envelope_dir=c1_envs,
+                prefer_host_state=True,
+            )
+        except Exception as exc:
+            cpf1_stale_pin_refused = "higher-control Rung 2 cleared model(s) exist" in str(exc)
+
+        pid_beta.unlink()
+        pid_alpha = pid_file_for_model("synthetic-rung3-alpha", c1_runs)
+        pid_alpha.write_text(
+            json.dumps(
+                {
+                    "model_id": "synthetic-rung3-alpha",
+                    "pid": os.getpid(),
+                    "pid_lstart": my_lstart,
+                    "status": "ready",
+                }
+            ),
+            encoding="utf-8",
+        )
+        host_pid_ok = (
+            attested_mod.resolve_default_attested_model_id(
+                [rung3_synth_a, rung3_synth_b],
+                env={},
+                root_dir=c1_root,
+                runs_dir=c1_runs,
+                envelope_dir=c1_envs,
+                prefer_host_state=True,
+            )
+            == "synthetic-rung3-alpha"
+        )
+        pid_alpha.unlink()
+
+        alpha_bin = c1_root / "bin" / "alpha-proxy"
+        alpha_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        alpha_bin.chmod(0o755)
+        host_bin_ok = (
+            attested_mod.resolve_default_attested_model_id(
+                [rung3_synth_a, rung3_synth_b],
+                env={},
+                root_dir=c1_root,
+                runs_dir=c1_runs,
+                envelope_dir=c1_envs,
+                prefer_host_state=True,
+            )
+            == "synthetic-rung3-alpha"
+        )
+
+        beta_bin = c1_root / "bin" / "beta-proxy"
+        beta_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        beta_bin.chmod(0o755)
+        alpha_stem = hashlib.sha256(
+            f"free-inference.alpha-check\0{DEFAULT_ENVELOPE_ACCOUNT}".encode("utf-8")
+        ).hexdigest()
+        alpha_env_path = c1_envs / f"{alpha_stem}.json"
+        alpha_env_path.write_text('{"version": 1}\n', encoding="utf-8")
+        os.chmod(alpha_env_path, 0o600)
+        host_env_ok = (
+            attested_mod.resolve_default_attested_model_id(
+                [rung3_synth_a, rung3_synth_b],
+                env={},
+                root_dir=c1_root,
+                runs_dir=c1_runs,
+                envelope_dir=c1_envs,
+                prefer_host_state=True,
+            )
+            == "synthetic-rung3-alpha"
+        )
+
+        cpf2_env_ignored = True
+        if pwd is not None and hasattr(os, "geteuid"):
+            empty_pw_home = tmp_c1 / "empty_pw_home"
+            empty_pw_home.mkdir(parents=True, mode=0o755)
+            orig_pw = pwd.getpwuid(os.geteuid())
+            fake_pw = pwd.struct_passwd(
+                (
+                    orig_pw.pw_name,
+                    orig_pw.pw_passwd,
+                    orig_pw.pw_uid,
+                    orig_pw.pw_gid,
+                    orig_pw.pw_gecos,
+                    str(empty_pw_home),
+                    orig_pw.pw_shell,
+                )
+            )
+            with (
+                patch("pwd.getpwuid", return_value=fake_pw),
+                patch.dict(os.environ, {"FREE_INFERENCE_SE_ENVELOPE_DIR": str(c1_envs)}),
+            ):
+                cpf2_env_ignored = (
+                    attested_mod.resolve_default_attested_model_id(
+                        [rung3_synth_a, rung3_synth_b],
+                        env={"FREE_INFERENCE_SE_ENVELOPE_DIR": str(c1_envs)},
+                        root_dir=c1_root,
+                        runs_dir=c1_runs,
+                        envelope_dir=None,
+                        prefer_host_state=True,
+                    )
+                    == "synthetic-rung3-beta"
+                )
+
     all_blocked_refused = False
     try:
         attested_mod.resolve_default_attested_model_id(
@@ -158,7 +475,17 @@ def run_offline_checks() -> dict[str, Any]:
         timeout=15,
     )
     check_1_passed = (
-        resolved_default == "tinfoil-deepseek-v4-1-flash"
+        resolved_default == expected_catalog_default
+        and lifo_ok
+        and env_override_ok
+        and bad_env_refused
+        and dup_pin_refused
+        and cpf1_rank_ok
+        and cpf1_stale_pin_refused
+        and host_pid_ok
+        and host_bin_ok
+        and host_env_ok
+        and cpf2_env_ignored
         and all_blocked_refused
         and proc_uncleared.returncode == 1
         and "not cleared for private-attested routing" in proc_uncleared.stderr
@@ -338,6 +665,15 @@ def run_offline_checks() -> dict[str, Any]:
         "check_1_routing_gate": {
             "passed": check_1_passed,
             "resolved_default_model_id": resolved_default,
+            "expected_catalog_default_model_id": expected_catalog_default,
+            "lifo_ok": lifo_ok,
+            "env_override_ok": env_override_ok,
+            "bad_env_refused": bad_env_refused,
+            "dup_pin_refused": dup_pin_refused,
+            "cpf1_rank_ok": cpf1_rank_ok,
+            "cpf1_stale_pin_refused": cpf1_stale_pin_refused,
+            "host_narrowing_ok": bool(host_pid_ok and host_bin_ok and host_env_ok),
+            "cpf2_env_ignored": cpf2_env_ignored,
             "all_blocked_refused": all_blocked_refused,
             "uncleared_rc": proc_uncleared.returncode,
             "uncleared_stderr": proc_uncleared.stderr.strip(),
@@ -371,12 +707,12 @@ def main(argv: list[str]) -> int:
         "--operator-approved",
         action="store_true",
         default=False,
-        help="Run Check 4 live against tinfoil-deepseek-v4-1-flash (<= 4 chat requests, reserved ceiling <= $0.03).",
+        help="Run Check 4 live against the selected cleared Rung 2/3 model (<= 4 chat requests, reserved ceiling <= $0.03).",
     )
     parser.add_argument(
         "--model",
-        default="tinfoil-deepseek-v4-1-flash",
-        help="Model ID for live Check 4 (default: tinfoil-deepseek-v4-1-flash).",
+        default=None,
+        help="Model ID for live Check 4 (default: resolved via opencode-attested default precedence).",
     )
     args = parser.parse_args(argv[1:])
 
@@ -437,7 +773,7 @@ def main(argv: list[str]) -> int:
     launcher = str(ROOT / "scripts" / "opencode-attested")
     stop_script = str(ROOT / "scripts" / "stop-model")
     verify_script = str(ROOT / "scripts" / "verify-served-model")
-    model_id = args.model
+    model_id = args.model or attested_mod.resolve_default_attested_model_id()
 
     verify_existing = subprocess.run(
         [verify_script, model_id, "--wait", "2"],
@@ -547,7 +883,11 @@ def main(argv: list[str]) -> int:
 
     host_after = smoke.snapshot_host_opencode_dirs(real_home)
     host_unchanged = host_before == host_after
-    token_scan = smoke.scan_and_redact_directory_tokens([run_dir, ROOT / ".home"])
+    token_scan, token_scan_roots_ok = run_live_attested_token_scan(
+        run_dir,
+        ROOT / ".home",
+        root_dir=ROOT,
+    )
 
     cap_ok = True if attached_to_existing_proxy else (cap_status_code == 429)
     live_passed = (
@@ -558,6 +898,7 @@ def main(argv: list[str]) -> int:
         and bool(net_live.get("network_observation_ok"))
         and int(net_live.get("non_localhost_sockets", 1)) == 0
         and cap_ok
+        and token_scan_roots_ok
         and int(token_scan.get("matches_found", 1)) == 0
     )
 

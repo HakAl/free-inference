@@ -85,6 +85,42 @@ DEFAULT_CLEARANCE_BASIS: dict[str, dict[str, Any]] = {
             "opencode_smoke": "2026-10-31-213515-opencode-smoke-tinfoil-deepseek-v4-1-flash-b41fc330-vf7313bc",
         },
     },
+    "privatemode-glm-5-3-flash": {
+        "mode": "operator_exception",
+        "approved_date": "2026-11-14",
+        "note": (
+            "Passed sanity 1/1, tools 4/4 (incremental tool_call_chunks=5), and "
+            "opencode-smoke (0 non-localhost sockets, smoke_seatbelt_enforced=true, "
+            "0 session token leaks). Scored 9/10 on automated v1 (missing only the "
+            "git-extended 'diff --git' header on an otherwise valid POSIX unified diff "
+            "in patch-like-edit-gitignore), outperforming full privatemode-glm-5-3 "
+            "(8/10 on v1). Cleared by explicit operator decision on 2026-11-14."
+        ),
+        "smoke_notes": (
+            "Primary clearing smoke run 2026-11-13-200441-opencode-smoke-privatemode-glm-5-3-flash-a319fedd-p1s_92n2 "
+            "verified per-run isolated worker home scanning (smoke_seatbelt_enforced=true, matches_found=0, "
+            "active_token_matches_found=0); pre-fix run "
+            "2026-11-13-171420-opencode-smoke-privatemode-glm-5-3-flash-a319fedd-vd1kskax is retained in runs/."
+        ),
+        "operator_clearance_decision": {
+            "approved": True,
+            "date": "2026-11-14",
+            "suite": "v1",
+            "score": "9/10",
+            "failed_case": "patch-like-edit-gitignore",
+            "rationale": (
+                "Output was a minimal, valid POSIX unified diff omitting only the git-specific "
+                "diff --git header line, and Flash outperformed full privatemode-glm-5-3 (8/10 on v1)."
+            ),
+            "decision_artifact": "docs/attestations/2026-11-13-privatemode-rung3-trial.md",
+        },
+        "default_runs": {
+            "sanity": "2026-11-13-171255-sanity-privatemode-glm-5-3-flash-a319fedd-2HvmJs",
+            "v1": "2026-11-13-171312-v1-privatemode-glm-5-3-flash-a319fedd-uzCxB4",
+            "tools": "2026-11-13-171404-tools-privatemode-glm-5-3-flash-a319fedd-jDaSTE",
+            "opencode_smoke": "2026-11-13-200441-opencode-smoke-privatemode-glm-5-3-flash-a319fedd-p1s_92n2",
+        },
+    },
 }
 
 
@@ -188,16 +224,27 @@ def all_pinned_clearance_runs_present(
     return all((runs_dir / rid).is_dir() for rid in required_run_ids)
 
 
-def _sanitize_token_scan(raw_scan: Any) -> dict[str, int] | None:
+def _sanitize_token_scan(raw_scan: Any) -> dict[str, Any] | None:
     if not isinstance(raw_scan, dict):
         return None
-    return {
+    out: dict[str, Any] = {
         "files_scanned": int(raw_scan.get("files_scanned", 0)),
         "bytes_scanned": int(raw_scan.get("bytes_scanned", 0)),
         "matches_found": int(raw_scan.get("matches_found", 0)),
         "redactions_applied": int(raw_scan.get("redactions_applied", 0)),
         "remaining_unredacted_matches": int(raw_scan.get("remaining_unredacted_matches", 0)),
     }
+    if "active_token_checked" in raw_scan:
+        out["active_token_checked"] = bool(raw_scan.get("active_token_checked"))
+        out["active_token_matches_found"] = int(raw_scan.get("active_token_matches_found", 0))
+    skipped_roots = raw_scan.get("skipped_roots")
+    if isinstance(skipped_roots, list) and len(skipped_roots) > 0:
+        out["skipped_roots_count"] = len(skipped_roots)
+    elif "skipped_roots_count" in raw_scan:
+        out["skipped_roots_count"] = int(raw_scan.get("skipped_roots_count") or 0)
+    if raw_scan.get("scan_roots_ok") is False or raw_scan.get("root_validation_errors"):
+        out["scan_roots_ok"] = False
+    return out
 
 
 def _extract_promptfoo_suite(
@@ -318,6 +365,10 @@ def _extract_smoke_suite(run_dir: Path, *, notes: str | None = None) -> dict[str
         "read_target_only": bool(summary.get("read_target_only")),
         "token_verified": bool(summary.get("token_verified")),
     }
+    if "smoke_seatbelt_enforced" in summary:
+        entry["smoke_seatbelt_enforced"] = bool(summary.get("smoke_seatbelt_enforced"))
+    if "scan_roots_ok" in summary:
+        entry["scan_roots_ok"] = bool(summary.get("scan_roots_ok"))
     if isinstance(summary.get("token_accounting"), dict):
         entry["token_accounting"] = summary["token_accounting"]
     scan_summary = _sanitize_token_scan(summary.get("session_token_scan"))
@@ -651,6 +702,10 @@ def validate_manifest_dict(
                 errors.append("suites.opencode_smoke must have only_read_tool_called=true and read_target_only=true")
             if s_obj.get("non_localhost_sockets") != 0 or s_obj.get("unconnected_udp_sockets") != 0:
                 errors.append("suites.opencode_smoke must have 0 non_localhost_sockets and 0 unconnected_udp_sockets")
+            if s_obj.get("smoke_seatbelt_enforced") is False:
+                errors.append("suites.opencode_smoke must have smoke_seatbelt_enforced=true when recorded")
+            if s_obj.get("scan_roots_ok") is False:
+                errors.append("suites.opencode_smoke must have scan_roots_ok=true when recorded")
             if not offline_ci and run_path.is_dir():
                 try:
                     live_smoke = _extract_smoke_suite(run_path)
@@ -665,8 +720,19 @@ def validate_manifest_dict(
 
         scan = s_obj.get("session_token_scan_summary")
         if isinstance(scan, dict):
-            if scan.get("matches_found", 0) != 0 or scan.get("remaining_unredacted_matches", 0) != 0:
+            if (
+                scan.get("matches_found", 0) != 0
+                or scan.get("remaining_unredacted_matches", 0) != 0
+                or scan.get("active_token_matches_found", 0) != 0
+            ):
                 errors.append(f"suites.{req_suite}.session_token_scan_summary has non-zero token matches")
+            if (
+                scan.get("skipped_roots_count", 0) != 0
+                or scan.get("scan_roots_ok") is False
+            ):
+                errors.append(
+                    f"suites.{req_suite}.session_token_scan_summary indicates skipped or invalid scan roots"
+                )
 
     if not offline_ci and not errors:
         try:

@@ -1,0 +1,431 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+from datetime import date, timedelta
+import json
+import math
+import os
+from pathlib import Path
+import re
+import sys
+from typing import Any
+
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from local_assist.logging import LOCAL_TZ, VALID_STARTUP_STATES, now_local, sanitize_caller_field  # noqa: E402
+from local_assist.paths import LOCAL_ASSIST_RUNS  # noqa: E402
+
+
+_DATE_FILE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})\.jsonl$")
+_STARTUP_KEYS = (
+    "warm",
+    "worker_handoff",
+    "auto_served",
+    "auto_serve_reused",
+    "auto_serve_failed",
+    "not_served",
+    "unrecorded",
+)
+
+
+def _parse_iso_date(raw: str, *, flag: str) -> date:
+    try:
+        return date.fromisoformat(raw)
+    except ValueError as exc:
+        raise ValueError(f"Invalid {flag} {raw!r}: expected YYYY-MM-DD.") from exc
+
+
+def _is_non_bool_int(val: Any) -> bool:
+    return isinstance(val, int) and not isinstance(val, bool) and val >= 0
+
+
+def _percentile(sorted_vals: list[int], pct: float) -> int | None:
+    if not sorted_vals:
+        return None
+    idx = min(len(sorted_vals) - 1, max(0, math.ceil((pct / 100.0) * len(sorted_vals)) - 1))
+    return sorted_vals[idx]
+
+
+def _summarize_ready(vals: list[int]) -> dict[str, int | None]:
+    s = sorted(vals)
+    return {
+        "count": len(s),
+        "p50": _percentile(s, 50.0),
+        "max": s[-1] if s else None,
+    }
+
+
+def _summarize_latency(vals: list[int]) -> dict[str, int | None]:
+    s = sorted(vals)
+    return {
+        "count": len(s),
+        "p50": _percentile(s, 50.0),
+        "p95": _percentile(s, 95.0),
+        "max": s[-1] if s else None,
+    }
+
+
+def _caller_key(row: dict[str, Any]) -> str:
+    caller = row.get("caller")
+    if not isinstance(caller, dict):
+        return "legacy"
+    label = sanitize_caller_field(caller.get("label"))
+    if label:
+        return label
+    transport = sanitize_caller_field(caller.get("transport")) or "direct"
+    client_name = sanitize_caller_field(caller.get("client_name"))
+    if client_name:
+        return f"{transport}:{client_name}"
+    return transport
+
+
+def _new_bucket() -> dict[str, Any]:
+    return {
+        "calls": 0,
+        "succeeded": 0,
+        "errors": 0,
+        "auto_serve_starts": 0,
+        "auto_serve_reused": 0,
+        "auto_serve_failures": 0,
+        "tokens": {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "cached_tokens": 0,
+        },
+        "error_tokens": {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+            "cached_tokens": 0,
+        },
+        "_ready_ok": [],
+        "_ready_fail": [],
+        "_latency_ok": [],
+    }
+
+
+def _finalize_bucket(bucket: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "calls": bucket["calls"],
+        "succeeded": bucket["succeeded"],
+        "errors": bucket["errors"],
+        "auto_serve_starts": bucket["auto_serve_starts"],
+        "auto_serve_reused": bucket["auto_serve_reused"],
+        "auto_serve_failures": bucket["auto_serve_failures"],
+        "tokens": dict(bucket["tokens"]),
+        "error_tokens": dict(bucket["error_tokens"]),
+        "ready_ms": _summarize_ready(bucket["_ready_ok"]),
+        "failed_ready_ms": _summarize_ready(bucket["_ready_fail"]),
+        "latency_ms": _summarize_latency(bucket["_latency_ok"]),
+    }
+
+
+def _extract_tokens(usage: Any) -> tuple[int, int, int, int]:
+    if not isinstance(usage, dict):
+        return (0, 0, 0, 0)
+    pt = usage.get("prompt_tokens")
+    ct = usage.get("completion_tokens")
+    tt = usage.get("total_tokens")
+    details = usage.get("prompt_tokens_details")
+    cached = details.get("cached_tokens") if isinstance(details, dict) else 0
+    return (
+        pt if _is_non_bool_int(pt) else 0,
+        ct if _is_non_bool_int(ct) else 0,
+        tt if _is_non_bool_int(tt) else 0,
+        cached if _is_non_bool_int(cached) else 0,
+    )
+
+
+def _reject_nonfinite(constant: str) -> Any:
+    raise ValueError(f"Non-finite JSON constant: {constant}")
+
+
+def collect_stats(
+    log_dir: Path,
+    *,
+    days: int | None = None,
+    single_date: date | None = None,
+    as_of: date | None = None,
+) -> dict[str, Any]:
+    window_info: dict[str, Any]
+    start_date: date | None = None
+    end_date: date | None = None
+
+    if single_date is not None:
+        start_date = single_date
+        end_date = single_date
+        window_info = {
+            "mode": "date",
+            "date": single_date.isoformat(),
+        }
+    elif days is not None:
+        ref = as_of if as_of is not None else now_local().date()
+        start_date = ref - timedelta(days=days - 1)
+        end_date = ref
+        window_info = {
+            "mode": "days",
+            "days": days,
+            "as_of": ref.isoformat(),
+            "start_date": start_date.isoformat(),
+            "end_date": end_date.isoformat(),
+        }
+    else:
+        window_info = {"mode": "all"}
+
+    matched_files: list[Path] = []
+    if log_dir.is_dir():
+        for entry in sorted(log_dir.iterdir(), key=lambda p: p.name):
+            if not entry.is_file() or entry.is_symlink():
+                continue
+            m = _DATE_FILE_RE.match(entry.name)
+            if not m:
+                continue
+            try:
+                file_date = date.fromisoformat(m.group(1))
+            except ValueError:
+                continue
+            if start_date is not None and file_date < start_date:
+                continue
+            if end_date is not None and file_date > end_date:
+                continue
+            matched_files.append(entry)
+
+    window_info["matched_files"] = [p.name for p in matched_files]
+
+    corrupt_lines = 0
+    overall = _new_bucket()
+    error_codes: dict[str, int] = {}
+    startup_states: dict[str, int] = {k: 0 for k in _STARTUP_KEYS}
+    by_caller_raw: dict[str, dict[str, Any]] = {}
+    by_tool_raw: dict[str, dict[str, Any]] = {}
+
+    for jf in matched_files:
+        try:
+            raw_bytes = jf.read_bytes()
+        except OSError:
+            corrupt_lines += 1
+            continue
+        for raw_record in raw_bytes.split(b"\n"):
+            raw_record = raw_record.rstrip(b"\r")
+            if not raw_record.strip():
+                continue
+            try:
+                decoded = raw_record.decode("utf-8")
+            except UnicodeDecodeError:
+                corrupt_lines += 1
+                continue
+            try:
+                row = json.loads(decoded, parse_constant=_reject_nonfinite)
+            except (json.JSONDecodeError, ValueError):
+                corrupt_lines += 1
+                continue
+            if not isinstance(row, dict):
+                corrupt_lines += 1
+                continue
+
+            ckey = _caller_key(row)
+            tkey = sanitize_caller_field(row.get("tool")) or "unknown"
+            cb = by_caller_raw.setdefault(ckey, _new_bucket())
+            tb = by_tool_raw.setdefault(tkey, _new_bucket())
+
+            is_err = row.get("finish_reason") == "error"
+            if is_err:
+                obs = row.get("observed")
+                ecode = (
+                    sanitize_caller_field(obs.get("error"))
+                    if isinstance(obs, dict)
+                    else None
+                ) or "unknown"
+                error_codes[ecode] = error_codes.get(ecode, 0) + 1
+
+            raw_state = row.get("startup_state")
+            skey = raw_state if isinstance(raw_state, str) and raw_state in VALID_STARTUP_STATES else "unrecorded"
+            startup_states[skey] = startup_states.get(skey, 0) + 1
+
+            pt, ct, tt, cached = _extract_tokens(row.get("usage"))
+            readiness_ok = row.get("readiness_ok")
+            ready_ms = row.get("ready_ms")
+            latency_ms = row.get("latency_ms")
+
+            for b in (overall, cb, tb):
+                b["calls"] += 1
+                if is_err:
+                    b["errors"] += 1
+                else:
+                    b["succeeded"] += 1
+                if skey == "auto_served":
+                    b["auto_serve_starts"] += 1
+                elif skey == "auto_serve_reused":
+                    b["auto_serve_reused"] += 1
+                elif skey == "auto_serve_failed":
+                    b["auto_serve_failures"] += 1
+                b["tokens"]["prompt_tokens"] += pt
+                b["tokens"]["completion_tokens"] += ct
+                b["tokens"]["total_tokens"] += tt
+                b["tokens"]["cached_tokens"] += cached
+                if is_err:
+                    b["error_tokens"]["prompt_tokens"] += pt
+                    b["error_tokens"]["completion_tokens"] += ct
+                    b["error_tokens"]["total_tokens"] += tt
+                    b["error_tokens"]["cached_tokens"] += cached
+                if _is_non_bool_int(ready_ms):
+                    if readiness_ok is True:
+                        b["_ready_ok"].append(ready_ms)
+                    elif readiness_ok is False:
+                        b["_ready_fail"].append(ready_ms)
+                if not is_err and _is_non_bool_int(latency_ms):
+                    b["_latency_ok"].append(latency_ms)
+
+    overall_fin = _finalize_bucket(overall)
+    return {
+        "log_dir": str(log_dir),
+        "timezone": str(LOCAL_TZ),
+        "window": window_info,
+        "corrupt_lines": corrupt_lines,
+        "total_calls": overall_fin["calls"],
+        "succeeded_calls": overall_fin["succeeded"],
+        "error_calls": overall_fin["errors"],
+        "error_codes": dict(sorted(error_codes.items())),
+        "startup_states": startup_states,
+        "auto_serve_starts": overall_fin["auto_serve_starts"],
+        "auto_serve_reused": overall_fin["auto_serve_reused"],
+        "auto_serve_failures": overall_fin["auto_serve_failures"],
+        "tokens": overall_fin["tokens"],
+        "error_tokens": overall_fin["error_tokens"],
+        "ready_ms": overall_fin["ready_ms"],
+        "failed_ready_ms": overall_fin["failed_ready_ms"],
+        "latency_ms": overall_fin["latency_ms"],
+        "by_caller": {k: _finalize_bucket(by_caller_raw[k]) for k in sorted(by_caller_raw)},
+        "by_tool": {k: _finalize_bucket(by_tool_raw[k]) for k in sorted(by_tool_raw)},
+    }
+
+
+def _fmt_ms(val: int | None) -> str:
+    return "-" if val is None else f"{val}ms"
+
+
+def render_text(report: dict[str, Any]) -> str:
+    win = report["window"]
+    if win["mode"] == "days":
+        win_desc = f"last {win['days']}d ({win['start_date']}..{win['end_date']}, {len(win['matched_files'])} file(s))"
+    elif win["mode"] == "date":
+        win_desc = f"date {win['date']} ({len(win['matched_files'])} file(s))"
+    else:
+        win_desc = f"all dates ({len(win['matched_files'])} file(s))"
+
+    tok = report["tokens"]
+    lines = [
+        f"local-assist telemetry ({win_desc}, tz={report['timezone']})",
+        f"  log_dir: {report['log_dir']}",
+        (
+            f"  calls: {report['total_calls']} total, {report['succeeded_calls']} ok, "
+            f"{report['error_calls']} errors (corrupt_lines={report['corrupt_lines']})"
+        ),
+        (
+            f"  auto_serve: {report['auto_serve_starts']} started, "
+            f"{report['auto_serve_reused']} reused, {report['auto_serve_failures']} failed"
+        ),
+        (
+            f"  tokens: {tok['total_tokens']} total "
+            f"(prompt={tok['prompt_tokens']}, cached={tok['cached_tokens']}, "
+            f"completion={tok['completion_tokens']}, error_tokens={report['error_tokens']['total_tokens']})"
+        ),
+        (
+            f"  readiness (ok): p50={_fmt_ms(report['ready_ms']['p50'])} max={_fmt_ms(report['ready_ms']['max'])} "
+            f"| readiness (failed): p50={_fmt_ms(report['failed_ready_ms']['p50'])} max={_fmt_ms(report['failed_ready_ms']['max'])}"
+        ),
+        (
+            f"  completion latency (ok): p50={_fmt_ms(report['latency_ms']['p50'])} "
+            f"p95={_fmt_ms(report['latency_ms']['p95'])} max={_fmt_ms(report['latency_ms']['max'])}"
+        ),
+    ]
+    if report["error_codes"]:
+        errs = ", ".join(f"{k}={v}" for k, v in report["error_codes"].items())
+        lines.append(f"  error_codes: {errs}")
+
+    for section_title, mapping in (("By caller:", report["by_caller"]), ("By tool:", report["by_tool"])):
+        lines.append("")
+        lines.append(section_title)
+        if not mapping:
+            lines.append("  (none)")
+            continue
+        for key, b in mapping.items():
+            lines.append(
+                f"  {key:<28} calls={b['calls']:<4} ok={b['succeeded']:<4} err={b['errors']:<3} "
+                f"auto_start={b['auto_serve_starts']:<2} tokens={b['tokens']['total_tokens']:<7} "
+                f"ready_p50={_fmt_ms(b['ready_ms']['p50']):<8} lat_p50={_fmt_ms(b['latency_ms']['p50']):<8} "
+                f"lat_p95={_fmt_ms(b['latency_ms']['p95'])}"
+            )
+    return "\n".join(lines)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Offline summary of local_assist JSONL telemetry in runs/local-assist/."
+    )
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--days",
+        type=int,
+        default=None,
+        help="Trailing N-calendar-day window in America/New_York (inclusive of today / --as-of).",
+    )
+    group.add_argument(
+        "--date",
+        default=None,
+        help="Single YYYY-MM-DD date to inspect.",
+    )
+    parser.add_argument(
+        "--as-of",
+        default=None,
+        help="Reference YYYY-MM-DD date for --days (default: today in America/New_York).",
+    )
+    parser.add_argument(
+        "--log-dir",
+        default=None,
+        help="Override log directory (default: LOCAL_ASSIST_LOG_DIR or runs/local-assist).",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON output.",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.days is not None and args.days < 1:
+        print("ERROR: --days must be >= 1.", file=sys.stderr)
+        return 2
+    if args.as_of is not None and args.date is not None:
+        print("ERROR: --as-of cannot be combined with --date.", file=sys.stderr)
+        return 2
+
+    try:
+        single_date = _parse_iso_date(args.date, flag="--date") if args.date else None
+        as_of = _parse_iso_date(args.as_of, flag="--as-of") if args.as_of else None
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+    env_dir = os.environ.get("LOCAL_ASSIST_LOG_DIR", "").strip()
+    log_dir = Path(args.log_dir) if args.log_dir else (Path(env_dir) if env_dir else LOCAL_ASSIST_RUNS)
+
+    report = collect_stats(log_dir, days=args.days, single_date=single_date, as_of=as_of)
+    if args.json:
+        print(json.dumps(report, indent=2, ensure_ascii=False))
+    else:
+        print(render_text(report))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

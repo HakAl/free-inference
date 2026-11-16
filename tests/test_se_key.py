@@ -2438,6 +2438,18 @@ class SEKeyTests(unittest.TestCase):
             upstream_srv.shutdown()
             upstream_srv.server_close()
 
+    def test_smoke_reads_valid_legacy_and_json_credentials_and_refuses_malformed_envelopes(self) -> None:
+        smoke_mod = _load_script_module('smoke_envelope', 'scripts/se-key-smoke')
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'token'
+            token = 'se-session-' + 'a'*64
+            for raw in [token, json.dumps({'token': token, 'generation': 2, 'session_id': 'synthetic'})]:
+                path.write_text(raw)
+                self.assertEqual(smoke_mod._read_proxy_token(path), token)
+            for raw in ['{invalid', '{}', '{"token":false}', '{"token":{}}', 'wrong-prefix']:
+                path.write_text(raw)
+                self.assertIsNone(smoke_mod._read_proxy_token(path))
+
     def test_se_key_smoke_script_harness(self) -> None:
         smoke_mod = _load_script_module("se_key_smoke_script", "scripts/se-key-smoke")
         with tempfile.TemporaryDirectory() as tmp:
@@ -2548,6 +2560,9 @@ class SEKeyTests(unittest.TestCase):
             env.pop("FREE_INFERENCE_REQUIRE_GH_ATTESTATION", None)
 
             # Case 0: Strict mode FREE_INFERENCE_REQUIRE_GH_ATTESTATION=1 fails closed when gh is unauthenticated
+            # The fixture must use the interpreter running the suite, including on Macs
+            # whose system python3 is older than the project's minimum version.
+            (fake_bin / 'python3').symlink_to(sys.executable)
             env_strict = dict(env)
             env_strict["FREE_INFERENCE_REQUIRE_GH_ATTESTATION"] = "1"
             proc_strict = subprocess.run(
@@ -3745,6 +3760,285 @@ class SEKeyTests(unittest.TestCase):
                 proc.stderr.close()
             upstream_srv.shutdown()
             upstream_srv.server_close()
+
+    def test_active_token_attribution_dedup_and_go_build_exclusion(self) -> None:
+        from local_assist.se_key import (
+            _stream_count_token_matches,
+            count_exact_session_token,
+        )
+
+        active_tok = "se-session-" + ("a" * 32)
+        longer_tok = active_tok + "bbbb"
+        historical_tok = "se-session-" + ("9" * 32)
+
+        # 1. Exact token helper: prefix does not match longer token, malformed raises ValueError
+        self.assertEqual(count_exact_session_token("none here", None), 0)
+        self.assertEqual(
+            count_exact_session_token(f"x {longer_tok} y {historical_tok} z", active_tok),
+            0,
+        )
+        self.assertEqual(
+            count_exact_session_token(
+                f"x {longer_tok} y {active_tok} z {active_tok}!",
+                active_tok,
+            ),
+            2,
+        )
+        with self.assertRaises(ValueError):
+            count_exact_session_token("hello", "not-a-valid-token")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+
+            # 2. Malformed active_session_token raises ValueError in scan_and_redact_directory_tokens
+            with self.assertRaises(ValueError):
+                scan_and_redact_directory_tokens([tmp_path], active_session_token="se-session-short")
+
+            # 3. Historical token only -> matches_found=1, active_token_checked=True, active_token_matches_found=0
+            hist_dir = tmp_path / "hist_case"
+            hist_dir.mkdir(parents=True, exist_ok=True)
+            (hist_dir / "old.db").write_bytes(
+                b"SQLite\x00" + historical_tok.encode("utf-8") + b" " + longer_tok.encode("utf-8")
+            )
+            res_hist = scan_and_redact_directory_tokens(
+                [hist_dir],
+                active_session_token=active_tok,
+            )
+            self.assertEqual(res_hist["matches_found"], 2)
+            self.assertIs(res_hist["active_token_checked"], True)
+            self.assertEqual(res_hist["active_token_matches_found"], 0)
+
+            res_unchecked = scan_and_redact_directory_tokens([hist_dir])
+            self.assertIs(res_unchecked["active_token_checked"], False)
+            self.assertEqual(res_unchecked["active_token_matches_found"], 0)
+
+            # 4. Active token in redacted text log (events.jsonl) + binary file across chunk boundary
+            mix_dir = tmp_path / "mix_case"
+            mix_dir.mkdir(parents=True, exist_ok=True)
+            events_file = mix_dir / "events.jsonl"
+            events_file.write_text(
+                f'{{"leak": "{active_tok}", "other": "{longer_tok}"}}\n',
+                encoding="utf-8",
+            )
+            bin_file = mix_dir / "state.sqlite"
+            # Place active_tok straddling a 1024-byte chunk boundary
+            prefix_pad = b"X" * (1024 - 12)
+            raw_sqlite = prefix_pad + active_tok.encode("utf-8") + b"\x00" + longer_tok.encode("utf-8") + (b"Y" * 512)
+            bin_file.write_bytes(raw_sqlite)
+
+            b_scanned, b_total, b_active = _stream_count_token_matches(
+                bin_file,
+                chunk_size=1024,
+                overlap=128,
+                active_token_bytes=active_tok.encode("utf-8"),
+            )
+            self.assertEqual(b_scanned, len(raw_sqlite))
+            self.assertEqual(b_total, 2)
+            self.assertEqual(b_active, 1)
+
+            res_mix = scan_and_redact_directory_tokens(
+                [mix_dir],
+                active_session_token=active_tok,
+            )
+            self.assertEqual(res_mix["matches_found"], 4)
+            self.assertEqual(res_mix["redactions_applied"], 2)
+            self.assertEqual(res_mix["remaining_unredacted_matches"], 2)
+            self.assertIs(res_mix["active_token_checked"], True)
+            self.assertEqual(res_mix["active_token_matches_found"], 2)
+            self.assertNotIn(active_tok, events_file.read_text(encoding="utf-8"))
+            self.assertEqual(bin_file.read_bytes(), raw_sqlite)
+
+            # 5. SSI4: Overlapping roots ([ws_dir, home_dir] and [home_dir, ws_dir]) visit nested file once,
+            #    and default go-build under .home is excluded with excluded_dir_name.
+            home_dir = tmp_path / ".home"
+            ws_dir = home_dir / "privatemode-proxy"
+            go_build_dir = home_dir / "go-build"
+            ws_dir.mkdir(parents=True, exist_ok=True)
+            go_build_dir.mkdir(parents=True, exist_ok=True)
+            (go_build_dir / "cached.o").write_bytes(b"ELF\x00" + active_tok.encode("utf-8"))
+            nested_bin = ws_dir / "cache.bin"
+            nested_bin.write_bytes(b"\x00\x01" + active_tok.encode("utf-8") + b"\x02")
+
+            for root_order in ([ws_dir, home_dir], [home_dir, ws_dir]):
+                dedup_res = scan_and_redact_directory_tokens(
+                    root_order,
+                    active_session_token=active_tok,
+                )
+                self.assertEqual(dedup_res["files_scanned"], 1)
+                self.assertEqual(dedup_res["matches_found"], 1)
+                self.assertEqual(dedup_res["active_token_matches_found"], 1)
+                excl_map = {item["path"]: item["reason"] for item in dedup_res["excluded_dirs"]}
+                self.assertEqual(excl_map.get(str(go_build_dir)), "excluded_dir_name")
+                self.assertNotIn(str(ws_dir), excl_map)
+
+            # 6. SSI-W1: Symlinked explicit roots passed directly to scan_and_redact_directory_tokens
+            #    record skipped_roots, and write-metrics resolves an authorized symlinked .home/.promptfoo
+            #    cache (detecting a synthetic active token exactly once without traversing protected homes)
+            #    while failing closed when .home/.promptfoo or out_dir overlaps a protected home or is invalid.
+            raw_symlink_root = tmp_path / "raw_symlink_root"
+            raw_symlink_target = tmp_path / "raw_symlink_target"
+            raw_symlink_target.mkdir(parents=True, exist_ok=True)
+            raw_symlink_root.symlink_to(raw_symlink_target)
+            raw_skip_res = scan_and_redact_directory_tokens([raw_symlink_root], active_session_token=active_tok)
+            self.assertEqual(
+                raw_skip_res["skipped_roots"],
+                [{"path": str(raw_symlink_root), "reason": "symlink_root"}],
+            )
+
+            import importlib.machinery
+            import importlib.util
+            from local_assist.registry import pid_file_for_model
+
+            wm_loader = importlib.machinery.SourceFileLoader(
+                "write_metrics_ssiw1",
+                str(Path(__file__).resolve().parents[1] / "scripts" / "write-metrics"),
+            )
+            wm_spec = importlib.util.spec_from_loader("write_metrics_ssiw1", wm_loader)
+            assert wm_spec is not None
+            wm_mod = importlib.util.module_from_spec(wm_spec)
+            wm_loader.exec_module(wm_mod)
+
+            wm_repo = tmp_path / "wm_repo"
+            wm_runs = wm_repo / "runs"
+            wm_out = wm_runs / "eval-out"
+            wm_home = wm_repo / ".home"
+            wm_protected = wm_home / "opencode-private-attested"
+            ext_pf_cache = tmp_path / "ext_promptfoo_cache"
+            for d in (wm_runs, wm_out, wm_protected, ext_pf_cache):
+                d.mkdir(parents=True, exist_ok=True)
+
+            # Protected sibling contains historical_tok and must NEVER be traversed
+            (wm_protected / "protected.db").write_bytes(b"SQLite\x00" + historical_tok.encode("utf-8"))
+            # Permitted external promptfoo cache symlink contains active_tok once
+            (wm_home / ".promptfoo").symlink_to(ext_pf_cache)
+            (ext_pf_cache / "promptfoo.sqlite").write_bytes(b"SQLite\x00" + active_tok.encode("utf-8"))
+
+            tok_file = wm_runs / ".se-session-test.token"
+            tok_file.write_text(active_tok + "\n", encoding="utf-8")
+            pid_file_for_model("privatemode-glm-5-3-flash", wm_runs).write_text(
+                json.dumps(
+                    {
+                        "model_id": "privatemode-glm-5-3-flash",
+                        "session_token_file": str(tok_file),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (wm_out / "output.json").write_text(
+                json.dumps({"results": {"stats": {"tokenUsage": {"numRequests": 1, "prompt": 10, "completion": 5, "total": 15}}}}),
+                encoding="utf-8",
+            )
+
+            rc_ext_pf = wm_mod.main(
+                [
+                    "write-metrics",
+                    "sanity",
+                    "privatemode-glm-5-3-flash",
+                    "openai:chat:glm-5.3-flash",
+                    "evals/sanity.yaml",
+                    "0",
+                    str(wm_out),
+                ],
+                root_dir=wm_repo,
+            )
+            self.assertEqual(rc_ext_pf, 1)
+            wm_metrics = json.loads((wm_out / "metrics.json").read_text(encoding="utf-8"))
+            wm_scan = wm_metrics["session_token_scan"]
+            self.assertEqual(wm_scan["skipped_roots"], [])
+            self.assertIs(wm_scan["scan_roots_ok"], True)
+            self.assertEqual(wm_scan["matches_found"], 1)
+            self.assertIs(wm_scan["active_token_checked"], True)
+            self.assertEqual(wm_scan["active_token_matches_found"], 1)
+
+            # Pointing .home/.promptfoo at protected opencode-private-attested fails closed WITHOUT traversing it
+            (wm_home / ".promptfoo").unlink()
+            (wm_home / ".promptfoo").symlink_to(wm_protected)
+            wm_out2 = wm_runs / "eval-out-protected-link"
+            wm_out2.mkdir(parents=True, exist_ok=True)
+            (wm_out2 / "output.json").write_text(
+                json.dumps({"results": {"stats": {"tokenUsage": {"numRequests": 1, "prompt": 10, "completion": 5, "total": 15}}}}),
+                encoding="utf-8",
+            )
+            rc_prot_pf = wm_mod.main(
+                [
+                    "write-metrics",
+                    "sanity",
+                    "privatemode-glm-5-3-flash",
+                    "openai:chat:glm-5.3-flash",
+                    "evals/sanity.yaml",
+                    "0",
+                    str(wm_out2),
+                ],
+                root_dir=wm_repo,
+            )
+            self.assertEqual(rc_prot_pf, 1)
+            wm_metrics2 = json.loads((wm_out2 / "metrics.json").read_text(encoding="utf-8"))
+            wm_scan2 = wm_metrics2["session_token_scan"]
+            self.assertIs(wm_scan2["scan_roots_ok"], False)
+            self.assertEqual(wm_scan2["matches_found"], 0)
+            self.assertTrue(wm_scan2.get("root_validation_errors"))
+
+            # Symlinked out_dir fails closed without writing through the symlink
+            symlink_out = wm_runs / "symlink-out"
+            symlink_out.symlink_to(wm_protected)
+            rc_sym_out = wm_mod.main(
+                [
+                    "write-metrics",
+                    "sanity",
+                    "privatemode-glm-5-3-flash",
+                    "openai:chat:glm-5.3-flash",
+                    "evals/sanity.yaml",
+                    "0",
+                    str(symlink_out),
+                ],
+                root_dir=wm_repo,
+            )
+            self.assertEqual(rc_sym_out, 1)
+            self.assertFalse((wm_protected / "metrics.json").exists())
+
+            # SSI-W2: <repo>/safe/link/.. where link -> protected/child must be rejected BEFORE
+            # lexical '..' collapse or any read of protected output.json / timing.json.
+            (wm_home / ".promptfoo").unlink()
+            (wm_home / ".promptfoo").mkdir(parents=True, exist_ok=True)
+            prot_child = wm_protected / "child"
+            prot_child.mkdir(parents=True, exist_ok=True)
+            (wm_protected / "output.json").write_text(
+                json.dumps({"results": {"stats": {"tokenUsage": {"numRequests": 99, "prompt": 99, "completion": 99, "total": 198}}}}),
+                encoding="utf-8",
+            )
+            safe_dir = wm_repo / "safe"
+            safe_dir.mkdir(parents=True, exist_ok=True)
+            (safe_dir / "link").symlink_to(prot_child)
+            tricky_out_str = str(safe_dir / "link") + "/.."
+
+            orig_load_opt = wm_mod._load_optional_json
+            read_paths: list[str] = []
+
+            def _spy_load_opt(p: Path):
+                read_paths.append(str(p.resolve()))
+                return orig_load_opt(p)
+
+            wm_mod._load_optional_json = _spy_load_opt
+            try:
+                rc_dotdot = wm_mod.main(
+                    [
+                        "write-metrics",
+                        "sanity",
+                        "privatemode-glm-5-3-flash",
+                        "openai:chat:glm-5.3-flash",
+                        "evals/sanity.yaml",
+                        "0",
+                        tricky_out_str,
+                    ],
+                    root_dir=wm_repo,
+                )
+            finally:
+                wm_mod._load_optional_json = orig_load_opt
+
+            self.assertEqual(rc_dotdot, 1)
+            self.assertEqual(read_paths, [])
+            self.assertFalse((safe_dir / "metrics.json").exists())
+            self.assertFalse((wm_protected / "metrics.json").exists())
 
 
 if __name__ == "__main__":

@@ -2747,6 +2747,166 @@ containers:
             self.assertEqual(ds_after["eval_evidence_artifact"], "docs/evals/tinfoil-deepseek-v4-1-flash.json")
             self.assertNotIn("stale_eval_evidence_artifact", ds_after)
 
+    def test_privatemode_entries_ignored_by_tinfoil_catalog_sync(self) -> None:
+        from local_assist.catalog_sync import is_tinfoil_managed_model
+
+        models_with_pm = _make_base_models_fixture()
+        pm_entries = [
+            {
+                "id": "privatemode-glm-5-3-flash",
+                "status": "candidate",
+                "repo": "glm-5.3-flash",
+                "upstream": "nvidia/GLM-5.3-Flash-NVFP4",
+                "runtime": "proxy",
+                "serve_command": "./bin/privatemode-proxy --listen-address {host} --port {port} --api-key-fallback=never --manifest-path config/privatemode-manifest-v1.63.0.json --workspace .home/privatemode-proxy --disable-prompt-cache=false --prompt-cache-salt=random --nvidia-ocsp-allow-unknown=false --nvidia-ocsp-revoked-grace-period=0",
+                "promptfoo_provider": {
+                    "id": "openai:chat:glm-5.3-flash",
+                    "apiBaseUrl": "http://127.0.0.1:8082/v1",
+                    "apiKeyKeychainService": "free-inference.privatemode",
+                },
+                "capabilities": {"tool_calling": True},
+                "routing": {"private_local": "blocked", "private_attested": "blocked"},
+                "remote_trust": {
+                    "tier": "enclave_runtime_attested",
+                    "attestation_method": "privatemode-proxy-contrast",
+                    "weights_hash": None,
+                    "weights_source": None,
+                    "provider_manifest_weights_hash": "dmverity:sha256:c5dcd713fffc38c956bbd41fb299c360ed07d60de61938a6ff2729f6c3acd245",
+                    "provider_manifest_weights_source": "nvidia/GLM-5.3-Flash-NVFP4@da920bb0b9f4a06727223a349e55468e38352348",
+                    "usage_policy": "provider_terms_apply",
+                    "jurisdiction": "EU",
+                    "pricing_per_m_tokens": {"input": 0.22, "output": 0.71},
+                },
+            },
+            {
+                "id": "privatemode-gpt-oss-120b",
+                "status": "candidate",
+                "repo": "openai/gpt-oss-120b",
+                "upstream": "openai/gpt-oss-120b",
+                "runtime": "proxy",
+                "serve_command": "./bin/privatemode-proxy --listen-address {host} --port {port} --api-key-fallback=never --manifest-path config/privatemode-manifest-v1.63.0.json --workspace .home/privatemode-proxy --disable-prompt-cache=false --prompt-cache-salt=random --nvidia-ocsp-allow-unknown=false --nvidia-ocsp-revoked-grace-period=0",
+                "promptfoo_provider": {
+                    "id": "openai:chat:openai/gpt-oss-120b",
+                    "apiBaseUrl": "http://127.0.0.1:8082/v1",
+                    "apiKeyKeychainService": "free-inference.privatemode",
+                },
+                "capabilities": {"tool_calling": True},
+                "routing": {"private_local": "blocked", "private_attested": "blocked"},
+                "remote_trust": {
+                    "tier": "enclave_runtime_attested",
+                    "attestation_method": "privatemode-proxy-contrast",
+                    "weights_hash": None,
+                    "weights_source": None,
+                    "provider_manifest_weights_hash": "dmverity:sha256:a19e31d4c7da198b4905539ac00e55b93f377ecc4048e287810b2cf3a197cb29",
+                    "provider_manifest_weights_source": "openai/gpt-oss-120b@b5c939de8f754692c1647ca79fbf85e8c1e70f8a",
+                    "usage_policy": "provider_terms_apply",
+                    "jurisdiction": "EU",
+                    "pricing_per_m_tokens": {"input": 0.22, "output": 0.71},
+                },
+            },
+        ]
+        for entry in pm_entries:
+            self.assertFalse(is_tinfoil_managed_model(entry))
+        models_with_pm["models"].extend(pm_entries)
+
+        enclaves_base = {
+            "tinfoilsh/confidential-deepseek-v4-1-flash@v0.0.10+b200": parse_tinfoil_config_yaml(
+                DEEPSEEK_V4_1_FLASH_YAML
+            ),
+            "tinfoilsh/confidential-kimi-k3@v0.0.16": parse_tinfoil_config_yaml(KIMI_K3_V0_0_16_YAML),
+            "tinfoilsh/confidential-kimi-k3-1-pro@v0.0.3": parse_tinfoil_config_yaml(
+                KIMI_K3_1_PRO_V0_0_3_YAML
+            ),
+        }
+        with tempfile.TemporaryDirectory() as td_pm:
+            p_pm = Path(td_pm) / "models.yaml"
+            p_pm.write_text(dump_models_yaml(_make_base_models_fixture()), encoding="utf-8")
+            initial_rep = compute_catalog_drift(
+                _make_base_models_fixture(),
+                _make_router_manifest_fixture(),
+                _make_openai_models_fixture(),
+                enclaves_base,
+                observed_date="2026-11-13",
+            )
+            synced_base = apply_catalog_healing(p_pm, initial_rep)
+            synced_base["models"].extend(copy.deepcopy(pm_entries))
+
+            report = compute_catalog_drift(
+                synced_base,
+                _make_router_manifest_fixture(),
+                _make_openai_models_fixture(),
+                enclaves_base,
+                observed_date="2026-11-13",
+            )
+            self.assertFalse(report.has_drift)
+            self.assertEqual(report.updated_models, [])
+            self.assertEqual(report.removed_models, [])
+            self.assertEqual(report.disagreements, [])
+            self.assertEqual(report.new_models, [])
+
+    def test_demote_clears_default_private_attested_pin(self) -> None:
+        from local_assist.catalog_sync import _demote_routing_and_preserve_evidence
+        from local_assist.registry import resolve_endpoint
+
+        pinned = next(
+            copy.deepcopy(m)
+            for m in _make_base_models_fixture()["models"]
+            if m["id"] == "tinfoil-deepseek-v4-1-flash"
+        )
+        pinned["routing"]["default_private_attested"] = True
+
+        changes = _demote_routing_and_preserve_evidence(pinned, new_status="candidate")
+        self.assertEqual(pinned["status"], "candidate")
+        self.assertEqual(pinned["routing"]["private_attested"], "blocked")
+        self.assertNotIn("default_private_attested", pinned["routing"])
+        self.assertEqual(
+            changes.get("routing.default_private_attested"),
+            {"from": True, "to": False},
+        )
+        ep = resolve_endpoint(pinned, require_api_key=False)
+        self.assertEqual(ep.routing_private_attested, "blocked")
+        self.assertFalse(ep.default_private_attested)
+
+        # End-to-end compute_catalog_drift + apply_catalog_healing when a pinned default model's weights change
+        models_fixture = _make_base_models_fixture()
+        for m in models_fixture["models"]:
+            if m["id"] == "tinfoil-deepseek-v4-1-flash":
+                m["routing"]["default_private_attested"] = True
+        ds_new_hash = "9" * 64
+        ds_old_hash = "6c4a2b637f7f45d9e48d1bdc38c12e0454584f48d3759851f7ee4471cd90b2e7"
+        ds_changed_yaml = DEEPSEEK_V4_1_FLASH_YAML.replace(ds_old_hash, ds_new_hash)
+        enclaves_changed = {
+            "deepseek-v4-1-flash": parse_tinfoil_config_yaml(ds_changed_yaml),
+            "kimi-k3": parse_tinfoil_config_yaml(KIMI_K3_V0_0_16_YAML),
+            "kimi-k3-1-pro": parse_tinfoil_config_yaml(KIMI_K3_1_PRO_V0_0_3_YAML),
+        }
+        with tempfile.TemporaryDirectory() as td_str:
+            p_models = Path(td_str) / "models.yaml"
+            p_models.write_text(dump_models_yaml(models_fixture), encoding="utf-8")
+            drift = compute_catalog_drift(
+                models_fixture,
+                _make_router_manifest_fixture(),
+                _make_openai_models_fixture(),
+                enclaves_changed,
+                observed_date="2026-11-14",
+            )
+            self.assertTrue(drift.has_drift)
+            healed = apply_catalog_healing(p_models, drift)
+            ds_healed = next(m for m in healed["models"] if m["id"] == "tinfoil-deepseek-v4-1-flash")
+            self.assertEqual(ds_healed["status"], "candidate")
+            self.assertEqual(ds_healed["routing"]["private_attested"], "blocked")
+            self.assertNotIn("default_private_attested", ds_healed["routing"])
+            ep_healed = resolve_endpoint(ds_healed, require_api_key=False)
+            self.assertFalse(ep_healed.default_private_attested)
+            drift_after = compute_catalog_drift(
+                safe_load(p_models.read_text(encoding="utf-8")),
+                _make_router_manifest_fixture(),
+                _make_openai_models_fixture(),
+                enclaves_changed,
+                observed_date="2026-11-14",
+            )
+            self.assertFalse(drift_after.has_drift)
+
 
 if __name__ == "__main__":
     unittest.main()

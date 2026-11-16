@@ -1,0 +1,546 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import platform
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from urllib.request import Request, urlopen
+
+ROOT = Path(__file__).resolve().parents[1]
+BIN_DIR = ROOT / "bin"
+OUTPUT_BINARY_PATH = BIN_DIR / "privatemode-proxy"
+STAMP_PATH = BIN_DIR / ".privatemode-proxy.stamp"
+COMMITTED_MANIFEST_PATH = ROOT / "config" / "privatemode-manifest-v1.63.0.json"
+GO_BUILD_HOME = ROOT / ".home" / "go-build"
+
+PRIVATEMODE_VERSION = "1.63.0"
+PRIVATEMODE_GIT_TAG = f"v{PRIVATEMODE_VERSION}"
+PRIVATEMODE_REPO_URL = "https://github.com/edgelesssys/privatemode-public.git"
+PRIVATEMODE_SOURCE_COMMIT = "2634ffb82c72339902f26ae071db513add2bdc2f"
+PRIVATEMODE_RELEASE_MANIFEST_URL = (
+    f"https://github.com/edgelesssys/privatemode-public/releases/download/"
+    f"{PRIVATEMODE_GIT_TAG}/manifest.json"
+)
+EXPECTED_MANIFEST_SHA256 = "5fa927e3b864738da35d427c10ba8e49ebeeb1531e49618899cf95f654d240c1"
+
+
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def sha256_file(path: Path) -> str:
+    return sha256_bytes(path.read_bytes())
+
+
+def verify_committed_manifest(manifest_path: Path = COMMITTED_MANIFEST_PATH) -> bytes:
+    if not manifest_path.is_file():
+        raise RuntimeError(f"Missing committed Contrast manifest at {manifest_path}")
+    raw = manifest_path.read_bytes()
+    actual_sha = sha256_bytes(raw)
+    if actual_sha != EXPECTED_MANIFEST_SHA256:
+        raise RuntimeError(
+            f"Committed manifest SHA-256 mismatch at {manifest_path}: "
+            f"got {actual_sha}, expected {EXPECTED_MANIFEST_SHA256}"
+        )
+    parsed = json.loads(raw.decode("utf-8"))
+    if not isinstance(parsed, dict) or not parsed.get("ReferenceValues") or not parsed.get("Policies"):
+        raise RuntimeError(
+            f"Committed manifest at {manifest_path} is missing ReferenceValues or Policies"
+        )
+    return raw
+
+
+def fetch_and_verify_release_manifest(
+    committed_bytes: bytes,
+    *,
+    release_url: str = PRIVATEMODE_RELEASE_MANIFEST_URL,
+) -> None:
+    req = Request(release_url, headers={"User-Agent": "free-inference-builder/1.0"})
+    with urlopen(req, timeout=30) as resp:
+        release_bytes = resp.read()
+    release_sha = sha256_bytes(release_bytes)
+    if release_sha != EXPECTED_MANIFEST_SHA256:
+        raise RuntimeError(
+            f"Release asset manifest SHA-256 mismatch from {release_url}: "
+            f"got {release_sha}, expected {EXPECTED_MANIFEST_SHA256}"
+        )
+    if release_bytes != committed_bytes:
+        raise RuntimeError(
+            f"Release asset manifest bytes from {release_url} do not match committed "
+            f"{COMMITTED_MANIFEST_PATH}"
+        )
+
+
+def _allocate_free_loopback_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _resolve_lsof_binary() -> str:
+    found = shutil.which("lsof")
+    if found:
+        return found
+    if os.path.isfile("/usr/sbin/lsof") and os.access("/usr/sbin/lsof", os.X_OK):
+        return "/usr/sbin/lsof"
+    raise RuntimeError("lsof is required to verify loopback listener ownership")
+
+
+def _inspect_pid_tcp_sockets(pid: int, *, lsof_bin: str) -> list[str]:
+    """Return '<name> (<state>)' entries strictly owned by `pid` via `lsof -FpnT`."""
+    cp = subprocess.run(
+        [lsof_bin, "-Pan", "-p", str(pid), "-iTCP", "-FpnT"],
+        capture_output=True,
+        text=True,
+        timeout=3,
+        check=False,
+    )
+    sockets: list[str] = []
+    cur_pid: int | None = None
+    cur_name: str | None = None
+    cur_state: str | None = None
+
+    def _flush() -> None:
+        nonlocal cur_name, cur_state
+        if cur_pid == pid and cur_name is not None:
+            sockets.append(f"{cur_name} ({cur_state or 'UNKNOWN'})")
+        cur_name = None
+        cur_state = None
+
+    for raw_line in cp.stdout.splitlines():
+        if not raw_line:
+            continue
+        tag, val = raw_line[0], raw_line[1:]
+        if tag == "p":
+            _flush()
+            try:
+                cur_pid = int(val)
+            except ValueError:
+                cur_pid = None
+        elif tag == "f":
+            _flush()
+        elif tag == "n":
+            cur_name = val
+        elif tag == "T" and val.startswith("ST="):
+            cur_state = val[3:]
+    _flush()
+    return sockets
+
+
+def _build_smoke_check_seatbelt_profile(port: int) -> str:
+    return (
+        "(version 1)\n"
+        "(allow default)\n"
+        "(deny network-outbound)\n"
+        "(allow network-outbound (remote unix-socket))\n"
+        "(deny network-bind)\n"
+        f'(allow network-bind (local ip "localhost:{port}"))\n'
+        f'(allow network-inbound (local ip "localhost:{port}"))\n'
+    )
+
+
+def run_strict_ocsp_config_check(
+    binary_path: Path,
+    *,
+    manifest_path: Path = COMMITTED_MANIFEST_PATH,
+    timeout_seconds: float = 5.0,
+    sigterm_timeout_seconds: float = 3.0,
+) -> dict[str, object]:
+    """Verify strict OCSP flags, enforced zero-outbound + loopback-only bind, and clean SIGTERM exit."""
+    sandbox_exec_bin = "/usr/bin/sandbox-exec"
+    if not (os.path.isfile(sandbox_exec_bin) and os.access(sandbox_exec_bin, os.X_OK)):
+        raise RuntimeError(
+            f"{sandbox_exec_bin} is required on macOS to enforce zero outbound traffic during smoke check"
+        )
+    lsof_bin = _resolve_lsof_binary()
+    port = _allocate_free_loopback_port()
+    sb_profile = _build_smoke_check_seatbelt_profile(port)
+    allowed_listeners = {
+        f"127.0.0.1:{port} (LISTEN)",
+        f"[::1]:{port} (LISTEN)",
+    }
+    transient_prelisten = {
+        "*:* (CLOSED)",
+        f"127.0.0.1:{port} (CLOSED)",
+        f"[::1]:{port} (CLOSED)",
+    }
+
+    with tempfile.TemporaryDirectory(prefix="pm-ocsp-check-") as tmp_dir:
+        tmp_path = Path(tmp_dir)
+        ws_dir = tmp_path / "workspace"
+        ws_dir.mkdir(parents=True, exist_ok=True)
+        log_path = tmp_path / "startup.log"
+        cmd = [
+            sandbox_exec_bin,
+            "-p",
+            sb_profile,
+            str(binary_path),
+            "--listen-address",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            "--api-key-fallback=never",
+            "--manifest-path",
+            str(manifest_path),
+            "--workspace",
+            str(ws_dir),
+            "--disable-prompt-cache=false",
+            "--prompt-cache-salt=random",
+            "--nvidia-ocsp-allow-unknown=false",
+            "--nvidia-ocsp-revoked-grace-period=0",
+        ]
+        env = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": str(tmp_path),
+        }
+        with log_path.open("w", encoding="utf-8") as log_fh:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(ROOT),
+                env=env,
+                stdout=log_fh,
+                stderr=subprocess.STDOUT,
+            )
+
+        observed_sockets: list[str] = []
+        sigkill_escalated = False
+        exit_code: int | None = None
+        try:
+            deadline = time.monotonic() + timeout_seconds
+            bound = False
+            while time.monotonic() < deadline:
+                if proc.poll() is not None:
+                    log_txt = log_path.read_text(encoding="utf-8", errors="replace").strip()
+                    raise RuntimeError(
+                        f"privatemode-proxy exited prematurely during strict-OCSP config check "
+                        f"(code={proc.returncode}): {log_txt}"
+                    )
+                observed_sockets = _inspect_pid_tcp_sockets(proc.pid, lsof_bin=lsof_bin)
+                if proc.poll() is not None:
+                    log_txt = log_path.read_text(encoding="utf-8", errors="replace").strip()
+                    raise RuntimeError(
+                        f"privatemode-proxy exited prematurely during strict-OCSP config check "
+                        f"(code={proc.returncode}): {log_txt}"
+                    )
+                if observed_sockets:
+                    unexpected = [s for s in observed_sockets if s not in allowed_listeners]
+                    if unexpected:
+                        non_transient = [s for s in unexpected if s not in transient_prelisten]
+                        if non_transient:
+                            raise RuntimeError(
+                                f"privatemode-proxy opened non-loopback or unexpected TCP socket(s) "
+                                f"for pid={proc.pid}: {observed_sockets}"
+                            )
+                        time.sleep(0.05)
+                        continue
+                    bound = True
+                    break
+                time.sleep(0.05)
+
+            if not bound:
+                log_txt = log_path.read_text(encoding="utf-8", errors="replace").strip()
+                raise RuntimeError(
+                    f"privatemode-proxy (pid={proc.pid}) did not bind 127.0.0.1:{port} "
+                    f"within {timeout_seconds}s: {log_txt}"
+                )
+
+            with socket.create_connection(("127.0.0.1", port), timeout=1.0):
+                pass
+
+            proc.send_signal(signal.SIGTERM)
+            try:
+                exit_code = proc.wait(timeout=sigterm_timeout_seconds)
+            except subprocess.TimeoutExpired as exc:
+                sigkill_escalated = True
+                proc.kill()
+                exit_code = proc.wait(timeout=2)
+                raise RuntimeError(
+                    f"privatemode-proxy (pid={proc.pid}) ignored SIGTERM for "
+                    f"{sigterm_timeout_seconds}s and required SIGKILL escalation "
+                    f"(exit status {exit_code})"
+                ) from exc
+
+            if exit_code not in (0, -int(signal.SIGTERM)):
+                log_txt = log_path.read_text(encoding="utf-8", errors="replace").strip()
+                raise RuntimeError(
+                    f"privatemode-proxy (pid={proc.pid}) exited with unexpected exit status "
+                    f"{exit_code} after SIGTERM: {log_txt}"
+                )
+
+            return {
+                "passed": True,
+                "port": port,
+                "outbound_network_enforcement": "seatbelt_deny_network_outbound",
+                "listener_inspection": "lsof_pid_tcp_table",
+                "observed_tcp_sockets": observed_sockets,
+                "sigterm_exit_code": exit_code,
+                "sigkill_escalated": sigkill_escalated,
+            }
+        finally:
+            if proc.poll() is None:
+                proc.send_signal(signal.SIGTERM)
+                try:
+                    proc.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=2)
+
+
+def verify_existing_binary(
+    binary_path: Path = OUTPUT_BINARY_PATH,
+    stamp_path: Path = STAMP_PATH,
+    manifest_path: Path = COMMITTED_MANIFEST_PATH,
+) -> dict[str, object]:
+    verify_committed_manifest(manifest_path)
+    if not binary_path.is_file() or not os.access(binary_path, os.X_OK):
+        raise RuntimeError(f"Missing executable binary at {binary_path}")
+    if not stamp_path.is_file():
+        raise RuntimeError(f"Missing build stamp at {stamp_path}")
+    stamp = json.loads(stamp_path.read_text(encoding="utf-8"))
+    if not isinstance(stamp, dict):
+        raise RuntimeError(f"Malformed stamp at {stamp_path}")
+    actual_bin_sha = sha256_file(binary_path)
+    if stamp.get("version") != PRIVATEMODE_VERSION:
+        raise RuntimeError(f"Stamp version mismatch: {stamp.get('version')!r} != {PRIVATEMODE_VERSION!r}")
+    if stamp.get("embedded_version") != PRIVATEMODE_GIT_TAG:
+        raise RuntimeError(
+            f"Stamp embedded_version mismatch: {stamp.get('embedded_version')!r} != {PRIVATEMODE_GIT_TAG!r}"
+        )
+    if stamp.get("source_commit") != PRIVATEMODE_SOURCE_COMMIT:
+        raise RuntimeError(
+            f"Stamp source_commit mismatch: {stamp.get('source_commit')!r} != {PRIVATEMODE_SOURCE_COMMIT!r}"
+        )
+    if stamp.get("manifest_sha256") != EXPECTED_MANIFEST_SHA256:
+        raise RuntimeError(
+            f"Stamp manifest_sha256 mismatch: {stamp.get('manifest_sha256')!r} != {EXPECTED_MANIFEST_SHA256!r}"
+        )
+    if stamp.get("binary_sha256") != actual_bin_sha:
+        raise RuntimeError(
+            f"Binary SHA-256 mismatch against stamp: got {actual_bin_sha}, expected {stamp.get('binary_sha256')}"
+        )
+    if not isinstance(stamp.get("strict_ocsp_config_check"), dict):
+        raise RuntimeError(
+            f"Stamp at {stamp_path} is missing structured strict_ocsp_config_check receipt"
+        )
+    ver_cp = subprocess.run(
+        [str(binary_path), "--version"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=True,
+    )
+    if PRIVATEMODE_GIT_TAG not in (ver_cp.stdout + ver_cp.stderr):
+        raise RuntimeError(
+            f"Unexpected --version output from {binary_path}: {(ver_cp.stdout + ver_cp.stderr).strip()!r}"
+        )
+    live_receipt = run_strict_ocsp_config_check(binary_path, manifest_path=manifest_path)
+    out = dict(stamp)
+    out["strict_ocsp_config_check_live"] = live_receipt
+    return out
+
+
+def build_and_verify(*, force: bool = False) -> int:
+    if platform.system() != "Darwin" or platform.machine() != "arm64":
+        print(
+            f"ERROR: build-privatemode-proxy requires Darwin arm64; "
+            f"got {platform.system()} {platform.machine()}",
+            file=sys.stderr,
+        )
+        return 1
+
+    if not force and OUTPUT_BINARY_PATH.is_file() and STAMP_PATH.is_file():
+        try:
+            stamp = verify_existing_binary()
+            print(
+                f"Verified existing bin/privatemode-proxy (v{PRIVATEMODE_VERSION}, "
+                f"commit {PRIVATEMODE_SOURCE_COMMIT[:12]}, "
+                f"SHA-256 {str(stamp['binary_sha256'])[:16]}...)."
+            )
+            return 0
+        except Exception as exc:
+            print(f"Existing bin/privatemode-proxy requires rebuild ({exc}); rebuilding...", file=sys.stderr)
+
+    git_bin = shutil.which("git")
+    go_bin = shutil.which("go")
+    if not git_bin:
+        print("ERROR: 'git' is required on PATH to clone privatemode-public.", file=sys.stderr)
+        return 1
+    if not go_bin:
+        print("ERROR: 'go' is required on PATH to compile privatemode-proxy.", file=sys.stderr)
+        return 1
+
+    committed_manifest_bytes = verify_committed_manifest()
+    print(f"Verifying release asset manifest ({PRIVATEMODE_RELEASE_MANIFEST_URL})...")
+    fetch_and_verify_release_manifest(committed_manifest_bytes)
+
+    go_ver_cp = subprocess.run(
+        [go_bin, "version"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=True,
+    )
+    go_version = go_ver_cp.stdout.strip()
+
+    BIN_DIR.mkdir(parents=True, exist_ok=True)
+    (GO_BUILD_HOME / "gopath").mkdir(parents=True, exist_ok=True)
+    (GO_BUILD_HOME / "gomodcache").mkdir(parents=True, exist_ok=True)
+    (GO_BUILD_HOME / "gocache").mkdir(parents=True, exist_ok=True)
+
+    with tempfile.TemporaryDirectory(prefix="privatemode-build-") as tmp_dir:
+        tmp_root = Path(tmp_dir)
+        repo_dir = tmp_root / "repo"
+        print(
+            f"Cloning {PRIVATEMODE_REPO_URL} at {PRIVATEMODE_GIT_TAG} "
+            f"(expected commit {PRIVATEMODE_SOURCE_COMMIT})..."
+        )
+        subprocess.run(
+            [
+                git_bin,
+                "clone",
+                "--depth",
+                "1",
+                "--branch",
+                PRIVATEMODE_GIT_TAG,
+                PRIVATEMODE_REPO_URL,
+                str(repo_dir),
+            ],
+            check=True,
+        )
+        rev_cp = subprocess.run(
+            [git_bin, "-C", str(repo_dir), "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        actual_commit = rev_cp.stdout.strip()
+        if actual_commit != PRIVATEMODE_SOURCE_COMMIT:
+            raise RuntimeError(
+                f"Source commit mismatch for {PRIVATEMODE_GIT_TAG}: "
+                f"got {actual_commit}, expected {PRIVATEMODE_SOURCE_COMMIT}"
+            )
+
+        tmp_bin = BIN_DIR / f".privatemode-proxy.tmp.{os.getpid()}"
+        try:
+            build_env = dict(os.environ)
+            build_env["CGO_ENABLED"] = "0"
+            build_env["GOOS"] = "darwin"
+            build_env["GOARCH"] = "arm64"
+            build_env["GOPATH"] = str(GO_BUILD_HOME / "gopath")
+            build_env["GOMODCACHE"] = str(GO_BUILD_HOME / "gomodcache")
+            build_env["GOCACHE"] = str(GO_BUILD_HOME / "gocache")
+            build_env["HOME"] = str(ROOT / ".home")
+
+            print(f"Building pure-Go darwin/arm64 privatemode-proxy {PRIVATEMODE_GIT_TAG}...")
+            subprocess.run(
+                [
+                    go_bin,
+                    "build",
+                    "-trimpath",
+                    "-tags",
+                    "contrast_unstable_api",
+                    "-ldflags",
+                    f"-s -w -X github.com/edgelesssys/continuum/internal/oss/constants.version={PRIVATEMODE_GIT_TAG}",
+                    "-o",
+                    str(tmp_bin),
+                    "./privatemode-proxy",
+                ],
+                cwd=str(repo_dir),
+                env=build_env,
+                check=True,
+            )
+            os.chmod(tmp_bin, 0o755)
+
+            ver_cp = subprocess.run(
+                [str(tmp_bin), "--version"],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=True,
+            )
+            if PRIVATEMODE_GIT_TAG not in (ver_cp.stdout + ver_cp.stderr):
+                raise RuntimeError(
+                    f"Built privatemode-proxy reported unexpected version: "
+                    f"{(ver_cp.stdout + ver_cp.stderr).strip()!r}"
+                )
+
+            print("Running offline strict-OCSP configuration smoke check...")
+            ocsp_check_receipt = run_strict_ocsp_config_check(tmp_bin)
+
+            bin_sha256 = sha256_file(tmp_bin)
+            os.replace(tmp_bin, OUTPUT_BINARY_PATH)
+        finally:
+            if tmp_bin.exists():
+                tmp_bin.unlink(missing_ok=True)
+
+    stamp_payload = {
+        "version": PRIVATEMODE_VERSION,
+        "embedded_version": PRIVATEMODE_GIT_TAG,
+        "git_tag": PRIVATEMODE_GIT_TAG,
+        "source_repo": PRIVATEMODE_REPO_URL,
+        "source_commit": PRIVATEMODE_SOURCE_COMMIT,
+        "release_manifest_url": PRIVATEMODE_RELEASE_MANIFEST_URL,
+        "committed_manifest_path": str(COMMITTED_MANIFEST_PATH.relative_to(ROOT)),
+        "manifest_sha256": EXPECTED_MANIFEST_SHA256,
+        "binary_sha256": bin_sha256,
+        "strict_ocsp_config_check_passed": True,
+        "strict_ocsp_config_check": ocsp_check_receipt,
+        "go_version": go_version,
+    }
+    STAMP_PATH.write_text(json.dumps(stamp_payload, indent=2) + "\n", encoding="utf-8")
+    print(
+        f"Built and verified bin/privatemode-proxy v{PRIVATEMODE_VERSION} "
+        f"(SHA-256 {bin_sha256})."
+    )
+    return 0
+
+
+def build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            f"Build and verify workspace-local bin/privatemode-proxy v{PRIVATEMODE_VERSION} "
+            f"from edgelesssys/privatemode-public@{PRIVATEMODE_SOURCE_COMMIT}, "
+            f"cross-check release manifest SHA-256 {EXPECTED_MANIFEST_SHA256}, "
+            "and run an offline strict-OCSP configuration smoke check "
+            "(--nvidia-ocsp-allow-unknown=false --nvidia-ocsp-revoked-grace-period=0)."
+        )
+    )
+    parser.add_argument(
+        "--verify-only",
+        action="store_true",
+        help="Verify existing bin/privatemode-proxy, stamp, manifest, and strict-OCSP config offline.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Rebuild bin/privatemode-proxy even if an existing verified binary is present.",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_arg_parser()
+    args = parser.parse_args(sys.argv[1:] if argv is None else argv)
+    try:
+        if args.verify_only:
+            stamp = verify_existing_binary()
+            print(json.dumps(stamp, indent=2))
+            return 0
+        return build_and_verify(force=bool(args.force))
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

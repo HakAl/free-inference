@@ -14,6 +14,9 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from local_assist.errors import LocalAssistError  # noqa: E402
+from local_assist.logging import caller_context  # noqa: E402
+from local_assist.tools.assist_status import run as assist_status  # noqa: E402
+from local_assist.tools.check_eval_assertion import run as check_eval_assertion  # noqa: E402
 from local_assist.tools.compress_context import run as compress_context  # noqa: E402
 from local_assist.tools.delegate_task import ALLOWED_KINDS, run as delegate_task  # noqa: E402
 from local_assist.tools.extract_fields import run as extract_fields  # noqa: E402
@@ -21,6 +24,7 @@ from local_assist.tools.propose_eval_prompts import (  # noqa: E402
     ALLOWED_CATEGORIES,
     run as propose_eval_prompts,
 )
+from local_assist.tools.select_context import run as select_context  # noqa: E402
 
 
 def _read_text_arg(inline_text: str | None, file_path: str | None, *, label: str) -> str:
@@ -59,6 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_delegate = subparsers.add_parser(
         "delegate_task",
+        aliases=["delegate-task"],
         help="Delegate a bounded code/test/text/Q&A task to the cleared Rung 1 local model.",
     )
     p_delegate.add_argument(
@@ -106,6 +111,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_compress = subparsers.add_parser(
         "compress_context",
+        aliases=["compress-context"],
         help="Compress a diff, test_output, or logs dump into structured JSON.",
     )
     p_compress.add_argument(
@@ -122,11 +128,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_compress.add_argument("--text", default=None, help="Inline text to compress.")
     p_compress.add_argument("--text-file", default=None, help="File path containing text to compress.")
+    p_compress.add_argument(
+        "--context-path",
+        dest="context_path",
+        default=None,
+        help="Workspace-confined file path read directly by compress_context.",
+    )
     p_compress.add_argument("--focus", default=None, help="Optional focus hint.")
     p_compress.add_argument("--max-items", type=int, default=10, help="Max items per list (1..50, default: 10).")
 
     p_extract = subparsers.add_parser(
         "extract_fields",
+        aliases=["extract-fields"],
         help="Extract structured scalar/list fields from text.",
     )
     p_extract.add_argument(
@@ -138,6 +151,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_extract.add_argument("--text", default=None, help="Inline source text.")
     p_extract.add_argument("--text-file", default=None, help="File path containing source text.")
     p_extract.add_argument(
+        "--context-path",
+        dest="context_path",
+        default=None,
+        help="Workspace-confined file path read directly by extract_fields.",
+    )
+    p_extract.add_argument(
         "--fields-json",
         required=True,
         help="JSON object mapping field_name to {type, description, required}.",
@@ -145,6 +164,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_propose = subparsers.add_parser(
         "propose_eval_prompts",
+        aliases=["propose-eval-prompts"],
         help="Generate candidate promptfoo eval prompts.",
     )
     p_propose.add_argument(
@@ -161,6 +181,37 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_propose.add_argument("--n", type=int, default=5, help="Number of candidates (1..25, default: 5).")
 
+    subparsers.add_parser(
+        "assist_status",
+        aliases=["status"],
+        help="Return side-effect-free, credential-free status for local_assist and active endpoints.",
+    )
+
+    p_check = subparsers.add_parser(
+        "check_eval_assertion",
+        aliases=["check-assertion", "check-eval-assertion"],
+        help="Test a candidate promptfoo assertion inside an OS Seatbelt + Node --permission sandbox.",
+    )
+    p_check.add_argument("--assertion-json", required=True, help="JSON assertion object {type, value}.")
+    p_check.add_argument("--pass-output", dest="passing_outputs", action="append", required=True)
+    p_check.add_argument("--fail-output", dest="failing_outputs", action="append", required=True)
+
+    p_select = subparsers.add_parser(
+        "select_context",
+        aliases=["select-context"],
+        help="Select verbatim evidence-backed file excerpts for a query via Rung 1 coordinate selection.",
+    )
+    p_select.add_argument(
+        "--auto-serve",
+        action="store_true",
+        dest="sub_auto_serve",
+        help="Opt in to auto-starting the cleared Rung 1 local MLX server if port 8080 is down.",
+    )
+    p_select.add_argument("--query", required=True, help="Question or lookup objective.")
+    p_select.add_argument("--path", dest="paths", action="append", required=True, help="Workspace-relative file path.")
+    p_select.add_argument("--max-excerpts", type=int, default=5)
+    p_select.add_argument("--max-lines-per-excerpt", type=int, default=40)
+
     return parser
 
 
@@ -168,38 +219,82 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    if args.auto_serve or getattr(args, "sub_auto_serve", False):
+    if (args.auto_serve or getattr(args, "sub_auto_serve", False)) and args.subcommand not in (
+        "assist_status",
+        "status",
+    ):
         os.environ["LOCAL_ASSIST_AUTO_SERVE"] = "1"
 
     try:
-        if args.subcommand == "delegate_task":
-            payload: dict[str, Any] = delegate_task(
-                kind=args.kind,
-                instruction=args.instruction,
-                context=args.context,
-                context_path=args.context_file,
-                constraints=args.constraints,
-                max_tokens=args.max_tokens,
-            )
-        elif args.subcommand == "compress_context":
-            text = _read_text_arg(args.text, args.text_file, label="text")
-            payload = compress_context(
-                kind=args.kind,
-                text=text,
-                focus=args.focus,
-                max_items=args.max_items,
-            )
-        elif args.subcommand == "extract_fields":
-            text = _read_text_arg(args.text, args.text_file, label="text")
-            try:
-                fields = json.loads(args.fields_json)
-            except json.JSONDecodeError as exc:
-                raise LocalAssistError("invalid_arguments", f"Invalid --fields-json: {exc}") from exc
-            payload = extract_fields(text=text, fields=fields)
-        elif args.subcommand == "propose_eval_prompts":
-            payload = propose_eval_prompts(category=args.category, n=args.n)
-        else:
-            raise LocalAssistError("invalid_arguments", f"Unsupported subcommand: {args.subcommand}")
+        with caller_context(transport="cli", client_name="delegate-local"):
+            if args.subcommand in ("delegate_task", "delegate-task"):
+                payload: dict[str, Any] = delegate_task(
+                    kind=args.kind,
+                    instruction=args.instruction,
+                    context=args.context,
+                    context_path=args.context_file,
+                    constraints=args.constraints,
+                    max_tokens=args.max_tokens,
+                )
+            elif args.subcommand in ("compress_context", "compress-context"):
+                if args.context_path is not None:
+                    if args.text is not None or args.text_file is not None:
+                        raise LocalAssistError(
+                            "invalid_arguments",
+                            "Pass either --context-path or --text/--text-file, not both.",
+                        )
+                    payload = compress_context(
+                        kind=args.kind,
+                        focus=args.focus,
+                        max_items=args.max_items,
+                        context_path=args.context_path,
+                    )
+                else:
+                    text = _read_text_arg(args.text, args.text_file, label="text")
+                    payload = compress_context(
+                        kind=args.kind,
+                        text=text,
+                        focus=args.focus,
+                        max_items=args.max_items,
+                    )
+            elif args.subcommand in ("extract_fields", "extract-fields"):
+                try:
+                    fields = json.loads(args.fields_json)
+                except json.JSONDecodeError as exc:
+                    raise LocalAssistError("invalid_arguments", f"Invalid --fields-json: {exc}") from exc
+                if args.context_path is not None:
+                    if args.text is not None or args.text_file is not None:
+                        raise LocalAssistError(
+                            "invalid_arguments",
+                            "Pass either --context-path or --text/--text-file, not both.",
+                        )
+                    payload = extract_fields(fields=fields, context_path=args.context_path)
+                else:
+                    text = _read_text_arg(args.text, args.text_file, label="text")
+                    payload = extract_fields(text=text, fields=fields)
+            elif args.subcommand in ("propose_eval_prompts", "propose-eval-prompts"):
+                payload = propose_eval_prompts(category=args.category, n=args.n)
+            elif args.subcommand in ("assist_status", "status"):
+                payload = assist_status()
+            elif args.subcommand in ("check_eval_assertion", "check-assertion", "check-eval-assertion"):
+                try:
+                    assertion_obj = json.loads(args.assertion_json)
+                except json.JSONDecodeError as exc:
+                    raise LocalAssistError("invalid_arguments", f"Invalid --assertion-json: {exc}") from exc
+                payload = check_eval_assertion(
+                    assertion=assertion_obj,
+                    passing_outputs=args.passing_outputs,
+                    failing_outputs=args.failing_outputs,
+                )
+            elif args.subcommand in ("select_context", "select-context"):
+                payload = select_context(
+                    query=args.query,
+                    paths=args.paths,
+                    max_excerpts=args.max_excerpts,
+                    max_lines_per_excerpt=args.max_lines_per_excerpt,
+                )
+            else:
+                raise LocalAssistError("invalid_arguments", f"Unsupported subcommand: {args.subcommand}")
     except LocalAssistError as exc:
         err_payload = exc.to_payload()
         print(json.dumps(err_payload, indent=2, ensure_ascii=False), file=sys.stderr)

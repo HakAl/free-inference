@@ -1362,6 +1362,7 @@ private final class StreamingForwardDelegate: NSObject, URLSessionDataDelegate, 
         guard canWrite else { return }
         let bodyObj: [String: Any] = [
             "error": [
+                "type": errorCode,
                 "code": errorCode,
                 "message": message,
             ]
@@ -1462,6 +1463,7 @@ private func sendHTTPError(
 ) {
     let bodyObj: [String: Any] = [
         "error": [
+            "type": errorCode,
             "code": errorCode,
             "message": message,
         ]
@@ -1476,6 +1478,385 @@ private func sendHTTPError(
         _ = writeAllToFD(clientFD, data: hData)
     }
     _ = writeAllToFD(clientFD, data: bodyData)
+}
+
+private let kTokenPrefixLeakRegex = try! NSRegularExpression(
+    pattern: "\\b(?:se-session|oc-relay|worker-relay)-[A-Za-z0-9_-]{12,}",
+    options: []
+)
+
+private let kBase64TokenPrefixes: [String] = [
+    "c2Utc2Vzc2lvbi0",
+    "b2MtcmVsYXkt",
+    "d29ya2VyLXJlbGF5LQ",
+]
+
+private let kBase64CandidateRegex = try! NSRegularExpression(
+    pattern: "[A-Za-z0-9+/_-]{16,}={0,2}",
+    options: []
+)
+
+private let kMaxJSONContainerDepth = 64
+private let kMaxEmbeddedJSONDecodes = 6
+private let kMaxVisitedJSONNodes = 20_000
+private let kMaxBase64CandidatesPerString = 16_384
+
+private func hexDigitValue(_ byte: UInt8) -> UInt8? {
+    switch byte {
+    case 0x30...0x39: return byte - 0x30
+    case 0x41...0x46: return byte - 0x41 + 10
+    case 0x61...0x66: return byte - 0x61 + 10
+    default: return nil
+    }
+}
+
+private func decodePercentLenient(_ data: Data) -> String {
+    let bytes = [UInt8](data)
+    var out: [UInt8] = []
+    out.reserveCapacity(bytes.count)
+    var idx = 0
+    while idx < bytes.count {
+        if bytes[idx] == 0x25 && idx + 2 < bytes.count,
+           let hi = hexDigitValue(bytes[idx + 1]),
+           let lo = hexDigitValue(bytes[idx + 2]) {
+            out.append((hi << 4) | lo)
+            idx += 3
+        } else {
+            out.append(bytes[idx])
+            idx += 1
+        }
+    }
+    return String(decoding: out, as: UTF8.self)
+}
+
+private func secretEncodingVariants(_ secretData: Data) -> [String] {
+    let trimmedStr = String(decoding: secretData, as: UTF8.self)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    guard trimmedStr.utf8.count >= 8 else { return [] }
+    let cleanData = Data(trimmedStr.utf8)
+    let b64Std = cleanData.base64EncodedString()
+    let b64NoPad = b64Std.trimmingCharacters(in: CharacterSet(charactersIn: "="))
+    let b64Url = b64NoPad
+        .replacingOccurrences(of: "+", with: "-")
+        .replacingOccurrences(of: "/", with: "_")
+    let basicOc = Data("opencode:\(trimmedStr)".utf8)
+        .base64EncodedString()
+        .trimmingCharacters(in: CharacterSet(charactersIn: "="))
+    let basicAnon = Data(":\(trimmedStr)".utf8)
+        .base64EncodedString()
+        .trimmingCharacters(in: CharacterSet(charactersIn: "="))
+    var variants: [String] = []
+    for cand in [trimmedStr, b64Std, b64NoPad, b64Url, basicOc, basicAnon] where cand.count >= 8 {
+        if !variants.contains(cand) {
+            variants.append(cand)
+        }
+    }
+    return variants
+}
+
+private func decodeJSONEscapeSequencesLenient(_ input: String) -> String {
+    guard input.contains("\\") else { return input }
+    let utf16 = Array(input.utf16)
+    var out: [UInt16] = []
+    out.reserveCapacity(utf16.count)
+    var idx = 0
+
+    func parseHex4(at start: Int) -> UInt16? {
+        guard start + 4 <= utf16.count else { return nil }
+        var acc: UInt16 = 0
+        for off in 0..<4 {
+            let unit = utf16[start + off]
+            guard unit <= 0x7F, let nib = hexDigitValue(UInt8(unit)) else { return nil }
+            acc = (acc << 4) | UInt16(nib)
+        }
+        return acc
+    }
+
+    while idx < utf16.count {
+        let cu = utf16[idx]
+        if cu == 0x5C && idx + 1 < utf16.count {
+            let next = utf16[idx + 1]
+            switch next {
+            case 0x2F: // \/ -> /
+                out.append(0x2F)
+                idx += 2
+            case 0x22: // \" -> "
+                out.append(0x22)
+                idx += 2
+            case 0x5C: // \\ -> \
+                out.append(0x5C)
+                idx += 2
+            case 0x6E: // \n
+                out.append(0x0A)
+                idx += 2
+            case 0x72: // \r
+                out.append(0x0D)
+                idx += 2
+            case 0x74: // \t
+                out.append(0x09)
+                idx += 2
+            case 0x62: // \b
+                out.append(0x08)
+                idx += 2
+            case 0x66: // \f
+                out.append(0x0C)
+                idx += 2
+            case 0x75: // \uXXXX
+                if let codeUnit = parseHex4(at: idx + 2) {
+                    out.append(codeUnit)
+                    idx += 6
+                } else {
+                    out.append(cu)
+                    idx += 1
+                }
+            default:
+                out.append(cu)
+                idx += 1
+            }
+        } else {
+            out.append(cu)
+            idx += 1
+        }
+    }
+    return String(decoding: out, as: UTF16.self)
+}
+
+private func trimmedSecretString(_ secretData: Data) -> String? {
+    let s = String(decoding: secretData, as: UTF8.self)
+        .trimmingCharacters(in: .whitespacesAndNewlines)
+    return s.utf8.count >= 8 ? s : nil
+}
+
+private func textMatchesDirectLeak(
+    _ text: String,
+    needles: [String]
+) -> Bool {
+    if text.isEmpty { return false }
+    for needle in needles where text.contains(needle) {
+        return true
+    }
+    for b64Pref in kBase64TokenPrefixes where text.contains(b64Pref) {
+        return true
+    }
+    let nsRange = NSRange(text.startIndex..<text.endIndex, in: text)
+    if kTokenPrefixLeakRegex.firstMatch(in: text, options: [], range: nsRange) != nil {
+        return true
+    }
+    return false
+}
+
+private func decodeBase64Candidate(_ token: String) -> Data? {
+    var normalized = token
+        .replacingOccurrences(of: "-", with: "+")
+        .replacingOccurrences(of: "_", with: "/")
+        .trimmingCharacters(in: CharacterSet(charactersIn: "="))
+    guard normalized.count >= 12 else { return nil }
+    let rem = normalized.count % 4
+    if rem == 1 {
+        return nil
+    }
+    if rem > 0 {
+        normalized += String(repeating: "=", count: 4 - rem)
+    }
+    return Data(base64Encoded: normalized)
+}
+
+private func stringContainsCredentialLeak(
+    _ rawString: String,
+    needles: [String],
+    rawSecrets: [String]
+) -> Bool {
+    if rawString.isEmpty { return false }
+    var candidateSet: [String] = []
+    func addCandidate(_ s: String) {
+        if !s.isEmpty && !candidateSet.contains(s) {
+            candidateSet.append(s)
+        }
+    }
+
+    addCandidate(rawString)
+    addCandidate(decodePercentLenient(Data(rawString.utf8)))
+    var cur = rawString
+    for _ in 0..<4 {
+        let next = decodeJSONEscapeSequencesLenient(cur)
+        if next == cur { break }
+        addCandidate(next)
+        addCandidate(decodePercentLenient(Data(next.utf8)))
+        cur = next
+    }
+
+    for cand in candidateSet {
+        if textMatchesDirectLeak(cand, needles: needles) {
+            return true
+        }
+        let nsRange = NSRange(cand.startIndex..<cand.endIndex, in: cand)
+        let matches = kBase64CandidateRegex.matches(in: cand, options: [], range: nsRange)
+        if matches.count > kMaxBase64CandidatesPerString {
+            return true
+        }
+        for match in matches {
+            guard let swiftRange = Range(match.range, in: cand) else { continue }
+            let tok = String(cand[swiftRange])
+            for offset in 0..<4 {
+                let slice = offset == 0 ? tok : String(tok.dropFirst(offset))
+                guard slice.count >= 12,
+                      let decoded = decodeBase64Candidate(slice),
+                      !decoded.isEmpty else {
+                    continue
+                }
+                let decStr = String(decoding: decoded, as: UTF8.self)
+                let decPct = decodePercentLenient(decoded)
+                let decUnesc = decodeJSONEscapeSequencesLenient(decStr)
+                for sub in [decStr, decPct, decUnesc] where !sub.isEmpty {
+                    for rawSec in rawSecrets where sub.contains(rawSec) {
+                        return true
+                    }
+                    if textMatchesDirectLeak(sub, needles: needles) {
+                        return true
+                    }
+                }
+            }
+        }
+    }
+    return false
+}
+
+private func containsCredentialLeak(
+    bodyData: Data,
+    sessionToken: Data,
+    apiKeyData: Data
+) -> Bool {
+    if bodyData.isEmpty { return false }
+    var needles = secretEncodingVariants(sessionToken)
+    for v in secretEncodingVariants(apiKeyData) where !needles.contains(v) {
+        needles.append(v)
+    }
+    var rawSecrets: [String] = []
+    if let s = trimmedSecretString(sessionToken) { rawSecrets.append(s) }
+    if let k = trimmedSecretString(apiKeyData), !rawSecrets.contains(k) { rawSecrets.append(k) }
+
+    let rawText = String(decoding: bodyData, as: UTF8.self)
+    return stringContainsCredentialLeak(rawText, needles: needles, rawSecrets: rawSecrets)
+}
+
+private func combinedCredentialLeakMaterial(_ secrets: [Data]) -> (needles: [String], raw: [String]) {
+    var needles = Set<String>()
+    var raw = Set<String>()
+    for secret in secrets {
+        for value in secretEncodingVariants(secret) { needles.insert(value) }
+        if let value = trimmedSecretString(secret) { raw.insert(value) }
+    }
+    return (Array(needles), Array(raw))
+}
+
+private func jsonNodeContainsCredentialLeak(
+    _ value: Any,
+    needles: [String],
+    rawSecrets: [String],
+    containerDepth: Int,
+    embeddedDecodeDepth: Int,
+    visitedNodes: inout Int
+) -> Bool {
+    visitedNodes += 1
+    if containerDepth > kMaxJSONContainerDepth || visitedNodes > kMaxVisitedJSONNodes {
+        return true
+    }
+
+    if let str = value as? String {
+        if stringContainsCredentialLeak(str, needles: needles, rawSecrets: rawSecrets) {
+            return true
+        }
+        let trimmed = str.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let first = trimmed.first, (first == "{" || first == "[" || first == "\"") {
+            if let nested = try? JSONSerialization.jsonObject(
+                with: Data(trimmed.utf8),
+                options: [.fragmentsAllowed]
+            ) {
+                if embeddedDecodeDepth >= kMaxEmbeddedJSONDecodes {
+                    return true
+                }
+                if jsonNodeContainsCredentialLeak(
+                    nested,
+                    needles: needles,
+                    rawSecrets: rawSecrets,
+                    containerDepth: 0,
+                    embeddedDecodeDepth: embeddedDecodeDepth + 1,
+                    visitedNodes: &visitedNodes
+                ) {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    if let arr = value as? [Any] {
+        for item in arr {
+            if jsonNodeContainsCredentialLeak(
+                item,
+                needles: needles,
+                rawSecrets: rawSecrets,
+                containerDepth: containerDepth + 1,
+                embeddedDecodeDepth: embeddedDecodeDepth,
+                visitedNodes: &visitedNodes
+            ) {
+                return true
+            }
+        }
+        return false
+    }
+
+    if let dict = value as? [String: Any] {
+        for (k, v) in dict {
+            if jsonNodeContainsCredentialLeak(
+                k,
+                needles: needles,
+                rawSecrets: rawSecrets,
+                containerDepth: containerDepth + 1,
+                embeddedDecodeDepth: embeddedDecodeDepth,
+                visitedNodes: &visitedNodes
+            ) {
+                return true
+            }
+            if jsonNodeContainsCredentialLeak(
+                v,
+                needles: needles,
+                rawSecrets: rawSecrets,
+                containerDepth: containerDepth + 1,
+                embeddedDecodeDepth: embeddedDecodeDepth,
+                visitedNodes: &visitedNodes
+            ) {
+                return true
+            }
+        }
+        return false
+    }
+
+    return false
+}
+
+private func jsonObjectContainsCredentialLeak(
+    _ root: Any,
+    sessionToken: Data,
+    apiKeyData: Data
+) -> Bool {
+    var needles = secretEncodingVariants(sessionToken)
+    for v in secretEncodingVariants(apiKeyData) where !needles.contains(v) {
+        needles.append(v)
+    }
+    var rawSecrets: [String] = []
+    if let s = trimmedSecretString(sessionToken) { rawSecrets.append(s) }
+    if let k = trimmedSecretString(apiKeyData), !rawSecrets.contains(k) { rawSecrets.append(k) }
+
+    var visitedNodes = 0
+    return jsonNodeContainsCredentialLeak(
+        root,
+        needles: needles,
+        rawSecrets: rawSecrets,
+        containerDepth: 0,
+        embeddedDecodeDepth: 0,
+        visitedNodes: &visitedNodes
+    )
 }
 
 // MARK: - HTTP/1.1 Loopback Server
@@ -1554,11 +1935,23 @@ private func parseAndValidateDefaultChatParams(rawJSON: String) throws -> [Strin
     return dict
 }
 
+private func continuousSeconds() -> Double {
+    var scale = mach_timebase_info_data_t()
+    mach_timebase_info(&scale)
+    return Double(mach_continuous_time()) * Double(scale.numer) / Double(scale.denom) / 1_000_000_000
+}
+
 private final class ProxyServer: @unchecked Sendable {
     let listenPort: UInt16
     let upstreamBaseURL: URL
     let allowedModel: String
-    let sessionToken: Data
+    private var activeSessionToken: Data
+    private var retiredSessionTokens: [Data] = []
+    private let maxSessionGenerations = 32
+    var sessionToken: Data {
+        lock.lock(); defer { lock.unlock() }
+        return activeSessionToken
+    }
     var apiKeyData: Data
     let maxChatRequests: Int
     let maxRequestBytes: Int
@@ -1574,6 +1967,18 @@ private final class ProxyServer: @unchecked Sendable {
     private var chatRequestsUsed = 0
     private var cleanedUp = false
     private let urlSession: URLSession
+    private let renewalLock = NSLock()
+    private let sessionID = UUID().uuidString
+    private var generation = 1
+    private var windowSeconds: Int
+    private var deadline: Double
+    private var expiresAt: Int
+    private var controlSocketPath: String?
+    private var controlFD: Int32 = -1
+    private var renewalAuthorizer: ((Int) throws -> Data)?
+    #if SE_KEY_TESTING
+    var testingPublicationFault = 0
+    #endif
 
     init(
         listenPort: UInt16,
@@ -1589,12 +1994,14 @@ private final class ProxyServer: @unchecked Sendable {
         upstreamBinding: UpstreamProcessBinding?,
         forceURLSession: Bool,
         sessionTokenFile: String?,
-        defaultChatParams: [String: Any] = [:]
+        defaultChatParams: [String: Any] = [:],
+        ttlSeconds: Int = 3600,
+        renewalAuthorizer: ((Int) throws -> Data)? = nil
     ) {
         self.listenPort = listenPort
         self.upstreamBaseURL = upstreamBaseURL
         self.allowedModel = allowedModel
-        self.sessionToken = sessionToken
+        self.activeSessionToken = sessionToken
         self.apiKeyData = apiKeyData
         self.maxChatRequests = maxChatRequests
         self.maxRequestBytes = maxRequestBytes
@@ -1605,6 +2012,10 @@ private final class ProxyServer: @unchecked Sendable {
         self.forceURLSession = forceURLSession
         self.sessionTokenFile = sessionTokenFile
         self.defaultChatParams = defaultChatParams
+        self.windowSeconds = ttlSeconds
+        self.deadline = continuousSeconds() + Double(ttlSeconds)
+        self.expiresAt = Int(Date().timeIntervalSince1970) + ttlSeconds
+        self.renewalAuthorizer = renewalAuthorizer
 
         let cfg = URLSessionConfiguration.ephemeral
         cfg.httpCookieStorage = nil
@@ -1617,11 +2028,235 @@ private final class ProxyServer: @unchecked Sendable {
         self.urlSession = URLSession(configuration: cfg)
     }
 
+    private func snapshotLocked() -> [String: Any] {
+        let remaining = max(0, deadline - continuousSeconds())
+        let left = Int(ceil(remaining))
+        return ["protocol": 1, "session_id": sessionID, "pid": Int(getpid()),
+                "model": allowedModel, "state": left > 0 && !cleanedUp ? "ON" : "OFF",
+                "generation": generation, "remaining_seconds": left, "remaining_milliseconds": Int(floor(remaining * 1000)), "expires_at": expiresAt,
+                "window_seconds": windowSeconds, "requests_used": chatRequestsUsed,
+                "request_limit": maxChatRequests, "requests_remaining": max(0, maxChatRequests - chatRequestsUsed)]
+    }
+
+    private func credentialEnvelope(token: Data, generation: Int) throws -> Data {
+        return try JSONSerialization.data(withJSONObject: ["token": String(decoding: token, as: UTF8.self),
+            "session_id": sessionID, "generation": generation])
+    }
+
+    func expireIfNeeded() {
+        lock.lock()
+        let expired = continuousSeconds() >= deadline
+        lock.unlock()
+        if expired { cleanupAndExit(code: 0) }
+    }
+
+    func startControl(path originalPath: String) throws {
+        let path = URL(fileURLWithPath: originalPath).standardizedFileURL.path
+        let addressName = URL(fileURLWithPath: path).lastPathComponent
+        guard addressName.utf8.count < MemoryLayout.size(ofValue: sockaddr_un().sun_path),
+              let rawTokenPath = sessionTokenFile, isSafeTokenFileForUnlink(rawTokenPath) else {
+            throw NSError(domain: "SessionControl", code: 1)
+        }
+        let tokenPath = URL(fileURLWithPath: rawTokenPath).standardizedFileURL.path
+        let dir = URL(fileURLWithPath: path).deletingLastPathComponent().path
+        try ensureOwnedDirectoryComponent(path: dir, createIfMissing: true, requireMode0700: true)
+        // Startup only, before any control/HTTP traffic is accepted. A relative Unix
+        // address avoids sun_path limits without placing a socket outside runs/.
+        let originalDir = Darwin.open(".", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        guard originalDir >= 0 else { throw NSError(domain: "SessionControl", code: 7) }
+        defer { Darwin.close(originalDir) }
+        let controlDir = Darwin.open(dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+        guard controlDir >= 0 else { throw NSError(domain: "SessionControl", code: 7) }
+        defer { Darwin.close(controlDir) }
+        guard Darwin.fchdir(controlDir) == 0 else { throw NSError(domain: "SessionControl", code: 7) }
+        var restored = false
+        defer { if !restored && Darwin.fchdir(originalDir) != 0 { Darwin._exit(1) } }
+        // Refuse a live or untrusted endpoint. Recover an owned, unbound socket after SIGKILL.
+        var existing = stat()
+        if lstat(path, &existing) == 0 {
+            guard (existing.st_mode & S_IFMT) == S_IFSOCK, existing.st_uid == geteuid(),
+                  (existing.st_mode & 0o777) == 0o600 else { throw NSError(domain: "SessionControl", code: 2) }
+            let probe = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+            guard probe >= 0 else { throw NSError(domain: "SessionControl", code: 2) }
+            var target = sockaddr_un(); target.sun_family = sa_family_t(AF_UNIX)
+            target.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
+            withUnsafeMutableBytes(of: &target.sun_path) { bytes in
+                bytes.copyBytes(from: Array(addressName.utf8) + [0] + Array(repeating: 0, count: bytes.count - addressName.utf8.count - 1))
+            }
+            let connected = withUnsafePointer(to: &target) { ptr in
+                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    Darwin.connect(probe, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+                }
+            }
+            let probeError = errno
+            Darwin.close(probe)
+            guard connected != 0, probeError == ECONNREFUSED else { throw NSError(domain: "SessionControl", code: 2) }
+            var current = stat()
+            guard lstat(path, &current) == 0, current.st_ino == existing.st_ino,
+                  current.st_dev == existing.st_dev, unlink(path) == 0 else { throw NSError(domain: "SessionControl", code: 2) }
+        } else if errno != ENOENT { throw NSError(domain: "SessionControl", code: 2) }
+        let fd = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { throw NSError(domain: "SessionControl", code: 3) }
+        var address = sockaddr_un()
+        address.sun_family = sa_family_t(AF_UNIX)
+        address.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
+        withUnsafeMutableBytes(of: &address.sun_path) { bytes in
+            bytes.copyBytes(from: Array(addressName.utf8) + [0] + Array(repeating: 0,
+                count: bytes.count - addressName.utf8.count - 1))
+        }
+        let bound = withUnsafePointer(to: &address) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.bind(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size))
+            }
+        }
+        guard bound == 0 else { Darwin.close(fd); throw NSError(domain: "SessionControl", code: 4) }
+        controlSocketPath = path
+        guard chmod(path, 0o600) == 0, Darwin.listen(fd, 8) == 0 else {
+            Darwin.close(fd); throw NSError(domain: "SessionControl", code: 5)
+        }
+        controlFD = fd
+        let tokenDir = URL(fileURLWithPath: tokenPath).deletingLastPathComponent().path
+        _ = try readOwnedRegularFile0600(path: tokenPath)
+        let stage = try writeStageFile0600(dir: tokenDir, prefix: "session", data:
+            credentialEnvelope(token: activeSessionToken, generation: generation))
+        try atomicPublishStageFile(dir: tokenDir, stagePath: stage, targetPath: tokenPath)
+        guard Darwin.fchdir(originalDir) == 0 else { throw NSError(domain: "SessionControl", code: 7) }
+        restored = true
+        DispatchQueue.global().async {
+            while true {
+                let peer = Darwin.accept(fd, nil, nil)
+                if peer < 0 { if errno == EINTR { continue }; break }
+                DispatchQueue.global().async { self.handleControl(fd: peer) }
+            }
+        }
+    }
+
+    private func handleControl(fd: Int32) {
+        defer { Darwin.close(fd) }
+        var uid: uid_t = 0; var gid: gid_t = 0
+        guard getpeereid(fd, &uid, &gid) == 0, uid == geteuid() else { return }
+        var timeout = timeval(tv_sec: 5, tv_usec: 0)
+        _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        _ = setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        func reply(_ payload: [String: Any]) {
+            if var bytes = try? JSONSerialization.data(withJSONObject: payload) {
+                bytes.append(10); _ = writeAllToFD(fd, data: bytes)
+            }
+        }
+        var raw = Data(); var part = [UInt8](repeating: 0, count: 512)
+        while !raw.contains(10) && raw.count < 4096 {
+            let n = Darwin.read(fd, &part, min(part.count, 4096 - raw.count))
+            if n <= 0 { return }; raw.append(contentsOf: part[0..<n])
+        }
+        guard let end = raw.firstIndex(of: 10),
+              let request = (try? JSONSerialization.jsonObject(with: raw.prefix(upTo: end))) as? [String: Any],
+              let action = request["action"] as? String else { reply(["error": "invalid_request"]); return }
+        guard request.keys.allSatisfy({ countTopLevelKeyOccurrences(in: Data(raw.prefix(upTo: end)), targetKey: $0) == 1 }) else {
+            reply(["error": "duplicate_key"]); return
+        }
+        if action == "status", request.count == 1 {
+            lock.lock(); let result = snapshotLocked(); lock.unlock(); reply(result); return
+        }
+        guard action == "renew", Set(request.keys) == Set(["action", "seconds", "session_id", "generation"]),
+              let number = request["seconds"] as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
+              number.doubleValue == Double(number.intValue), (1...86400).contains(number.intValue),
+              let requestedGeneration = request["generation"] as? NSNumber,
+              CFGetTypeID(requestedGeneration) != CFBooleanGetTypeID(),
+              requestedGeneration.doubleValue == Double(requestedGeneration.intValue),
+              request["session_id"] as? String == sessionID,
+              renewalLock.try() else { reply(["error": "renewal_refused"]); return }
+        defer { renewalLock.unlock() }
+        func eligible() -> Bool {
+            return !cleanedUp && generation == requestedGeneration.intValue
+                && generation < maxSessionGenerations
+                && continuousSeconds() < deadline && chatRequestsUsed < maxChatRequests
+        }
+        lock.lock(); let canRenew = eligible(); lock.unlock()
+        guard canRenew, let authorize = renewalAuthorizer, let tokenPath = sessionTokenFile else {
+            reply(["error": "renewal_refused"]); return
+        }
+        var freshKey: Data
+        do { freshKey = try authorize(number.intValue) }
+        catch { reply(["error": "authorization_cancelled"]); return }
+        defer { bestEffortZero(&freshKey) }
+        lock.lock()
+        guard eligible(), constantTimeEquals(freshKey, apiKeyData) else {
+            lock.unlock(); reply(["error": "renewal_refused"]); return
+        }
+        let nextToken = Data(("se-session-" + randomHexBytes(32)).utf8)
+        let tokenDir = URL(fileURLWithPath: tokenPath).deletingLastPathComponent().path
+        var stage: String?; var published = false
+        do {
+            #if SE_KEY_TESTING
+            if testingPublicationFault == 1 { throw NSError(domain: "SessionPublicationTest", code: 1) }
+            #endif
+            _ = try readOwnedRegularFile0600(path: tokenPath)
+            stage = try writeStageFile0600(dir: tokenDir, prefix: "session", data:
+                credentialEnvelope(token: nextToken, generation: generation + 1))
+            try ensureDestinationNotSymlink(path: tokenPath)
+            guard Darwin.rename(stage!, tokenPath) == 0 else { throw NSError(domain: "SessionControl", code: 6) }
+            published = true
+            #if SE_KEY_TESTING
+            if testingPublicationFault == 2 { throw NSError(domain: "SessionPublicationTest", code: 2) }
+            #endif
+            try fsyncDirectory(tokenDir, context: "session renewal")
+            retiredSessionTokens.append(activeSessionToken)
+            activeSessionToken = nextToken
+            generation += 1
+            windowSeconds = number.intValue
+            deadline = continuousSeconds() + Double(windowSeconds)
+            expiresAt = Int(Date().timeIntervalSince1970) + windowSeconds
+            let result = snapshotLocked()
+            lock.unlock(); reply(result)
+        } catch {
+            lock.unlock()
+            if let stage = stage { unlink(stage) }
+            if published { cleanupAndExit(code: 1) }
+            reply(["error": "publication_failed"])
+        }
+    }
+
+    private func rejectStaleCredential(fd: Int32, providedToken: Data, nonce: String?) {
+        // Complete the refusal before closing a socket whose request body may be unread.
+        // Otherwise Darwin can reset the connection and discard the proof response.
+        defer {
+            _ = Darwin.shutdown(fd, SHUT_WR)
+            var discarded = [UInt8](repeating: 0, count: 4096)
+            var left = 65536
+            while left > 0 {
+                let n = Darwin.recv(fd, &discarded, min(left, discarded.count), MSG_DONTWAIT)
+                if n <= 0 { break }
+                left -= n
+            }
+        }
+        lock.lock()
+        let gen = generation; let key = activeSessionToken; let sid = sessionID
+        let wasIssued = retiredSessionTokens.contains { constantTimeEquals(providedToken, $0) }
+        lock.unlock()
+        guard wasIssued, gen > 1, let nonce = nonce, nonce.count == 32,
+              nonce.allSatisfy({ $0.isHexDigit && $0.isASCII }) else {
+            sendHTTPError(clientFD: fd, status: 401, statusText: "Unauthorized", errorCode: "unauthorized", message: "Invalid session token")
+            return
+        }
+        let material = "free-inference-stale-v1|\(sid)|\(gen)|\(nonce)"
+        let proof = HMAC<SHA256>.authenticationCode(for: Data(material.utf8), using: SymmetricKey(data: key))
+            .map { String(format: "%02x", $0) }.joined()
+        let body = try! JSONSerialization.data(withJSONObject: ["error": ["code": "session_credential_stale",
+            "session_id": sid, "generation": gen, "request_id": nonce, "proof": proof]])
+        let header = "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: \(body.count)\r\nConnection: close\r\n\r\n"
+        _ = writeAllToFD(fd, data: Data(header.utf8)); _ = writeAllToFD(fd, data: body)
+    }
+
     func cleanupAndExit(code: Int32) -> Never {
         lock.lock()
         if !cleanedUp {
             cleanedUp = true
             bestEffortZero(&apiKeyData)
+            bestEffortZero(&activeSessionToken)
+            for index in retiredSessionTokens.indices { bestEffortZero(&retiredSessionTokens[index]) }
+            retiredSessionTokens.removeAll(keepingCapacity: false)
+            if let path = controlSocketPath { unlink(path) }
+            if controlFD >= 0 { Darwin.close(controlFD) }
             if let tokenPath = sessionTokenFile, isSafeTokenFileForUnlink(tokenPath) {
                 unlink(tokenPath)
             }
@@ -1638,6 +2273,11 @@ private final class ProxyServer: @unchecked Sendable {
     func handleClient(fd: Int32) {
         let delegate = StreamingForwardDelegate(clientFD: fd, timeoutSeconds: streamTimeoutSeconds)
         defer { delegate.closeClientSocket() }
+        lock.lock(); let expired = continuousSeconds() >= deadline; lock.unlock()
+        if expired {
+            sendHTTPError(clientFD: fd, status: 401, statusText: "Unauthorized", errorCode: "session_expired", message: "Session authorization expired")
+            return
+        }
 
         var tv = timeval(tv_sec: 15, tv_usec: 0)
         _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
@@ -1726,6 +2366,7 @@ private final class ProxyServer: @unchecked Sendable {
         var contentLengthValues: [String] = []
         var hasTransferEncoding = false
         var authHeader: String? = nil
+        var sessionRequestID: String? = nil
         var acceptHeader: String? = nil
         var contentTypeHeader: String? = nil
 
@@ -1763,6 +2404,8 @@ private final class ProxyServer: @unchecked Sendable {
                 hasTransferEncoding = true
             case "authorization":
                 authHeader = val
+            case "x-session-request-id":
+                sessionRequestID = val
             case "accept":
                 acceptHeader = val
             case "content-type":
@@ -1823,13 +2466,7 @@ private final class ProxyServer: @unchecked Sendable {
         }
         let providedToken = Data(String(rawAuth.dropFirst("Bearer ".count)).trimmingCharacters(in: .whitespaces).utf8)
         guard constantTimeEquals(providedToken, sessionToken) else {
-            sendHTTPError(
-                clientFD: fd,
-                status: 401,
-                statusText: "Unauthorized",
-                errorCode: "unauthorized",
-                message: "Invalid session token"
-            )
+            rejectStaleCredential(fd: fd, providedToken: providedToken, nonce: sessionRequestID)
             return
         }
 
@@ -2035,8 +2672,35 @@ private final class ProxyServer: @unchecked Sendable {
                 return
             }
 
+            lock.lock()
+            let guardTokens = retiredSessionTokens + [activeSessionToken]
+            let guardKey = apiKeyData
+            lock.unlock()
+            let material = combinedCredentialLeakMaterial(guardTokens + [guardKey])
+            var guardNodes = 0
+            if jsonNodeContainsCredentialLeak(jsonDict, needles: material.needles, rawSecrets: material.raw,
+                    containerDepth: 0, embeddedDecodeDepth: 0, visitedNodes: &guardNodes)
+                || stringContainsCredentialLeak(String(decoding: bodyData, as: UTF8.self),
+                    needles: material.needles, rawSecrets: material.raw)
+                || stringContainsCredentialLeak(String(decoding: canonicalBody, as: UTF8.self),
+                    needles: material.needles, rawSecrets: material.raw) {
+                sendHTTPError(
+                    clientFD: fd,
+                    status: 400,
+                    statusText: "Bad Request",
+                    errorCode: "credential_leak_blocked",
+                    message: "Outbound request blocked: request body contains session or provider credential material"
+                )
+                return
+            }
+
             // Enforce session chat request budget before forwarding
             lock.lock()
+            if continuousSeconds() >= deadline {
+                lock.unlock()
+                sendHTTPError(clientFD: fd, status: 401, statusText: "Unauthorized", errorCode: "session_expired", message: "Session authorization expired")
+                return
+            }
             if chatRequestsUsed >= maxChatRequests {
                 lock.unlock()
                 sendHTTPError(
@@ -3697,11 +4361,14 @@ private func runProxy(args: [String]) -> Int32 {
     var maxRequestBytes = 262144
     var maxTokensCap = 0
     var ttlSeconds = 3600
+    var controlSocket: String?
     var streamTimeoutSeconds = 300
     var defaultChatParamsRaw: String? = nil
     var forceURLSession = false
     #if SE_KEY_TESTING
     var testEphemeralKeyFD: Int32?
+    var testRenewalFD: Int32?
+    var testPublicationFault = 0
     #endif
 
     var i = 0
@@ -3737,6 +4404,9 @@ private func runProxy(args: [String]) -> Int32 {
         case "--session-token-file":
             i += 1
             if i < args.count { sessionTokenFile = args[i] }
+        case "--control-socket":
+            i += 1
+            if i < args.count { controlSocket = args[i] }
         case "--max-chat-requests":
             i += 1
             if i < args.count, let v = Int(args[i]), v > 0 { maxChatRequests = v }
@@ -3768,6 +4438,20 @@ private func runProxy(args: [String]) -> Int32 {
                     i += 1
                     continue
                 }
+            } else if args[i] == "--test-renewal-fd" {
+                i += 1
+                if i < args.count, let fd = Int32(args[i]) {
+                    testRenewalFD = fd
+                    i += 1
+                    continue
+                }
+            } else if args[i] == "--test-publication-fault" {
+                i += 1
+                if i < args.count, let fault = Int(args[i]), (1...2).contains(fault) {
+                    testPublicationFault = fault
+                    i += 1
+                    continue
+                }
             } else if args[i] == "--test-force-urlsession" {
                 forceURLSession = true
                 i += 1
@@ -3794,6 +4478,10 @@ private func runProxy(args: [String]) -> Int32 {
 
     guard listenHost == "127.0.0.1" else {
         writeStderr("Refusing to bind se-key-proxy to non-loopback host '\(listenHost)'")
+        return 2
+    }
+    guard (1...86400).contains(ttlSeconds) else {
+        writeStderr("Session window must be between 1 and 86400 seconds")
         return 2
     }
 
@@ -3915,6 +4603,24 @@ private func runProxy(args: [String]) -> Int32 {
         return 1
     }
 
+    #if SE_KEY_TESTING
+    let testKeyForRenewal = unsealedKeyData
+    #endif
+    let authorizeRenewal: (Int) throws -> Data = { seconds in
+        #if SE_KEY_TESTING
+        if let authFD = testRenewalFD {
+            var decision: UInt8 = 0
+            guard Darwin.read(authFD, &decision, 1) == 1, decision == 49 else {
+                throw NSError(domain: "SessionAuthorization", code: 1)
+            }
+            return testKeyForRenewal
+        }
+        // An injected test key must never fall through to real biometric authorization.
+        if testEphemeralKeyFD != nil { throw NSError(domain: "SessionAuthorization", code: 2) }
+        #endif
+        return try unsealFromKeychainAndSecureEnclave(service: svc, account: account,
+            upstreamURL: upURL, allowedModel: model, maxChatRequests: maxChatRequests, ttlSeconds: seconds)
+    }
     let server = ProxyServer(
         listenPort: lPort,
         upstreamBaseURL: upURL,
@@ -3929,8 +4635,18 @@ private func runProxy(args: [String]) -> Int32 {
         upstreamBinding: verifiedBinding,
         forceURLSession: forceURLSession,
         sessionTokenFile: sessionTokenFile,
-        defaultChatParams: defaultChatParams
+        defaultChatParams: defaultChatParams,
+        ttlSeconds: ttlSeconds,
+        renewalAuthorizer: authorizeRenewal
     )
+    #if SE_KEY_TESTING
+    server.testingPublicationFault = testPublicationFault
+    #endif
+    // SE_KEY_TESTING renewal callback holds its own synthetic-key copy only.
+    if let path = controlSocket {
+        do { try server.startControl(path: path) }
+        catch { writeStderr("Session control initialization failed"); server.cleanupAndExit(code: 1) }
+    }
     bestEffortZero(&unsealedKeyData)
 
     // Install SIGINT/SIGTERM and TTL dispatch sources
@@ -3945,10 +4661,9 @@ private func runProxy(args: [String]) -> Int32 {
     sigIntSrc.resume()
 
     let ttlTimer = DispatchSource.makeTimerSource(queue: .global())
-    ttlTimer.schedule(deadline: .now() + .seconds(ttlSeconds))
+    ttlTimer.schedule(deadline: .now() + .milliseconds(100), repeating: .milliseconds(100))
     ttlTimer.setEventHandler {
-        writeStderr("se-key-proxy session TTL (\(ttlSeconds)s) expired; shutting down.")
-        server.cleanupAndExit(code: 0)
+        server.expireIfNeeded()
     }
     ttlTimer.resume()
 

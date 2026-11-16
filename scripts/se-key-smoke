@@ -6,9 +6,12 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 import socket
+import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from types import ModuleType
@@ -25,7 +28,7 @@ if __name__ == "__main__" and VENV_PYTHON.exists() and Path(sys.executable) != V
 sys.path.insert(0, str(ROOT))
 
 from local_assist.client import open_loopback_http
-from local_assist.registry import pid_file_for_model, session_token_file_for_model
+from local_assist.registry import pid_file_for_model, session_token_file_for_model, parse_session_token_raw
 from local_assist.se_key import verify_se_key_proxy_binary
 
 
@@ -33,6 +36,13 @@ SELFTEST_SERVICE = "free-inference.selftest"
 SYNTHETIC_REAL_KEY = "sk-selftest-synthetic-key-7741"
 MODEL_ID = "se-key-smoke-mock"
 SERVED_REPO = "mock/se-key-smoke-model"
+
+
+def _read_proxy_token(path: Path) -> str | None:
+    try:
+        return parse_session_token_raw(path.read_text(encoding='utf-8'))
+    except (OSError, ValueError, AttributeError):
+        return None
 
 
 def _load_script_module(name: str, rel_path: str) -> ModuleType:
@@ -185,8 +195,11 @@ def main(argv: list[str]) -> int:
     stamp = time.strftime("%Y-%m-%d-%H%M%S")
     out_dir = RUNS / f"{stamp}-se-key-smoke"
     out_dir.mkdir(parents=True, exist_ok=True)
-    serve_mod.RUNS = out_dir
-    stop_mod.RUNS = out_dir
+    # sockaddr_un on macOS cannot address long nested run-artifact paths.
+    # Keep disposable runtime state short; retain the diagnostic logs in out_dir.
+    runtime_dir = Path(tempfile.mkdtemp(prefix='fi-smoke-', dir='/private/tmp'))
+    serve_mod.RUNS = runtime_dir
+    stop_mod.RUNS = runtime_dir
 
     listen_port = _free_port_pair()
     upstream_port = listen_port + 1000
@@ -219,9 +232,9 @@ def main(argv: list[str]) -> int:
         "upstream_port": upstream_port,
     }
 
-    tok_file = session_token_file_for_model(MODEL_ID, out_dir)
-    pid_file = pid_file_for_model(MODEL_ID, out_dir)
-    default_pid_file = out_dir / ".serve.pid"
+    tok_file = session_token_file_for_model(MODEL_ID, runtime_dir)
+    pid_file = pid_file_for_model(MODEL_ID, runtime_dir)
+    default_pid_file = runtime_dir / ".serve.pid"
 
     try:
         # 1. Seal synthetic key into free-inference.selftest via --secret-fd
@@ -270,8 +283,9 @@ def main(argv: list[str]) -> int:
                 "Did a macOS Touch ID prompt appear for unlock #1? [y/N]: "
             )
 
-            if rc1 == 0 and tok_file.exists():
-                session_tok_1 = tok_file.read_text(encoding="utf-8").strip()
+            session_tok_1 = _read_proxy_token(tok_file) if rc1 == 0 else None
+            summary['unlock_1_credential_envelope_valid'] = session_tok_1 is not None
+            if session_tok_1 is not None:
                 req = Request(
                     f"http://127.0.0.1:{listen_port}/v1/models",
                     headers={"Authorization": f"Bearer {session_tok_1}"},
@@ -359,8 +373,9 @@ def main(argv: list[str]) -> int:
                 and all(item.get("accept_encoding") == "identity" for item in observed)
             )
     finally:
+        cleanup_rc = 1
         try:
-            stop_mod.main(["scripts/stop-model", MODEL_ID])
+            cleanup_rc = stop_mod.main(["scripts/stop-model", MODEL_ID])
         except Exception:
             pass
         del_cp = subprocess.run(
@@ -372,6 +387,20 @@ def main(argv: list[str]) -> int:
         summary["keychain_entry_removed"] = (
             del_cp.returncode == 0 and json.loads(del_cp.stdout).get("deleted") is True
         )
+        try:
+            for log in runtime_dir.glob('*.log'):
+                shutil.copyfile(log, out_dir / log.name)
+        except OSError:
+            summary['runtime_log_copy_failed'] = True
+        if cleanup_rc == 0:
+            try:
+                shutil.rmtree(runtime_dir)
+            except OSError:
+                summary['runtime_cleanup_blocked'] = True
+                summary['runtime_state_directory'] = str(runtime_dir)
+        else:
+            summary['runtime_cleanup_blocked'] = True
+            summary['runtime_state_directory'] = str(runtime_dir)
 
     # Check zero leaks of se-session- or SYNTHETIC_REAL_KEY in out_dir
     leaks: list[str] = []
@@ -405,6 +434,8 @@ def main(argv: list[str]) -> int:
             and not leaks
         )
 
+    summary['all_passed'] = (summary['all_passed'] and not summary.get('runtime_cleanup_blocked', False)
+                            and not summary.get('runtime_log_copy_failed', False))
     summary_path = out_dir / "summary.json"
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n")
     print(json.dumps(summary, indent=2, sort_keys=True))

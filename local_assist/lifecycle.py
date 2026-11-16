@@ -11,6 +11,7 @@ from typing import Any
 
 from .client import chat, default_timeout_seconds, get_models
 from .errors import LocalAssistError, ModelMismatch, ModelTimeout, ModelUnavailable
+from .logging import get_active_startup_state, record_active_startup_state
 from .paths import ROOT
 from .registry import (
     RegistryError,
@@ -181,7 +182,7 @@ def ensure_local_model_served(
     wait_seconds: float | None = None,
     deadline: float | None = None,
     run_cmd: Any = None,
-) -> None:
+) -> str:
     runner = run_cmd or subprocess.run
     effective_auto_serve = (
         auto_serve
@@ -193,6 +194,7 @@ def ensure_local_model_served(
     try:
         entry = find_model_by_id_or_repo(registry_id) or find_model_by_id_or_repo(model)
         if entry is None:
+            record_active_startup_state("not_served")
             raise ModelUnavailable(
                 "model_unavailable",
                 f"Model '{model}' (registry_id='{registry_id}') is not present in models.yaml.",
@@ -202,6 +204,7 @@ def ensure_local_model_served(
         pid_record = read_pid_record_for_model(real_id)
         endpoint = resolve_endpoint(entry, pid_record=pid_record, require_api_key=False)
     except RegistryError as exc:
+        record_active_startup_state("not_served")
         raise LocalAssistError(
             "registry_error",
             str(exc),
@@ -211,11 +214,12 @@ def ensure_local_model_served(
     verify_script = str(ROOT / "scripts" / "verify-served-model")
     serve_script = str(ROOT / "scripts" / "serve-model")
 
-    def _rem(cap: float) -> float:
+    def _rem(cap: float, *, failure_state: str = "not_served") -> float:
         if deadline is None:
             return cap
         rem = deadline - time.monotonic()
         if rem <= 0:
+            record_active_startup_state(failure_state)
             raise ModelTimeout(
                 "timeout",
                 f"Timed out waiting for local model '{real_id}' before deadline.",
@@ -232,7 +236,8 @@ def ensure_local_model_served(
         check=False,
     )
     if check_proc.returncode == 0:
-        return
+        record_active_startup_state("warm")
+        return "warm"
 
     check_detail = (check_proc.stderr or check_proc.stdout or "").strip()
     if (
@@ -244,9 +249,11 @@ def ensure_local_model_served(
         except LocalAssistError:
             available = []
         if model in available or real_id in available or endpoint.served_model_id in available:
-            return
+            record_active_startup_state("worker_handoff")
+            return "worker_handoff"
 
     if check_proc.returncode == 3:
+        record_active_startup_state("not_served")
         raise ModelMismatch(
             "model_mismatch",
             f"Refusing to use {endpoint.api_base_url} for '{real_id}': another model is occupying the port ({check_detail}).",
@@ -259,6 +266,7 @@ def ensure_local_model_served(
         )
 
     if not effective_auto_serve:
+        record_active_startup_state("not_served")
         raise ModelUnavailable(
             "model_unavailable",
             f"Required local model '{real_id}' is not currently served at {endpoint.api_base_url} ({check_detail}).",
@@ -274,12 +282,14 @@ def ensure_local_model_served(
         )
 
     if endpoint.trust_tier != "local":
+        record_active_startup_state("not_served")
         raise LocalAssistError(
             "trust_tier_blocked",
             f"Refusing auto-serve for non-local model '{real_id}' with trust_tier='{endpoint.trust_tier}'.",
             details={"model_id": real_id, "trust_tier": endpoint.trust_tier},
         )
     if endpoint.routing_private_local != "cleared":
+        record_active_startup_state("not_served")
         raise LocalAssistError(
             "routing_gate_blocked",
             f"Refusing auto-serve for model '{real_id}' because routing.private_local is "
@@ -295,6 +305,8 @@ def ensure_local_model_served(
         if wait_seconds is not None
         else _rem(_default_auto_serve_wait_seconds())
     )
+    serve_timeout = max(1, int(_rem(30.0)))
+    record_active_startup_state("auto_serve_failed")
     print(
         f"[local-assist] auto-starting Rung 1 model '{real_id}' on {endpoint.api_base_url} ...",
         file=sys.stderr,
@@ -304,7 +316,7 @@ def ensure_local_model_served(
         cwd=str(ROOT),
         capture_output=True,
         text=True,
-        timeout=max(1, int(_rem(30.0))),
+        timeout=serve_timeout,
         check=False,
     )
     serve_detail = (serve_proc.stderr or serve_proc.stdout or "").strip()
@@ -321,7 +333,7 @@ def ensure_local_model_served(
             details={"required_model": model, "registry_id": real_id, "serve_error": serve_detail},
         )
 
-    wait_budget = _rem(effective_wait)
+    wait_budget = _rem(effective_wait, failure_state="auto_serve_failed")
     wait_proc = runner(
         [sys.executable, verify_script, real_id, "--wait", str(wait_budget), "--require-offline"],
         cwd=str(ROOT),
@@ -343,6 +355,13 @@ def ensure_local_model_served(
             f"Model '{real_id}' did not become ready within {wait_budget}s: {wait_detail}",
             details={"required_model": model, "registry_id": real_id, "verify_error": wait_detail},
         )
+    final_state = (
+        "auto_serve_reused"
+        if "is already active (or starting) on port" in (serve_proc.stdout or "")
+        else "auto_served"
+    )
+    record_active_startup_state(final_state)
+    return final_state
 
 
 def require_chat_succeeds(model: str, *, deadline: float | None = None) -> str:
@@ -352,39 +371,44 @@ def require_chat_succeeds(model: str, *, deadline: float | None = None) -> str:
         else (time.monotonic() + float(default_timeout_seconds()))
     )
     ensure_local_model_served(model, deadline=effective_deadline)
-    rem_models = max(1, int(min(5.0, effective_deadline - time.monotonic())))
-    available = get_models(timeout_seconds=rem_models, model=model)
-    if model not in available:
-        registry_id = MODEL_TO_REGISTRY_ID.get(model, model)
-        raise ModelUnavailable(
-            "model_unavailable",
-            f"Required model is not available: {model}.",
-            details={
-                "required_model": model,
-                "available_models": available,
-                "remediation": f"Run: scripts/serve-model {registry_id}",
-            },
-        )
+    try:
+        rem_models = max(1, int(min(5.0, effective_deadline - time.monotonic())))
+        available = get_models(timeout_seconds=rem_models, model=model)
+        if model not in available:
+            registry_id = MODEL_TO_REGISTRY_ID.get(model, model)
+            raise ModelUnavailable(
+                "model_unavailable",
+                f"Required model is not available: {model}.",
+                details={
+                    "required_model": model,
+                    "available_models": available,
+                    "remediation": f"Run: scripts/serve-model {registry_id}",
+                },
+            )
 
-    rem_smoke = effective_deadline - time.monotonic()
-    if rem_smoke <= 0:
-        raise ModelTimeout(
-            "timeout",
-            f"Timed out before smoke health-check for {model}.",
-            details={"model": model},
+        rem_smoke = effective_deadline - time.monotonic()
+        if rem_smoke <= 0:
+            raise ModelTimeout(
+                "timeout",
+                f"Timed out before smoke health-check for {model}.",
+                details={"model": model},
+            )
+        result = chat(
+            model,
+            SMOKE_SYSTEM,
+            SMOKE_PROMPT,
+            max_tokens=8,
+            temperature=0,
+            timeout_seconds=max(1, int(min(30.0, rem_smoke))),
         )
-    result = chat(
-        model,
-        SMOKE_SYSTEM,
-        SMOKE_PROMPT,
-        max_tokens=8,
-        temperature=0,
-        timeout_seconds=max(1, int(min(30.0, rem_smoke))),
-    )
-    if result.served_model != model:
-        raise ModelMismatch(
-            "model_mismatch",
-            "Requested model and served model differed.",
-            details={"requested_model": model, "served_model": result.served_model},
-        )
-    return result.served_model
+        if result.served_model != model:
+            raise ModelMismatch(
+                "model_mismatch",
+                "Requested model and served model differed.",
+                details={"requested_model": model, "served_model": result.served_model},
+            )
+        return result.served_model
+    except Exception:
+        if get_active_startup_state() in ("auto_served", "auto_serve_reused"):
+            record_active_startup_state("auto_serve_failed")
+        raise

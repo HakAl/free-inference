@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT))
 
 from local_assist.registry import (
     _legacy_unhashed_pid_file,
+    _effective_runs_dir,
     get_process_command,
     get_process_lstart,
     legacy_pid_file,
@@ -28,7 +29,7 @@ from local_assist.registry import (
 )
 
 
-RUNS = ROOT / "runs"
+RUNS = _effective_runs_dir()
 
 
 @contextlib.contextmanager
@@ -236,6 +237,14 @@ def _stop_record(
                 ok = False
 
     if ok:
+        if isinstance(model_id, str) and model_id and model_id != 'unknown':
+            from local_assist.session import remove_stale_control_socket
+            try:
+                if not remove_stale_control_socket(RUNS, model_id, int(pid or 0)):
+                    print('Refusing cleanup of an unverifiable control socket.', file=sys.stderr)
+                    return False
+            except (OSError, ValueError):
+                return False
         token_file = record.get("session_token_file")
         if isinstance(token_file, str) and token_file.strip():
             _safe_unlink_token_file(Path(token_file), RUNS)

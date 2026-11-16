@@ -64,13 +64,15 @@ from local_assist.security_profile import (
 )
 
 
-RUNS = ROOT / "runs"
+from local_assist.registry import _effective_runs_dir
+
+RUNS = _effective_runs_dir()
 DEFAULT_PORT = 8080
 DEFAULT_MAX_TOKENS_CAP = 4096
 INTERACTIVE_MAX_CHAT_REQUESTS = 1000
 INTERACTIVE_MAX_TOKENS_CAP = 16384
 INTERACTIVE_MAX_REQUEST_BYTES = 8388608
-INTERACTIVE_TTL_SECONDS = 43200
+INTERACTIVE_TTL_SECONDS = 7200
 CUSTOM_COMMAND_RUNTIMES = {"proxy", "mlx-vlm", "vllm-mlx", "omlx", "llama.cpp"}
 SERVE_ENV_ALLOWLIST = BASE_SAFE_ENV_ALLOWLIST | frozenset({
     "COLORTERM",
@@ -1013,6 +1015,8 @@ def main(argv: list[str]) -> int:
                         "--stream-timeout-seconds",
                         str(args.stream_timeout_seconds),
                     ]
+                    from local_assist.session import control_path
+                    se_cmd.extend(['--control-socket', str(control_path(RUNS, endpoint.model_id))])
                     if default_chat_params:
                         se_cmd.extend(
                             [

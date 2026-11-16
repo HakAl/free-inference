@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.machinery
 import importlib.util
 import json
@@ -1866,7 +1867,15 @@ class RegistryAndToolsTests(unittest.TestCase):
         self.assertEqual(parsed_line_resps[0]["result"]["protocolVersion"], "2025-11-25")
         self.assertEqual(
             [t["name"] for t in parsed_line_resps[1]["result"]["tools"]],
-            ["propose_eval_prompts", "extract_fields", "compress_context", "delegate_task"],
+            [
+                "propose_eval_prompts",
+                "extract_fields",
+                "compress_context",
+                "delegate_task",
+                "assist_status",
+                "check_eval_assertion",
+                "select_context",
+            ],
         )
         # Ensure structuredContent is present and serialized text in line mode has no literal newlines in frame
         self.assertFalse(parsed_line_resps[2]["result"]["isError"])
@@ -1997,6 +2006,7 @@ class RegistryAndToolsTests(unittest.TestCase):
             with (
                 patch.object(verify_mod, "load_model", return_value=model_entry),
                 patch.object(verify_mod, "read_pid_record_for_model", return_value=None),
+                patch.object(verify_mod, "list_pid_records", return_value=[]),
                 patch.object(verify_mod, "verify_local_listener_matches", return_value=(True, None)),
             ):
                 # 1. Exact match -> exit 0
@@ -2101,6 +2111,7 @@ class RegistryAndToolsTests(unittest.TestCase):
         with (
             patch.object(verify_mod, "load_model", return_value=unreachable_entry),
             patch.object(verify_mod, "read_pid_record_for_model", return_value=None),
+            patch.object(verify_mod, "list_pid_records", return_value=[]),
         ):
             rc_down = verify_mod.main(["scripts/verify-served-model", "qwen3-30b-a3b-2507-mlx-4bit"])
             self.assertEqual(rc_down, verify_mod.EXIT_UNREACHABLE)
@@ -2493,8 +2504,11 @@ class RegistryAndToolsTests(unittest.TestCase):
             os.environ["LOCAL_ASSIST_ALLOW_UNCLEARED_TEE"] = "1"
             check_private_coding_admission(uncleared_ep)
 
-        # Launcher resolve_default_attested_model_id resolves the single cleared model (tinfoil-deepseek-v4-1-flash)
-        self.assertEqual(oc_attested.resolve_default_attested_model_id(), "tinfoil-deepseek-v4-1-flash")
+        # Launcher resolve_default_attested_model_id resolves the configured catalog default (tinfoil-deepseek-v4-1-flash)
+        self.assertEqual(
+            oc_attested.resolve_default_attested_model_id(prefer_host_state=False, env={}),
+            "tinfoil-deepseek-v4-1-flash",
+        )
 
         # And refuses when no model is cleared in models_list
         with self.assertRaises(LocalAssistError) as ctx_default:
@@ -2862,7 +2876,7 @@ class RegistryAndToolsTests(unittest.TestCase):
             self.assertEqual(env["OPENCODE_DISABLE_MODELS_FETCH"], "1")
             self.assertEqual(env["OPENCODE_DISABLE_PROJECT_CONFIG"], "1")
             self.assertEqual(env["LOCAL_ASSIST_BASE_URL"], "http://127.0.0.1:8080/v1")
-            self.assertEqual(env["LOCAL_ASSIST_SESSION_TOKEN"], tok_val)
+            self.assertNotIn("LOCAL_ASSIST_SESSION_TOKEN", env)
             self.assertNotIn("LOCAL_ASSIST_ALLOW_ATTESTED_TEE", env)
             self.assertNotIn("LOCAL_ASSIST_ALLOW_UNCLEARED_TEE", env)
             self.assertNotIn("OPENAI_API_KEY", env)
@@ -3858,15 +3872,44 @@ class RegistryAndToolsTests(unittest.TestCase):
             self.assertTrue(pid_path.exists())
 
     def test_version_0_1_3_and_setup_modes(self) -> None:
+        import re
         import shutil
         import local_assist
         from local_assist.server import SERVER_INFO
 
         # 1. Version parity across __init__.py, server.py, package.json, and scripts/models --version (A4)
-        self.assertEqual(local_assist.__version__, "0.1.5")
-        self.assertEqual(SERVER_INFO["version"], "0.1.5")
+        self.assertEqual(local_assist.__version__, "0.2.0")
+        self.assertEqual(SERVER_INFO["version"], "0.2.0")
         pkg_json = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))
-        self.assertEqual(pkg_json["version"], "0.1.5")
+        self.assertEqual(pkg_json["version"], "0.2.0")
+
+        # 1b. Anchored release-hygiene.json scan.allow rule for Swift parameter label (Minor 4);
+        # release-hygiene.json is private-only and absent in exported public clones / CI.
+        def _verify_release_hygiene_if_present(repo_root: Path) -> bool:
+            rh_path = repo_root / "release-hygiene.json"
+            if not rh_path.is_file():
+                return False
+            rh_json = json.loads(rh_path.read_text(encoding="utf-8"))
+            allow_patterns = [re.compile(rx) for rx in rh_json.get("scan", {}).get("allow", [])]
+            swift_call_line = (
+                "            credentialEnvelope(" + "token" + ": activeSessionToken, generation: generation))"
+            )
+            secret_suffix_line = (
+                swift_call_line + " // " + "api_" + "key = " + "sk_live_" + "1234567890abcdef"
+            )
+            self.assertTrue(
+                any(rx.search(swift_call_line) for rx in allow_patterns),
+                "Exact Swift credentialEnvelope(...) call line must match an anchored scan.allow rule",
+            )
+            self.assertFalse(
+                any(rx.search(secret_suffix_line) for rx in allow_patterns),
+                "Line with trailing secret assignment must NOT be exempted by scan.allow!",
+            )
+            return True
+
+        _verify_release_hygiene_if_present(ROOT)
+        with tempfile.TemporaryDirectory() as empty_public_root:
+            self.assertFalse(_verify_release_hygiene_if_present(Path(empty_public_root)))
 
         # 2. requirements-local.txt closure check (Phase 2 / PLAN-MINOR-2 / WORK-MINOR-4)
         req_local_lines = [
@@ -4013,7 +4056,7 @@ class RegistryAndToolsTests(unittest.TestCase):
                 text=True,
                 check=True,
             )
-            self.assertEqual(models_ver_clean.stdout.strip(), "free-inference-lab 0.1.5")
+            self.assertEqual(models_ver_clean.stdout.strip(), "free-inference-lab 0.2.0")
 
             for launcher_rel in ("opencode-local", "opencode-attested"):
                 hlp = subprocess.run(
@@ -4613,7 +4656,12 @@ class RegistryAndToolsTests(unittest.TestCase):
             max_session_usd=None,
         )
         self.assertIn("remaining)", banner)
-        self.assertIn("--refresh-session", banner)
+        self.assertIn("./scripts/session status|renew|stop", banner)
+        session_meta['live_status'] = dict(state='ON', model_id=ep_att.model_id,
+            remaining_seconds=120, window_seconds=7200, requests_remaining=7, request_limit=10)
+        live_banner = oc_att.format_session_banner(ep_att, session_meta, max_session_usd=None)
+        self.assertIn('ttl_seconds=7200 (120s remaining)', live_banner)
+        self.assertIn('7/10 requests left', live_banner)
 
     def test_subagent_defaults_and_side_by_side_port_allocation(self) -> None:
         import io
@@ -5273,7 +5321,7 @@ class RegistryAndToolsTests(unittest.TestCase):
     def test_publish_and_run_opencode_per_invocation_isolation_and_lifecycle(self) -> None:
         import io
         import threading
-        from contextlib import redirect_stdout
+        from contextlib import redirect_stderr, redirect_stdout
         from local_assist.launch import (
             _prune_active_opencode_clients,
             publish_and_run_opencode,
@@ -5281,9 +5329,6 @@ class RegistryAndToolsTests(unittest.TestCase):
         from local_assist.registry import get_process_lstart
 
         ep_ds = resolve_endpoint(load_model("tinfoil-deepseek-v4-1-flash"), require_api_key=False)
-        ep_kimi = resolve_endpoint(
-            load_model("tinfoil-kimi-k3-1-pro"), require_api_key=False, port_override=8082
-        )
         my_lstart = get_process_lstart(os.getpid())
         self.assertTrue(my_lstart)
 
@@ -5293,15 +5338,24 @@ class RegistryAndToolsTests(unittest.TestCase):
             ws_dir = Path(tmp) / "ws"
             ws_dir.mkdir(parents=True)
 
-            # 1. Exclusive first launch writes shared opencode.json, runs service restart, does NOT inject --standalone,
-            #    and cleans up its per-invocation config and registry entry on exit.
-            service_cmds: list[list[str]] = []
-            popens_seen: list[tuple[list[str], dict[str, str]]] = []
+            # 1. Per-invocation launch provisions <iso_home>/.invocations/<inv_id>/opencode.json (0400)
+            #    and .config/opencode/service.json (0400), strips secret env vars, does NOT inject
+            #    --standalone, does NOT write shared iso_home/opencode.json, and removes <inv_dir> on exit.
+            popens_seen: list[tuple[list[str], dict[str, str], dict[str, Any], dict[str, Any]]] = []
 
             class _FakeCompletedPopen:
                 def __init__(self, cmd: list[str], cwd: str, env: dict[str, str]) -> None:
                     self.pid = os.getpid()
-                    popens_seen.append((list(cmd), dict(env)))
+                    cfg_p = Path(env["OPENCODE_CONFIG"])
+                    svc_p = Path(env["XDG_CONFIG_HOME"]) / "opencode" / "service.json"
+                    popens_seen.append(
+                        (
+                            list(cmd),
+                            dict(env),
+                            json.loads(cfg_p.read_text(encoding="utf-8")),
+                            json.loads(svc_p.read_text(encoding="utf-8")),
+                        )
+                    )
 
                 def wait(self) -> int:
                     return 0
@@ -5311,63 +5365,50 @@ class RegistryAndToolsTests(unittest.TestCase):
 
             rc_1 = publish_and_run_opencode(
                 opencode_bin="/usr/bin/opencode",
-                opencode_args=["run", "hello"],
+                opencode_args=["run", "--standalone", "hello"],
                 caller_cwd=ws_dir,
                 isolated_home=iso_home,
                 endpoint=ep_ds,
                 config_text=json.dumps({"model": "ds"}),
-                build_env_fn=lambda cfg_p: {"OPENCODE_CONFIG": str(cfg_p)},
+                build_env_fn=lambda cfg_p: {
+                    "OPENCODE_CONFIG": str(cfg_p),
+                    "OPENCODE_PASSWORD": "must-be-stripped",
+                    "LOCAL_ASSIST_SESSION_TOKEN": "se-session-must-be-stripped",
+                },
                 current_sync={"model_id": "tinfoil-deepseek-v4-1-flash", "startup_nonce": "n1"},
                 popen_fn=_FakeCompletedPopen,
-                run_service_cmd=lambda cmd, **kw: (
-                    service_cmds.append(list(cmd)) or subprocess.CompletedProcess(cmd, 0, "", "")
-                ),
             )
             self.assertEqual(rc_1, 0)
-            self.assertEqual(len(service_cmds), 1)
             self.assertEqual(popens_seen[0][0], ["/usr/bin/opencode", "run", "hello"])
-            self.assertEqual(
-                json.loads((iso_home / "opencode.json").read_text(encoding="utf-8")),
-                {"model": "ds"},
-            )
-            self.assertEqual(list((iso_home / ".configs").glob("*.json")), [])
+            seen_env = popens_seen[0][1]
+            self.assertNotIn("OPENCODE_PASSWORD", seen_env)
+            self.assertNotIn("LOCAL_ASSIST_SESSION_TOKEN", seen_env)
+            self.assertEqual(popens_seen[0][2], {"model": "ds"})
+            self.assertEqual(popens_seen[0][3]["hostname"], "127.0.0.1")
+            self.assertGreater(int(popens_seen[0][3]["port"]), 0)
+            self.assertTrue(popens_seen[0][3]["password"])
+            self.assertFalse((iso_home / "opencode.json").exists())
+            self.assertEqual(list((iso_home / ".invocations").iterdir()), [])
 
-            # 2. Pre-upgrade / unregistered daemon detection (R2-PLAN-MAJOR-1):
-            #    When .last-service-sync.json exists and .active-opencode-clients.json is absent,
-            #    has_unregistered_opencode_service returns True -> non-exclusive (--standalone injected,
-            #    shared opencode.json NOT overwritten, service restart NOT called)!
-            (iso_home / ".active-opencode-clients.json").unlink(missing_ok=True)
-            self.assertTrue((iso_home / ".last-service-sync.json").exists())
-            service_cmds.clear()
-            popens_seen.clear()
+            # 2. Disallowed daemon/external-server arguments fail closed (SIR1):
+            for bad_args in (["run", "--server", "http://127.0.0.1:4096", "hi"], ["service", "start"]):
+                err_buf = io.StringIO()
+                with redirect_stderr(err_buf):
+                    rc_bad = publish_and_run_opencode(
+                        opencode_bin="/usr/bin/opencode",
+                        opencode_args=list(bad_args),
+                        caller_cwd=ws_dir,
+                        isolated_home=iso_home,
+                        endpoint=ep_ds,
+                        config_text=json.dumps({"model": "ds"}),
+                        build_env_fn=lambda cfg_p: {"OPENCODE_CONFIG": str(cfg_p)},
+                        current_sync={"model_id": "tinfoil-deepseek-v4-1-flash"},
+                        popen_fn=_FakeCompletedPopen,
+                    )
+                self.assertEqual(rc_bad, 1)
 
-            rc_pre = publish_and_run_opencode(
-                opencode_bin="/usr/bin/opencode",
-                opencode_args=["run", "second"],
-                caller_cwd=ws_dir,
-                isolated_home=iso_home,
-                endpoint=ep_kimi,
-                config_text=json.dumps({"model": "kimi"}),
-                build_env_fn=lambda cfg_p: {"OPENCODE_CONFIG": str(cfg_p)},
-                current_sync={"model_id": "tinfoil-kimi-k3-1-pro", "startup_nonce": "n2"},
-                popen_fn=_FakeCompletedPopen,
-                run_service_cmd=lambda cmd, **kw: (
-                    service_cmds.append(list(cmd)) or subprocess.CompletedProcess(cmd, 0, "", "")
-                ),
-            )
-            self.assertEqual(rc_pre, 0)
-            self.assertEqual(len(service_cmds), 0)
-            self.assertEqual(
-                popens_seen[0][0], ["/usr/bin/opencode", "run", "--standalone", "second"]
-            )
-            # Shared opencode.json still holds {"model": "ds"}!
-            self.assertEqual(
-                json.loads((iso_home / "opencode.json").read_text(encoding="utf-8")),
-                {"model": "ds"},
-            )
-
-            # 3. Dead-wrapper with live-child retention AND unconfirmed "starting" (child_pid=None) retention
-            #    (R2-PLAN-MAJOR-2):
+            # 3. Direct _prune_active_opencode_clients retention helper check:
+            (iso_home / ".configs").mkdir(parents=True, exist_ok=True)
             live_child_cfg = iso_home / ".configs" / "opencode-live-child.json"
             live_child_cfg.write_text('{"model":"live-child"}\n', encoding="utf-8")
             starting_cfg = iso_home / ".configs" / "opencode-starting-orphan.json"
@@ -5421,14 +5462,11 @@ class RegistryAndToolsTests(unittest.TestCase):
             self.assertTrue(live_child_cfg.exists())
             self.assertTrue(starting_cfg.exists())
             self.assertFalse(dead_both_cfg.exists())
-
-            # 4. Synchronous popen_fn failure (OSError) before any child is spawned immediately
-            #    removes its own provisional "starting" record and per-invocation config file (R3-PLAN-MAJOR-1)!
-            reg_file.write_text("[]\n", encoding="utf-8")
-            (iso_home / ".last-service-sync.json").unlink(missing_ok=True)
             live_child_cfg.unlink(missing_ok=True)
             starting_cfg.unlink(missing_ok=True)
+            reg_file.unlink(missing_ok=True)
 
+            # 4. Synchronous popen_fn failure (OSError) immediately removes its per-invocation directory!
             def _failing_popen(*a: object, **kw: object) -> object:
                 raise OSError("Simulated exec failure before child exists")
 
@@ -5443,131 +5481,52 @@ class RegistryAndToolsTests(unittest.TestCase):
                     build_env_fn=lambda cfg_p: {"OPENCODE_CONFIG": str(cfg_p)},
                     current_sync={"model_id": "tinfoil-deepseek-v4-1-flash", "startup_nonce": "n3"},
                     popen_fn=_failing_popen,
-                    run_service_cmd=lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, "", ""),
                 )
-            self.assertEqual(json.loads(reg_file.read_text(encoding="utf-8")), [])
-            self.assertEqual(list((iso_home / ".configs").glob("*.json")), [])
+            self.assertEqual(list((iso_home / ".invocations").iterdir()), [])
 
-            # 5. Next-launch behavior when an unconfirmed "starting" (child_pid=None) row is retained (WORK-MINOR-4):
-            #    Asserts non-exclusive standalone execution, no shared opencode.json / .last-service-sync.json
-            #    write, and no service restart!
-            (iso_home / "opencode.json").write_text('{"model":"preserved-by-pending"}\n', encoding="utf-8")
-            (iso_home / ".last-service-sync.json").write_text('{"startup_nonce":"sync-before-pending"}\n', encoding="utf-8")
-            pending_cfg = iso_home / ".configs" / "opencode-pending.json"
-            pending_cfg.write_text('{"model":"pending"}\n', encoding="utf-8")
-            reg_file.write_text(
-                json.dumps(
-                    [
-                        {
-                            "invocation_id": "inv-pending-handoff",
-                            "launcher_pid": 999994,
-                            "launcher_lstart": "Thu Jan  1 00:00:00 1970",
-                            "child_pid": None,
-                            "child_lstart": None,
-                            "status": "starting",
-                            "model_id": "tinfoil-deepseek-v4-1-flash",
-                            "config_path": str(pending_cfg),
-                        }
-                    ]
-                ),
-                encoding="utf-8",
-            )
-            service_cmds.clear()
-            popens_seen.clear()
-            rc_after_pending = publish_and_run_opencode(
-                opencode_bin="/usr/bin/opencode",
-                opencode_args=["run", "after-pending"],
-                caller_cwd=ws_dir,
-                isolated_home=iso_home,
-                endpoint=ep_ds,
-                config_text=json.dumps({"model": "new-attempt"}),
-                build_env_fn=lambda cfg_p: {"OPENCODE_CONFIG": str(cfg_p)},
-                current_sync={"model_id": "tinfoil-deepseek-v4-1-flash", "startup_nonce": "sync-new"},
-                popen_fn=_FakeCompletedPopen,
-                run_service_cmd=lambda cmd, **kw: (
-                    service_cmds.append(list(cmd)) or subprocess.CompletedProcess(cmd, 0, "", "")
-                ),
-            )
-            self.assertEqual(rc_after_pending, 0)
-            self.assertEqual(service_cmds, [])
-            self.assertEqual(
-                popens_seen[0][0], ["/usr/bin/opencode", "run", "--standalone", "after-pending"]
-            )
-            self.assertEqual(
-                json.loads((iso_home / "opencode.json").read_text(encoding="utf-8")),
-                {"model": "preserved-by-pending"},
-            )
-            self.assertEqual(
-                json.loads((iso_home / ".last-service-sync.json").read_text(encoding="utf-8")),
-                {"startup_nonce": "sync-before-pending"},
-            )
-            pending_cfg.unlink(missing_ok=True)
-
-            # 6. Controlled ps_runner observer test with an existing empty registry ([]), a same-home
-            #    unregistered `opencode serve --service` daemon, and changed sync metadata (WORK-MAJOR-3):
-            #    Asserts no shared-config/sync write or service restart and standalone execution!
-            reg_file.write_text("[]\n", encoding="utf-8")
-            (iso_home / "opencode.json").write_text('{"model":"preserved-by-unreg-daemon"}\n', encoding="utf-8")
-            (iso_home / ".last-service-sync.json").write_text('{"startup_nonce":"sync-before-daemon"}\n', encoding="utf-8")
-            service_cmds.clear()
-            popens_seen.clear()
-
-            def _fake_ps_with_same_home_daemon(cmd: list[str], **kw: object) -> subprocess.CompletedProcess[str]:
-                return subprocess.CompletedProcess(
-                    cmd,
-                    0,
-                    stdout=f"88888 /opt/homebrew/bin/opencode serve --service OPENCODE_TEST_HOME={iso_home}\n",
-                    stderr="",
+            # 5. Uncontained legacy service.json gate fails closed without mutating files (SIR2)!
+            legacy_svc = iso_home / ".local" / "state" / "opencode" / "service.json"
+            legacy_svc.parent.mkdir(parents=True, exist_ok=True)
+            legacy_svc.write_text('{"pid": 999999, "port": 4096, "password": "pw"}\n', encoding="utf-8")
+            err_leg = io.StringIO()
+            with redirect_stderr(err_leg):
+                rc_leg = publish_and_run_opencode(
+                    opencode_bin="/usr/bin/opencode",
+                    opencode_args=["run", "blocked-by-legacy"],
+                    caller_cwd=ws_dir,
+                    isolated_home=iso_home,
+                    endpoint=ep_ds,
+                    config_text=json.dumps({"model": "ds"}),
+                    build_env_fn=lambda cfg_p: {"OPENCODE_CONFIG": str(cfg_p)},
+                    current_sync={"model_id": "tinfoil-deepseek-v4-1-flash"},
+                    popen_fn=_failing_popen,
                 )
+            self.assertEqual(rc_leg, 1)
+            self.assertIn("check-credential-containment", err_leg.getvalue())
+            self.assertTrue(legacy_svc.exists())
+            legacy_svc.unlink()
 
-            rc_unreg_daemon = publish_and_run_opencode(
-                opencode_bin="/usr/bin/opencode",
-                opencode_args=["run", "with-unreg-daemon"],
-                caller_cwd=ws_dir,
-                isolated_home=iso_home,
-                endpoint=ep_ds,
-                config_text=json.dumps({"model": "would-clobber"}),
-                build_env_fn=lambda cfg_p: {"OPENCODE_CONFIG": str(cfg_p)},
-                current_sync={"model_id": "tinfoil-deepseek-v4-1-flash", "startup_nonce": "sync-changed"},
-                popen_fn=_FakeCompletedPopen,
-                run_service_cmd=lambda cmd, **kw: (
-                    service_cmds.append(list(cmd)) or subprocess.CompletedProcess(cmd, 0, "", "")
-                ),
-                ps_runner=_fake_ps_with_same_home_daemon,
-            )
-            self.assertEqual(rc_unreg_daemon, 0)
-            self.assertEqual(service_cmds, [])
-            self.assertEqual(
-                popens_seen[0][0], ["/usr/bin/opencode", "run", "--standalone", "with-unreg-daemon"]
-            )
-            self.assertEqual(
-                json.loads((iso_home / "opencode.json").read_text(encoding="utf-8")),
-                {"model": "preserved-by-unreg-daemon"},
-            )
-            self.assertEqual(
-                json.loads((iso_home / ".last-service-sync.json").read_text(encoding="utf-8")),
-                {"startup_nonce": "sync-before-daemon"},
-            )
-
-            # 7. Overlapping same-model launches from two workspaces (ws_a and ws_b) with a blocked
-            #    fake child lifetime + concurrent --print-config while Client A is active (WORK-MINOR-4):
+            # 6. Overlapping launches from two workspaces (ws_a and ws_b) + concurrent --print-config:
             ws_a = Path(tmp) / "ws_a"
             ws_b = Path(tmp) / "ws_b"
             ws_a.mkdir(parents=True)
             ws_b.mkdir(parents=True)
-            reg_file.write_text("[]\n", encoding="utf-8")
-            service_cmds.clear()
 
             client_a_waiting = threading.Event()
             client_a_release = threading.Event()
-            overlap_records: dict[str, tuple[list[str], dict[str, str], dict[str, Any]]] = {}
+            overlap_records: dict[str, tuple[list[str], dict[str, str], dict[str, Any], dict[str, Any]]] = {}
 
             def _make_popen_for(tag: str, block: bool) -> Any:
                 class _TaggedPopen:
                     def __init__(self, cmd: list[str], cwd: str, env: dict[str, str]) -> None:
                         self.pid = os.getpid()
                         cfg_data = json.loads(Path(env["OPENCODE_CONFIG"]).read_text(encoding="utf-8"))
-                        overlap_records[tag] = (list(cmd), dict(env), cfg_data)
+                        svc_data = json.loads(
+                            (Path(env["XDG_CONFIG_HOME"]) / "opencode" / "service.json").read_text(
+                                encoding="utf-8"
+                            )
+                        )
+                        overlap_records[tag] = (list(cmd), dict(env), cfg_data, svc_data)
                         self._done = False
 
                     def wait(self) -> int:
@@ -5595,9 +5554,6 @@ class RegistryAndToolsTests(unittest.TestCase):
                     build_env_fn=lambda cfg_p: {"OPENCODE_CONFIG": str(cfg_p)},
                     current_sync={"model_id": "tinfoil-deepseek-v4-1-flash", "startup_nonce": "sync-a"},
                     popen_fn=_make_popen_for("A", block=True),
-                    run_service_cmd=lambda cmd, **kw: (
-                        service_cmds.append(list(cmd)) or subprocess.CompletedProcess(cmd, 0, "", "")
-                    ),
                 )
                 rc_holder.append(rc_a)
 
@@ -5606,17 +5562,11 @@ class RegistryAndToolsTests(unittest.TestCase):
             self.assertTrue(client_a_waiting.wait(timeout=5))
 
             try:
-                # Client A is active: verify it was exclusive owner and its per-invocation config exists
-                self.assertEqual(len(service_cmds), 1)
                 self.assertEqual(overlap_records["A"][0], ["/usr/bin/opencode", "run", "from-ws-a"])
                 cfg_a_path = Path(overlap_records["A"][1]["OPENCODE_CONFIG"])
                 self.assertTrue(cfg_a_path.exists())
-                self.assertEqual(
-                    json.loads((iso_home / "opencode.json").read_text(encoding="utf-8")),
-                    {"workspace": "ws_a", "model": "ds"},
-                )
 
-                # Run --print-config while Client A is active: must NOT overwrite shared opencode.json or Client A's config!
+                # Concurrent --print-config redacts apiKey, writes nothing, and leaves Client A intact!
                 print_buf = io.StringIO()
                 with redirect_stdout(print_buf):
                     rc_print = publish_and_run_opencode(
@@ -5625,25 +5575,33 @@ class RegistryAndToolsTests(unittest.TestCase):
                         caller_cwd=ws_b,
                         isolated_home=iso_home,
                         endpoint=ep_ds,
-                        config_text=json.dumps({"workspace": "print_preview", "model": "ds"}),
+                        config_text=json.dumps(
+                            {
+                                "workspace": "print_preview",
+                                "provider": {
+                                    "private-attested": {
+                                        "options": {"apiKey": "oc-relay-supersecret123456"}
+                                    }
+                                },
+                            }
+                        ),
                         build_env_fn=lambda cfg_p: {"OPENCODE_CONFIG": str(cfg_p)},
                         current_sync={"model_id": "tinfoil-deepseek-v4-1-flash", "startup_nonce": "sync-print"},
                         print_config=True,
                     )
                 self.assertEqual(rc_print, 0)
                 print_payload = json.loads(print_buf.getvalue())
-                self.assertNotEqual(Path(print_payload["opencode_config_path"]), iso_home / "opencode.json")
                 self.assertFalse(Path(print_payload["opencode_config_path"]).exists())
                 self.assertEqual(
-                    json.loads((iso_home / "opencode.json").read_text(encoding="utf-8")),
-                    {"workspace": "ws_a", "model": "ds"},
+                    print_payload["config"]["provider"]["private-attested"]["options"]["apiKey"],
+                    "[REDACTED_PER_INVOCATION_RELAY_TOKEN]",
                 )
                 self.assertEqual(
                     json.loads(cfg_a_path.read_text(encoding="utf-8")),
                     {"workspace": "ws_a", "model": "ds"},
                 )
 
-                # Launch overlapping same-model Client B from ws_b while Client A is still active:
+                # Concurrent Client B gets its own per-invocation directory, service port, and password WITHOUT --standalone!
                 rc_b = publish_and_run_opencode(
                     opencode_bin="/usr/bin/opencode",
                     opencode_args=["run", "from-ws-b"],
@@ -5654,37 +5612,23 @@ class RegistryAndToolsTests(unittest.TestCase):
                     build_env_fn=lambda cfg_p: {"OPENCODE_CONFIG": str(cfg_p)},
                     current_sync={"model_id": "tinfoil-deepseek-v4-1-flash", "startup_nonce": "sync-b"},
                     popen_fn=_make_popen_for("B", block=False),
-                    run_service_cmd=lambda cmd, **kw: (
-                        service_cmds.append(list(cmd)) or subprocess.CompletedProcess(cmd, 0, "", "")
-                    ),
                 )
                 self.assertEqual(rc_b, 0)
-                self.assertEqual(len(service_cmds), 1)
-                self.assertEqual(
-                    overlap_records["B"][0], ["/usr/bin/opencode", "run", "--standalone", "from-ws-b"]
-                )
+                self.assertEqual(overlap_records["B"][0], ["/usr/bin/opencode", "run", "from-ws-b"])
                 self.assertEqual(overlap_records["B"][2], {"workspace": "ws_b", "model": "ds"})
                 self.assertNotEqual(
                     overlap_records["A"][1]["OPENCODE_CONFIG"],
                     overlap_records["B"][1]["OPENCODE_CONFIG"],
                 )
-                # Client A's config file and shared opencode.json remain intact while Client A is still alive!
+                self.assertNotEqual(overlap_records["A"][3]["port"], overlap_records["B"][3]["port"])
+                self.assertNotEqual(overlap_records["A"][3]["password"], overlap_records["B"][3]["password"])
                 self.assertTrue(cfg_a_path.exists())
-                self.assertEqual(
-                    json.loads(cfg_a_path.read_text(encoding="utf-8")),
-                    {"workspace": "ws_a", "model": "ds"},
-                )
-                self.assertEqual(
-                    json.loads((iso_home / "opencode.json").read_text(encoding="utf-8")),
-                    {"workspace": "ws_a", "model": "ds"},
-                )
             finally:
                 client_a_release.set()
                 t_a.join(timeout=5)
 
             self.assertEqual(rc_holder, [0])
-            self.assertEqual(json.loads(reg_file.read_text(encoding="utf-8")), [])
-            self.assertEqual(list((iso_home / ".configs").glob("*.json")), [])
+            self.assertEqual(list((iso_home / ".invocations").iterdir()), [])
 
     def test_models_active_sessions_inspection_cli_and_json(self) -> None:
         import io
@@ -5900,6 +5844,1166 @@ class RegistryAndToolsTests(unittest.TestCase):
                 "attach:  ./scripts/opencode-attested --model tinfoil-kimi-k3-1-pro --allow-uncleared-model --port 8082",
                 txt,
             )
+
+    def test_privatemode_phase0_registry_client_timeout_and_manifest(self) -> None:
+        # 1. validate_custom_command_localhost supports --listen-address and rejects wildcard/missing
+        strict_cmd = [
+            "./bin/privatemode-proxy",
+            "--listen-address",
+            "127.0.0.1",
+            "--port",
+            "9082",
+            "--api-key-fallback=never",
+            "--manifest-path",
+            "config/privatemode-manifest-v1.63.0.json",
+            "--workspace",
+            ".home/privatemode-proxy",
+            "--disable-prompt-cache=false",
+            "--prompt-cache-salt=random",
+            "--nvidia-ocsp-allow-unknown=false",
+            "--nvidia-ocsp-revoked-grace-period=0",
+        ]
+        self.assertIsNone(
+            validate_custom_command_localhost(strict_cmd, expected_port=9082)
+        )
+        eq_cmd = [
+            "./bin/privatemode-proxy",
+            "--listen-address=127.0.0.1",
+            "--port=9082",
+            "--api-key-fallback=never",
+        ]
+        self.assertIsNone(
+            validate_custom_command_localhost(eq_cmd, expected_port=9082)
+        )
+        for bad_cmd in (
+            ["./bin/privatemode-proxy", "--listen-address", "0.0.0.0", "--port", "9082"],
+            ["./bin/privatemode-proxy", "--listen-address=0.0.0.0", "--port", "9082"],
+            ["./bin/privatemode-proxy", "--listen-address", "192.168.1.5", "--port", "9082"],
+            ["./bin/privatemode-proxy", "--port", "9082", "--api-key-fallback=never"],
+        ):
+            self.assertIsNotNone(
+                validate_custom_command_localhost(bad_cmd, expected_port=9082),
+                f"Expected rejection for {bad_cmd}",
+            )
+
+        # 2. _resolve_effective_connection shared-port admission on :8082
+        pm_flash_cleared = {
+            "id": "privatemode-glm-5-3-flash",
+            "repo": "glm-5.3-flash",
+            "runtime": "proxy",
+            "status": "active",
+            "serve_command": " ".join(strict_cmd),
+            "capabilities": {"tool_calling": True},
+            "routing": {"private_local": "blocked", "private_attested": "cleared"},
+            "eval_evidence_artifact": "docs/evals/privatemode-glm-5-3-flash.json",
+            "promptfoo_provider": {
+                "id": "openai:chat:glm-5.3-flash",
+                "apiBaseUrl": "http://127.0.0.1:8082/v1",
+                "apiKeyKeychainService": "free-inference.privatemode",
+            },
+            "remote_trust": {
+                "tier": "enclave_runtime_attested",
+                "attestation_method": "privatemode-proxy-contrast",
+                "usage_policy": "provider_terms_apply",
+            },
+        }
+        pm_full_blocked = {
+            "id": "privatemode-glm-5-3",
+            "repo": "glm-5.3",
+            "runtime": "proxy",
+            "status": "candidate",
+            "serve_command": " ".join(strict_cmd),
+            "capabilities": {"tool_calling": True},
+            "routing": {"private_local": "blocked", "private_attested": "blocked"},
+            "promptfoo_provider": {
+                "id": "openai:chat:glm-5.3",
+                "apiBaseUrl": "http://127.0.0.1:8082/v1",
+                "apiKeyKeychainService": "free-inference.privatemode",
+            },
+            "remote_trust": {
+                "tier": "enclave_runtime_attested",
+                "attestation_method": "privatemode-proxy-contrast",
+                "usage_policy": "provider_terms_apply",
+            },
+        }
+        std_on_8082 = {
+            "id": "bad-std-8082",
+            "repo": "std-model",
+            "runtime": "proxy",
+            "promptfoo_provider": {
+                "id": "openai:chat:std-model",
+                "apiBaseUrl": "http://127.0.0.1:8082/v1",
+                "upstreamBaseUrl": "https://api.example.com/v1",
+                "apiKeyKeychainService": "free-inference.std",
+            },
+            "remote_trust": {"tier": "standard_api"},
+        }
+        saved_base = os.environ.pop("LOCAL_ASSIST_BASE_URL", None)
+        saved_tee = os.environ.pop("LOCAL_ASSIST_ALLOW_ATTESTED_TEE", None)
+        saved_unc = os.environ.pop("LOCAL_ASSIST_ALLOW_UNCLEARED_TEE", None)
+        try:
+            with (
+                patch(
+                    "local_assist.registry._is_valid_committed_eval_artifact_path",
+                    return_value=True,
+                ),
+                patch(
+                    "local_assist.client.load_models",
+                    return_value=[pm_flash_cleared, pm_full_blocked],
+                ),
+            ):
+                os.environ["LOCAL_ASSIST_ALLOW_ATTESTED_TEE"] = "1"
+                # Explicitly requesting the cleared model on :8082 succeeds despite blocked Rung 3 sibling
+                self.assertEqual(
+                    client_base_url("privatemode-glm-5-3-flash"),
+                    "http://127.0.0.1:8082/v1",
+                )
+                # Requesting the uncleared sibling on :8082 still fails with routing_gate_blocked
+                with self.assertRaises(LocalAssistError) as ctx_unc:
+                    client_base_url("privatemode-glm-5-3")
+                self.assertEqual(ctx_unc.exception.code, "routing_gate_blocked")
+                # Unqualified override (model=None) to :8082 fails when any model on :8082 is uncleared
+                os.environ["LOCAL_ASSIST_BASE_URL"] = "http://127.0.0.1:8082/v1"
+                with self.assertRaises(LocalAssistError) as ctx_unqual:
+                    client_base_url(None)
+                self.assertEqual(ctx_unqual.exception.code, "routing_gate_blocked")
+                os.environ.pop("LOCAL_ASSIST_BASE_URL", None)
+
+            # Mixing standard_api on :8082 still blocks even the cleared Rung 3 model (port homogeneity)
+            with (
+                patch(
+                    "local_assist.registry._is_valid_committed_eval_artifact_path",
+                    return_value=True,
+                ),
+                patch(
+                    "local_assist.client.load_models",
+                    return_value=[pm_flash_cleared, std_on_8082],
+                ),
+            ):
+                os.environ["LOCAL_ASSIST_ALLOW_ATTESTED_TEE"] = "1"
+                with self.assertRaises(LocalAssistError) as ctx_mixed:
+                    client_base_url("privatemode-glm-5-3-flash")
+                self.assertEqual(ctx_mixed.exception.code, "trust_tier_blocked")
+        finally:
+            if saved_base is not None:
+                os.environ["LOCAL_ASSIST_BASE_URL"] = saved_base
+            else:
+                os.environ.pop("LOCAL_ASSIST_BASE_URL", None)
+            if saved_tee is not None:
+                os.environ["LOCAL_ASSIST_ALLOW_ATTESTED_TEE"] = saved_tee
+            else:
+                os.environ.pop("LOCAL_ASSIST_ALLOW_ATTESTED_TEE", None)
+            if saved_unc is not None:
+                os.environ["LOCAL_ASSIST_ALLOW_UNCLEARED_TEE"] = saved_unc
+            else:
+                os.environ.pop("LOCAL_ASSIST_ALLOW_UNCLEARED_TEE", None)
+
+        # 3. verify-served-model cold-attestation probe timeout helper
+        verify_mod = _load_script_module("verify_served_model_pm", "scripts/verify-served-model")
+        local_ep = resolve_endpoint(load_model("qwen3-30b-a3b-2507-mlx-4bit"), require_api_key=False)
+        proxy_ep = resolve_endpoint(pm_full_blocked, require_api_key=False)
+        self.assertEqual(verify_mod.compute_probe_timeout_seconds(local_ep, wait_seconds=0.0, remaining_seconds=0.0), 5.0)
+        self.assertEqual(verify_mod.compute_probe_timeout_seconds(local_ep, wait_seconds=60.0, remaining_seconds=45.0), 5.0)
+        self.assertEqual(verify_mod.compute_probe_timeout_seconds(proxy_ep, wait_seconds=0.0, remaining_seconds=0.0), 15.0)
+        self.assertEqual(verify_mod.compute_probe_timeout_seconds(proxy_ep, wait_seconds=60.0, remaining_seconds=60.0), 30.0)
+        self.assertEqual(verify_mod.compute_probe_timeout_seconds(proxy_ep, wait_seconds=20.0, remaining_seconds=18.0), 18.0)
+
+        # 4. Pinned Contrast v1.63.0 manifest integrity and builder script presence
+        manifest_path = ROOT / "config" / "privatemode-manifest-v1.63.0.json"
+        self.assertTrue(manifest_path.is_file(), "Expected config/privatemode-manifest-v1.63.0.json")
+        manifest_bytes = manifest_path.read_bytes()
+        self.assertEqual(
+            hashlib.sha256(manifest_bytes).hexdigest(),
+            "5fa927e3b864738da35d427c10ba8e49ebeeb1531e49618899cf95f654d240c1",
+        )
+        manifest_json = json.loads(manifest_bytes.decode("utf-8"))
+        self.assertIsInstance(manifest_json, dict)
+        self.assertTrue(manifest_json.get("ReferenceValues"))
+        self.assertTrue(manifest_json.get("Policies"))
+
+        builder_path = ROOT / "scripts" / "build-privatemode-proxy"
+        self.assertTrue(builder_path.is_file() and os.access(builder_path, os.X_OK))
+        help_cp = subprocess.run(
+            [str(builder_path), "--help"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        )
+        self.assertIn("2634ffb82c72339902f26ae071db513add2bdc2f", help_cp.stdout)
+        self.assertIn("5fa927e3b864738da35d427c10ba8e49ebeeb1531e49618899cf95f654d240c1", help_cp.stdout)
+        self.assertIn("--nvidia-ocsp-revoked-grace-period=0", help_cp.stdout)
+
+        # 5. PM1 & PM2 offline unit checks for build-privatemode-proxy helpers
+        builder_mod = _load_script_module("build_privatemode_proxy_mod", "scripts/build-privatemode-proxy")
+        verified_bytes = builder_mod.verify_committed_manifest(manifest_path)
+        self.assertEqual(verified_bytes, manifest_bytes)
+
+        class _FakeResp:
+            def __init__(self, payload: bytes) -> None:
+                self._payload = payload
+
+            def __enter__(self) -> "_FakeResp":
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> None:
+                return None
+
+            def read(self) -> bytes:
+                return self._payload
+
+        # Valid release asset bytes pass
+        with patch.object(builder_mod, "urlopen", return_value=_FakeResp(manifest_bytes)):
+            builder_mod.fetch_and_verify_release_manifest(manifest_bytes)
+
+        # Wrong manifest (e.g. chat/static/manifest.json PWA manifest or tampered bytes) fails closed
+        pwa_manifest = b'{"name": "Privatemode Chat", "icons": []}\n'
+        with patch.object(builder_mod, "urlopen", return_value=_FakeResp(pwa_manifest)):
+            with self.assertRaises(RuntimeError) as ctx_pwa:
+                builder_mod.fetch_and_verify_release_manifest(manifest_bytes)
+            self.assertIn("Release asset manifest SHA-256 mismatch", str(ctx_pwa.exception))
+
+        with tempfile.TemporaryDirectory(prefix="pm-builder-test-") as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            good_bin = tmp_path / "good-proxy"
+            good_bin.write_text(
+                f"#!{sys.executable}\n"
+                "import signal, socket, sys, time\n"
+                "args = sys.argv[1:]\n"
+                "if '--nvidia-ocsp-allow-unknown=false' in args and '--nvidia-ocsp-revoked-grace-period=0' not in args:\n"
+                "    sys.stderr.write('unknown OCSP statuses are disallowed, but revoked statuses are allowed\\n')\n"
+                "    sys.exit(1)\n"
+                "port = int(args[args.index('--port') + 1])\n"
+                "sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+                "sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+                "sock.bind(('127.0.0.1', port))\n"
+                "sock.listen(1)\n"
+                "signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))\n"
+                "time.sleep(10)\n",
+                encoding="utf-8",
+            )
+            good_bin.chmod(0o755)
+            good_receipt = builder_mod.run_strict_ocsp_config_check(
+                good_bin,
+                manifest_path=manifest_path,
+                timeout_seconds=3.0,
+            )
+            self.assertIsInstance(good_receipt, dict)
+            self.assertTrue(good_receipt["passed"])
+            self.assertEqual(
+                good_receipt["outbound_network_enforcement"],
+                "seatbelt_deny_network_outbound",
+            )
+            self.assertEqual(
+                good_receipt["listener_inspection"],
+                "lsof_pid_tcp_table",
+            )
+            self.assertEqual(
+                good_receipt["observed_tcp_sockets"],
+                [f"127.0.0.1:{good_receipt['port']} (LISTEN)"],
+            )
+            self.assertFalse(good_receipt["sigkill_escalated"])
+            self.assertIn(good_receipt["sigterm_exit_code"], (0, -15))
+
+            bad_bin = tmp_path / "bad-proxy"
+            bad_bin.write_text(
+                f"#!{sys.executable}\n"
+                "import sys\n"
+                "sys.stderr.write('unknown OCSP statuses are disallowed, but revoked statuses are allowed\\n')\n"
+                "sys.exit(1)\n",
+                encoding="utf-8",
+            )
+            bad_bin.chmod(0o755)
+            with self.assertRaises(RuntimeError) as ctx_ocsp:
+                builder_mod.run_strict_ocsp_config_check(
+                    bad_bin,
+                    manifest_path=manifest_path,
+                    timeout_seconds=3.0,
+                )
+            self.assertIn("revoked statuses are allowed", str(ctx_ocsp.exception))
+
+            # PM-W1 negative (a): listener ignores SIGTERM and requires SIGKILL escalation
+            ignore_sigterm_bin = tmp_path / "ignore-sigterm-proxy"
+            ignore_sigterm_bin.write_text(
+                f"#!{sys.executable}\n"
+                "import signal, socket, sys, time\n"
+                "args = sys.argv[1:]\n"
+                "port = int(args[args.index('--port') + 1])\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                "sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+                "sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+                "sock.bind(('127.0.0.1', port))\n"
+                "sock.listen(1)\n"
+                "time.sleep(10)\n",
+                encoding="utf-8",
+            )
+            ignore_sigterm_bin.chmod(0o755)
+            with self.assertRaises(RuntimeError) as ctx_ign:
+                builder_mod.run_strict_ocsp_config_check(
+                    ignore_sigterm_bin,
+                    manifest_path=manifest_path,
+                    timeout_seconds=3.0,
+                    sigterm_timeout_seconds=0.4,
+                )
+            self.assertIn("SIGKILL", str(ctx_ign.exception))
+
+            # PM-W1 negative (b): listener traps SIGTERM and exits with non-zero error status
+            bad_sigterm_bin = tmp_path / "bad-sigterm-proxy"
+            bad_sigterm_bin.write_text(
+                f"#!{sys.executable}\n"
+                "import signal, socket, sys, time\n"
+                "args = sys.argv[1:]\n"
+                "port = int(args[args.index('--port') + 1])\n"
+                "signal.signal(signal.SIGTERM, lambda *_: sys.exit(2))\n"
+                "sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+                "sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+                "sock.bind(('127.0.0.1', port))\n"
+                "sock.listen(1)\n"
+                "time.sleep(10)\n",
+                encoding="utf-8",
+            )
+            bad_sigterm_bin.chmod(0o755)
+            with self.assertRaises(RuntimeError) as ctx_bad_term:
+                builder_mod.run_strict_ocsp_config_check(
+                    bad_sigterm_bin,
+                    manifest_path=manifest_path,
+                    timeout_seconds=3.0,
+                )
+            self.assertIn("exit status", str(ctx_bad_term.exception))
+
+            # PM-W2 negative (c): wildcard listener (0.0.0.0:<port>) is rejected by lsof inspection
+            wildcard_bin = tmp_path / "wildcard-proxy"
+            wildcard_bin.write_text(
+                f"#!{sys.executable}\n"
+                "import signal, socket, sys, time\n"
+                "args = sys.argv[1:]\n"
+                "port = int(args[args.index('--port') + 1])\n"
+                "signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))\n"
+                "sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+                "sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+                "sock.bind(('0.0.0.0', port))\n"
+                "sock.listen(1)\n"
+                "time.sleep(10)\n",
+                encoding="utf-8",
+            )
+            wildcard_bin.chmod(0o755)
+            with self.assertRaises(RuntimeError) as ctx_wild:
+                builder_mod.run_strict_ocsp_config_check(
+                    wildcard_bin,
+                    manifest_path=manifest_path,
+                    timeout_seconds=3.0,
+                )
+            self.assertIn("non-loopback or unexpected TCP socket", str(ctx_wild.exception))
+
+            # PM-W2 negative (d): forbidden outbound connection attempt is blocked by Seatbelt
+            import select as _select
+            import socket as _host_sock
+
+            with _host_sock.socket(_host_sock.AF_INET, _host_sock.SOCK_STREAM) as aux_srv:
+                aux_srv.bind(("127.0.0.1", 0))
+                aux_srv.listen(1)
+                aux_port = int(aux_srv.getsockname()[1])
+                outbound_bin = tmp_path / "outbound-proxy"
+                outbound_bin.write_text(
+                    f"#!{sys.executable}\n"
+                    "import signal, socket, sys, time\n"
+                    "args = sys.argv[1:]\n"
+                    "port = int(args[args.index('--port') + 1])\n"
+                    "c = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+                    "c.settimeout(1.0)\n"
+                    f"c.connect(('127.0.0.1', {aux_port}))\n"
+                    "sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+                    "sock.bind(('127.0.0.1', port))\n"
+                    "sock.listen(1)\n"
+                    "signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))\n"
+                    "time.sleep(10)\n",
+                    encoding="utf-8",
+                )
+                outbound_bin.chmod(0o755)
+                with self.assertRaises(RuntimeError) as ctx_out:
+                    builder_mod.run_strict_ocsp_config_check(
+                        outbound_bin,
+                        manifest_path=manifest_path,
+                        timeout_seconds=3.0,
+                    )
+                self.assertIn("Operation not permitted", str(ctx_out.exception))
+                readable, _, _ = _select.select([aux_srv], [], [], 0.05)
+                self.assertEqual(readable, [])
+
+        # 6. scripts/setup --help advertises --with-privatemode while preserving default modes
+        setup_help = subprocess.run(
+            [str(ROOT / "scripts" / "setup"), "--help"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=True,
+        )
+        self.assertIn("--with-privatemode", setup_help.stdout)
+
+    def test_opencode_smoke_seatbelt_isolation_and_workspace_plan(self) -> None:
+        smoke_mod = _load_script_module("opencode_smoke_ssi", ROOT / "scripts" / "opencode-smoke")
+        manifest_mod = _load_script_module("gen_eval_manifest_ssi", ROOT / "scripts" / "generate-eval-manifest")
+        from local_assist.se_key import scan_and_redact_directory_tokens
+
+        active_tok = "se-session-" + ("c" * 32)
+        old_tok = "se-session-" + ("d" * 32)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_root = Path(tmp) / "repo"
+            out_dir = tmp_root / "runs" / "smoke-run-1"
+            repo_home = tmp_root / ".home"
+            external_hf = Path(tmp) / "external-hf-cache"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            repo_home.mkdir(parents=True, exist_ok=True)
+            external_hf.mkdir(parents=True, exist_ok=True)
+
+            # Create protected sibling trees, cache trees, symlinked huggingface, and permitted proxy workspace
+            attested_dir = repo_home / "opencode-private-attested"
+            dogfood_dir = repo_home / "dogfood"
+            go_build_dir = repo_home / "go-build"
+            pm_ws_dir = repo_home / "privatemode-proxy"
+            for d in (attested_dir, dogfood_dir, go_build_dir, pm_ws_dir):
+                d.mkdir(parents=True, exist_ok=True)
+            (repo_home / "huggingface").symlink_to(external_hf)
+
+            existing_attested = attested_dir / "existing.bin"
+            orig_bytes = b"ORIGINAL-ATTESTED-DB-" + old_tok.encode("utf-8")
+            existing_attested.write_bytes(orig_bytes)
+            orig_stat = existing_attested.stat()
+
+            (dogfood_dir / "obs.json").write_text(f'{{"note": "{old_tok}"}}\n', encoding="utf-8")
+            go_blob = go_build_dir / "cache.blob"
+            go_blob.write_bytes(b"GO-CACHE-BLOB")
+            hf_blob = external_hf / "weights.safetensors"
+            hf_blob.write_bytes(b"HF-WEIGHTS")
+
+            # 1. SSI3: Forbidden --workspace paths are rejected fail-closed by build_smoke_scan_plan
+            for bad_ws in (
+                ".home",
+                ".home/opencode-private-attested",
+                ".home/opencode-private-attested/nested",
+                ".home/opencode-private-local",
+                ".home/dogfood",
+                ".home/workers",
+                ".home/.promptfoo",
+                ".home/go-build",
+                ".home/.npm",
+                ".home/huggingface",
+                str(external_hf),
+                str(external_hf / "sub"),
+                ".",
+            ):
+                bad_model = {
+                    "id": "bad-ws-model",
+                    "runtime": "proxy",
+                    "serve_command": f"./bin/privatemode-proxy --listen-address 127.0.0.1 --port 9082 --workspace {bad_ws}",
+                }
+                with self.assertRaises(ValueError, msg=f"Expected ValueError for workspace={bad_ws}"):
+                    smoke_mod.build_smoke_scan_plan(out_dir, tmp_root, bad_model)
+
+            # Dangling --workspace without value also fails closed
+            with self.assertRaises(ValueError):
+                smoke_mod.build_smoke_scan_plan(
+                    out_dir,
+                    tmp_root,
+                    {"id": "dangling-ws", "runtime": "proxy", "serve_command": "./bin/privatemode-proxy --workspace"},
+                )
+
+            # 2. Permitted workspaces (.home/privatemode-proxy and external runs/custom-proxy-ws) succeed
+            good_model = {
+                "id": "good-pm-model",
+                "runtime": "proxy",
+                "serve_command": "./bin/privatemode-proxy --listen-address 127.0.0.1 --port 9082 --workspace .home/privatemode-proxy",
+            }
+            roots_good, excl_good = smoke_mod.build_smoke_scan_plan(out_dir, tmp_root, good_model)
+            self.assertEqual(roots_good, [out_dir, repo_home, pm_ws_dir])
+
+            # Historical tokens in opencode-private-attested and dogfood are ignored while out_dir + pm_ws_dir are scanned
+            (out_dir / "clean.txt").write_text("clean smoke output\n", encoding="utf-8")
+            clean_scan = scan_and_redact_directory_tokens(
+                roots_good,
+                excluded_dir_names=excl_good,
+                active_session_token=active_tok,
+            )
+            self.assertEqual(clean_scan["matches_found"], 0)
+            self.assertEqual(clean_scan["active_token_matches_found"], 0)
+            self.assertEqual(clean_scan["skipped_roots"], [])
+
+            # Active token leaked into .home/privatemode-proxy or external runs/custom-proxy-ws IS caught exactly once
+            (pm_ws_dir / "leak.bin").write_bytes(b"leak:" + active_tok.encode("utf-8"))
+            leak_scan = scan_and_redact_directory_tokens(
+                roots_good,
+                excluded_dir_names=excl_good,
+                active_session_token=active_tok,
+            )
+            self.assertEqual(leak_scan["matches_found"], 1)
+            self.assertEqual(leak_scan["active_token_matches_found"], 1)
+            (pm_ws_dir / "leak.bin").unlink()
+
+            # SSI-W1: Permitted external workspace alias (.home/privatemode-proxy -> external dir)
+            # resolves to canonical target, refuses discovered symlink traversal during .home walk,
+            # skips protected homes, and detects a synthetic active token in the external workspace once.
+            pm_ws_dir.rmdir()
+            permitted_ext_ws = Path(tmp) / "permitted-external-pm-ws"
+            permitted_ext_ws.mkdir(parents=True, exist_ok=True)
+            (permitted_ext_ws / "proxy_state.bin").write_bytes(b"STATE:" + active_tok.encode("utf-8"))
+            pm_ws_dir.symlink_to(permitted_ext_ws)
+            try:
+                roots_alias, excl_alias = smoke_mod.build_smoke_scan_plan(out_dir, tmp_root, good_model)
+                self.assertIn(permitted_ext_ws.resolve(), roots_alias)
+                self.assertNotIn(pm_ws_dir, roots_alias)
+                alias_scan = scan_and_redact_directory_tokens(
+                    roots_alias,
+                    excluded_dir_names=excl_alias,
+                    active_session_token=active_tok,
+                )
+                self.assertEqual(alias_scan["skipped_roots"], [])
+                self.assertEqual(alias_scan["matches_found"], 1)
+                self.assertEqual(alias_scan["active_token_matches_found"], 1)
+                alias_excl = {item["path"]: item["reason"] for item in alias_scan["excluded_dirs"]}
+                self.assertEqual(alias_excl.get(str(repo_home / "privatemode-proxy")), "symlink_dir")
+
+                # Pointing .home/privatemode-proxy at a protected home or dangling target fails closed
+                pm_ws_dir.unlink()
+                pm_ws_dir.symlink_to(attested_dir)
+                with self.assertRaises(ValueError):
+                    smoke_mod.build_smoke_scan_plan(out_dir, tmp_root, good_model)
+
+                pm_ws_dir.unlink()
+                pm_ws_dir.symlink_to(Path(tmp) / "dangling-missing-ws")
+                with self.assertRaises(ValueError):
+                    smoke_mod.build_smoke_scan_plan(out_dir, tmp_root, good_model)
+
+                # Symlinked out_dir also fails closed
+                symlink_out = tmp_root / "runs" / "symlink-smoke-out"
+                symlink_out.symlink_to(out_dir)
+                with self.assertRaises(ValueError):
+                    smoke_mod.build_smoke_scan_plan(symlink_out, tmp_root, good_model)
+                symlink_out.unlink()
+            finally:
+                if pm_ws_dir.is_symlink():
+                    pm_ws_dir.unlink()
+                pm_ws_dir.mkdir(parents=True, exist_ok=True)
+
+            ext_ws = tmp_root / "runs" / "custom-proxy-ws"
+            ext_ws.mkdir(parents=True, exist_ok=True)
+            (ext_ws / "ext.bin").write_bytes(active_tok.encode("utf-8"))
+            ext_model = {
+                "id": "ext-ws-model",
+                "runtime": "proxy",
+                "serve_command": "./bin/privatemode-proxy --listen-address 127.0.0.1 --port 9082 --workspace=runs/custom-proxy-ws",
+            }
+            roots_ext, excl_ext = smoke_mod.build_smoke_scan_plan(out_dir, tmp_root, ext_model)
+            self.assertIn(ext_ws, roots_ext)
+            ext_scan = scan_and_redact_directory_tokens(
+                roots_ext,
+                excluded_dir_names=excl_ext,
+                active_session_token=active_tok,
+            )
+            self.assertEqual(ext_scan["matches_found"], 1)
+            self.assertEqual(ext_scan["active_token_matches_found"], 1)
+
+            # 3. Missing sandbox-exec on darwin fails closed; evaluate_smoke_gate rejects smoke_seatbelt_ok=False,
+            #    scan_roots_ok=False, and active_token_matches>0
+            _, sb_ok_missing, sb_err_missing = smoke_mod.wrap_command_with_smoke_seatbelt(
+                ["echo", "hi"],
+                "(version 1)\n(allow default)\n",
+                platform_name="darwin",
+                sandbox_exec_path=str(tmp_root / "missing-sandbox-exec"),
+            )
+            self.assertFalse(sb_ok_missing)
+            self.assertIsNotNone(sb_err_missing)
+
+            good_events = {
+                "llm_step_count": 1,
+                "read_tool_called": True,
+                "only_read_tool_called": True,
+                "read_target_only": True,
+                "token_in_tool_output": True,
+                "token_verified": True,
+                "denied_or_error_count": 0,
+            }
+            for bad_gate_kw in (
+                {"smoke_seatbelt_ok": False},
+                {"scan_roots_ok": False},
+                {"active_token_matches": 1},
+            ):
+                gate_check = smoke_mod.evaluate_smoke_gate(
+                    returncode=0,
+                    opencode_host_dirs_unchanged=True,
+                    observer_available=True,
+                    observer_errors=[],
+                    run_poll_count=3,
+                    run_positive_socket_samples=1,
+                    run_parsed_socket_lines=1,
+                    non_localhost_lines=[],
+                    unconnected_udp_lines=[],
+                    forwarder_bound_localhost=True,
+                    server_request_count=2,
+                    blocked_chat_requests=0,
+                    max_chat_requests=3,
+                    parsed_events=good_events,
+                    **bad_gate_kw,
+                )
+                self.assertFalse(gate_check["passed"], f"Expected gate failure for {bad_gate_kw}")
+
+            # 4. SSI1 & SSI2: Live Darwin Seatbelt enforcement blocks reads, same-size+restored-mtime overwrites,
+            #    cache writes (go-build), and symlinked target writes (huggingface), while allowing out_dir writes
+            #    and unaffected concurrent independent writes to opencode-private-attested.
+            import shutil as _shutil
+
+            sandbox_exec = _shutil.which("sandbox-exec")
+            if sys.platform == "darwin" and sandbox_exec:
+                profile = smoke_mod.build_smoke_seatbelt_profile(tmp_root)
+                probe_script = (
+                    "import json, os, pathlib, sys\n"
+                    f"existing = pathlib.Path({str(existing_attested)!r})\n"
+                    f"go_blob = pathlib.Path({str(go_blob)!r})\n"
+                    f"hf_blob = pathlib.Path({str(hf_blob)!r})\n"
+                    f"out_ok = pathlib.Path({str(out_dir / 'child_ok.txt')!r})\n"
+                    "results = {}\n"
+                    "try:\n"
+                    "    existing.read_bytes()\n"
+                    "    results['read_attested'] = 'allowed'\n"
+                    "except PermissionError:\n"
+                    "    results['read_attested'] = 'denied'\n"
+                    "try:\n"
+                    f"    with open(existing, 'r+b') as fh:\n"
+                    f"        fh.write(b'X' * {len(orig_bytes)})\n"
+                    f"    os.utime(existing, ns=({orig_stat.st_atime_ns}, {orig_stat.st_mtime_ns}))\n"
+                    "    results['overwrite_same_size'] = 'allowed'\n"
+                    "except PermissionError:\n"
+                    "    results['overwrite_same_size'] = 'denied'\n"
+                    "try:\n"
+                    "    go_blob.write_bytes(b'MUTATED')\n"
+                    "    results['write_go_build'] = 'allowed'\n"
+                    "except PermissionError:\n"
+                    "    results['write_go_build'] = 'denied'\n"
+                    "try:\n"
+                    "    hf_blob.write_bytes(b'MUTATED')\n"
+                    "    results['write_hf_symlink'] = 'allowed'\n"
+                    "except PermissionError:\n"
+                    "    results['write_hf_symlink'] = 'denied'\n"
+                    "out_ok.write_text('allowed-in-out-dir\\n', encoding='utf-8')\n"
+                    "results['write_out_dir'] = 'allowed'\n"
+                    "print(json.dumps(results))\n"
+                )
+                wrapped_cmd, sb_ok, sb_err = smoke_mod.wrap_command_with_smoke_seatbelt(
+                    [sys.executable, "-I", "-B", "-c", probe_script],
+                    profile,
+                    platform_name="darwin",
+                    sandbox_exec_path=sandbox_exec,
+                )
+                self.assertTrue(sb_ok, sb_err)
+                # Concurrent independent write outside the Seatbelt child succeeds without affecting the child or scan
+                (attested_dir / "concurrent_session.log").write_text(f"live {old_tok}\n", encoding="utf-8")
+                proc = subprocess.run(wrapped_cmd, capture_output=True, text=True, timeout=10, check=True)
+                observed = json.loads(proc.stdout.strip())
+                self.assertEqual(
+                    observed,
+                    {
+                        "read_attested": "denied",
+                        "overwrite_same_size": "denied",
+                        "write_go_build": "denied",
+                        "write_hf_symlink": "denied",
+                        "write_out_dir": "allowed",
+                    },
+                )
+                self.assertEqual(existing_attested.read_bytes(), orig_bytes)
+                self.assertEqual(go_blob.read_bytes(), b"GO-CACHE-BLOB")
+                self.assertEqual(hf_blob.read_bytes(), b"HF-WEIGHTS")
+
+                post_scan = scan_and_redact_directory_tokens(
+                    roots_good,
+                    excluded_dir_names=excl_good,
+                    active_session_token=active_tok,
+                )
+                self.assertEqual(post_scan["matches_found"], 0)
+                self.assertEqual(post_scan["active_token_matches_found"], 0)
+
+            # 5. _sanitize_token_scan preserves historical shape when active_token_checked is absent,
+            #    and includes active_token_checked / active_token_matches_found when present.
+            legacy_sanitized = manifest_mod._sanitize_token_scan(
+                {
+                    "files_scanned": 5,
+                    "bytes_scanned": 100,
+                    "matches_found": 0,
+                    "redactions_applied": 0,
+                    "remaining_unredacted_matches": 0,
+                }
+            )
+            self.assertNotIn("active_token_checked", legacy_sanitized)
+            new_sanitized = manifest_mod._sanitize_token_scan(
+                {
+                    "files_scanned": 5,
+                    "bytes_scanned": 100,
+                    "matches_found": 0,
+                    "redactions_applied": 0,
+                    "remaining_unredacted_matches": 0,
+                    "active_token_checked": True,
+                    "active_token_matches_found": 0,
+                }
+            )
+            self.assertEqual(new_sanitized["active_token_checked"], True)
+            self.assertEqual(new_sanitized["active_token_matches_found"], 0)
+
+            # 6. validate_manifest_dict rejects smoke_seatbelt_enforced=False and active_token_matches_found != 0
+            cleared_ep = resolve_endpoint(load_model("qwen3-30b-a3b-2507-mlx-4bit"), require_api_key=False)
+            committed_manifest = json.loads(
+                (ROOT / str(cleared_ep.eval_evidence_artifact)).read_text(encoding="utf-8")
+            )
+            bad_sb_manifest = json.loads(json.dumps(committed_manifest))
+            bad_sb_manifest["suites"]["opencode_smoke"]["smoke_seatbelt_enforced"] = False
+            errs_sb = manifest_mod.validate_manifest_dict(bad_sb_manifest, cleared_ep, offline_ci=True)
+            self.assertTrue(any("smoke_seatbelt_enforced=true" in e for e in errs_sb), errs_sb)
+
+            bad_act_manifest = json.loads(json.dumps(committed_manifest))
+            bad_act_manifest["suites"]["opencode_smoke"]["session_token_scan_summary"] = {
+                "files_scanned": 5,
+                "bytes_scanned": 100,
+                "matches_found": 0,
+                "redactions_applied": 0,
+                "remaining_unredacted_matches": 0,
+                "active_token_checked": True,
+                "active_token_matches_found": 1,
+            }
+            errs_act = manifest_mod.validate_manifest_dict(bad_act_manifest, cleared_ep, offline_ci=True)
+            self.assertTrue(any("non-zero token matches" in e for e in errs_act), errs_act)
+
+            bad_roots_manifest = json.loads(json.dumps(committed_manifest))
+            bad_roots_manifest["suites"]["opencode_smoke"]["scan_roots_ok"] = False
+            errs_roots = manifest_mod.validate_manifest_dict(bad_roots_manifest, cleared_ep, offline_ci=True)
+            self.assertTrue(any("scan_roots_ok=true" in e for e in errs_roots), errs_roots)
+
+            bad_skip_manifest = json.loads(json.dumps(committed_manifest))
+            bad_skip_manifest["suites"]["sanity"]["session_token_scan_summary"] = {
+                "files_scanned": 5,
+                "bytes_scanned": 100,
+                "matches_found": 0,
+                "redactions_applied": 0,
+                "remaining_unredacted_matches": 0,
+                "skipped_roots_count": 1,
+            }
+            errs_skip = manifest_mod.validate_manifest_dict(bad_skip_manifest, cleared_ep, offline_ci=True)
+            self.assertTrue(any("skipped or invalid scan roots" in e for e in errs_skip), errs_skip)
+
+            # 7. SSI-W2 & SSI-W3: symlink + '..' workspace rejected in smoke, and opencode-attested-e2e
+            #    validates live scan roots BEFORE calling scan_and_redact_directory_tokens so symlink targets
+            #    are never traversed or redacted in place.
+            attested_child = attested_dir / "child"
+            attested_child.mkdir(parents=True, exist_ok=True)
+            safe_ws_parent = tmp_root / "safe_ws"
+            safe_ws_parent.mkdir(parents=True, exist_ok=True)
+            (safe_ws_parent / "link").symlink_to(attested_child)
+            dotdot_ws_model = {
+                "id": "dotdot-ws-model",
+                "runtime": "proxy",
+                "serve_command": "./bin/privatemode-proxy --listen-address 127.0.0.1 --port 9082 --workspace safe_ws/link/..",
+            }
+            with self.assertRaises(ValueError):
+                smoke_mod.build_smoke_scan_plan(out_dir, tmp_root, dotdot_ws_model)
+
+            e2e_mod = _load_script_module("opencode_attested_e2e_ssiw3", ROOT / "scripts" / "opencode-attested-e2e")
+            e2e_root = Path(tmp) / "e2e_repo"
+            e2e_run = e2e_root / "runs" / "live-e2e-run"
+            e2e_run.mkdir(parents=True, exist_ok=True)
+            (e2e_run / "clean.txt").write_text("clean\n", encoding="utf-8")
+            ext_secret_home = Path(tmp) / "ext_secret_home"
+            ext_secret_home.mkdir(parents=True, exist_ok=True)
+            untouched_events = ext_secret_home / "events.jsonl"
+            orig_secret_text = f'{{"keep_untouched": "{old_tok}"}}\n'
+            untouched_events.write_text(orig_secret_text, encoding="utf-8")
+            (e2e_root / ".home").symlink_to(ext_secret_home)
+
+            scanned_arg_lists: list[list[Path]] = []
+            orig_e2e_scanner = e2e_mod.smoke.scan_and_redact_directory_tokens
+
+            def _spy_e2e_scanner(roots_arg: list[Path], *a: object, **kw: object):
+                scanned_arg_lists.append(list(roots_arg))
+                return orig_e2e_scanner(roots_arg, *a, **kw)
+
+            e2e_mod.smoke.scan_and_redact_directory_tokens = _spy_e2e_scanner
+            try:
+                bad_home_scan, bad_home_ok = e2e_mod.run_live_attested_token_scan(
+                    e2e_run,
+                    e2e_root / ".home",
+                    root_dir=e2e_root,
+                )
+            finally:
+                e2e_mod.smoke.scan_and_redact_directory_tokens = orig_e2e_scanner
+
+            self.assertFalse(bad_home_ok)
+            self.assertIs(bad_home_scan["scan_roots_ok"], False)
+            # Symlinked .home and its target must NEVER reach scan_and_redact_directory_tokens or be redacted
+            for call_roots in scanned_arg_lists:
+                self.assertNotIn(e2e_root / ".home", call_roots)
+                self.assertNotIn(ext_secret_home, call_roots)
+                self.assertNotIn(ext_secret_home.resolve(), call_roots)
+            self.assertEqual(untouched_events.read_text(encoding="utf-8"), orig_secret_text)
+
+            # Valid non-symlink .home in opencode-attested-e2e scans both roots cleanly
+            (e2e_root / ".home").unlink()
+            (e2e_root / ".home" / "opencode-private-attested").mkdir(parents=True, exist_ok=True)
+            (e2e_root / ".home" / "opencode-private-attested" / "state.txt").write_text("ok\n", encoding="utf-8")
+            good_e2e_scan, good_e2e_ok = e2e_mod.run_live_attested_token_scan(
+                e2e_run,
+                e2e_root / ".home",
+                root_dir=e2e_root,
+            )
+            self.assertTrue(good_e2e_ok)
+            self.assertEqual(good_e2e_scan["matches_found"], 0)
+
+    def test_privatemode_flash_clearance_and_default_attested_resolution(self) -> None:
+        import copy
+        import pwd
+        from local_assist.registry import get_process_lstart
+
+        oc_attested = _load_script_module("oc_attested_multi_cleared", "scripts/opencode-attested")
+        gen_mod = _load_script_module("gen_eval_manifest_pm_flash", "scripts/generate-eval-manifest")
+
+        # 1. Live models.yaml and committed manifest checks for privatemode-glm-5-3-flash and tinfoil-deepseek-v4-1-flash
+        pm_flash_raw = load_model("privatemode-glm-5-3-flash")
+        ep_pm_flash = resolve_endpoint(pm_flash_raw, require_api_key=False)
+        self.assertEqual(ep_pm_flash.status, "active")
+        self.assertEqual(ep_pm_flash.routing_private_attested, "cleared")
+        self.assertFalse(ep_pm_flash.default_private_attested)
+        self.assertEqual(
+            ep_pm_flash.eval_evidence_artifact,
+            "docs/evals/privatemode-glm-5-3-flash.json",
+        )
+        pm_manifest = json.loads((ROOT / ep_pm_flash.eval_evidence_artifact).read_text(encoding="utf-8"))
+        self.assertEqual(
+            gen_mod.validate_manifest_dict(pm_manifest, ep_pm_flash, offline_ci=True),
+            [],
+        )
+        self.assertEqual(pm_manifest["clearance_basis"]["mode"], "operator_exception")
+        self.assertEqual(pm_manifest["clearance_basis"]["approved_date"], "2026-11-14")
+
+        ds_raw = load_model("tinfoil-deepseek-v4-1-flash")
+        ep_ds = resolve_endpoint(ds_raw, require_api_key=False)
+        self.assertEqual(ep_ds.status, "active")
+        self.assertEqual(ep_ds.routing_private_attested, "cleared")
+        self.assertTrue(ep_ds.default_private_attested)
+
+        for blocked_id in ("privatemode-glm-5-3", "privatemode-gpt-oss-120b"):
+            ep_blk = resolve_endpoint(load_model(blocked_id), require_api_key=False)
+            self.assertEqual(ep_blk.status, "candidate")
+            self.assertEqual(ep_blk.routing_private_attested, "blocked")
+            self.assertFalse(ep_blk.default_private_attested)
+
+        # 2. RegistryError validation on routing.default_private_attested (including explicit null, CPF-W1)
+        for bad_dpa in (None, "yes", 1, []):
+            bad_entry = copy.deepcopy(ds_raw)
+            bad_entry["routing"]["default_private_attested"] = bad_dpa
+            with self.assertRaises(RegistryError):
+                resolve_endpoint(bad_entry, require_api_key=False)
+            with self.assertRaises(RegistryError):
+                oc_attested.resolve_default_attested_model_id([bad_entry], env={})
+
+        explicit_false_entry = copy.deepcopy(ds_raw)
+        explicit_false_entry["routing"]["default_private_attested"] = False
+        self.assertFalse(resolve_endpoint(explicit_false_entry, require_api_key=False).default_private_attested)
+
+        absent_key_entry = copy.deepcopy(ds_raw)
+        absent_key_entry["routing"].pop("default_private_attested", None)
+        self.assertFalse(resolve_endpoint(absent_key_entry, require_api_key=False).default_private_attested)
+
+        blocked_with_default = copy.deepcopy(load_model("privatemode-glm-5-3"))
+        blocked_with_default["routing"]["default_private_attested"] = True
+        with self.assertRaises(RegistryError):
+            resolve_endpoint(blocked_with_default, require_api_key=False)
+
+        local_with_default = copy.deepcopy(load_model("qwen3-30b-a3b-2507-mlx-4bit"))
+        local_with_default["routing"]["default_private_attested"] = True
+        with self.assertRaises(RegistryError):
+            resolve_endpoint(local_with_default, require_api_key=False)
+
+        # 3. Same-rung LIFO, explicit catalog pin, and FREE_INFERENCE_DEFAULT_ATTESTED_MODEL
+        model_a = copy.deepcopy(ds_raw)
+        model_a["routing"].pop("default_private_attested", None)
+        model_b = copy.deepcopy(pm_flash_raw)
+        model_b["routing"].pop("default_private_attested", None)
+
+        self.assertEqual(
+            oc_attested.resolve_default_attested_model_id([model_a, model_b], env={}),
+            "privatemode-glm-5-3-flash",
+        )
+        self.assertEqual(
+            oc_attested.resolve_default_attested_model_id([model_b, model_a], env={}),
+            "tinfoil-deepseek-v4-1-flash",
+        )
+
+        model_a_pinned = copy.deepcopy(model_a)
+        model_a_pinned["routing"]["default_private_attested"] = True
+        self.assertEqual(
+            oc_attested.resolve_default_attested_model_id([model_a_pinned, model_b], env={}),
+            "tinfoil-deepseek-v4-1-flash",
+        )
+
+        model_b_pinned = copy.deepcopy(model_b)
+        model_b_pinned["routing"]["default_private_attested"] = True
+        with self.assertRaises(LocalAssistError) as ctx_dup:
+            oc_attested.resolve_default_attested_model_id([model_a_pinned, model_b_pinned], env={})
+        self.assertEqual(ctx_dup.exception.code, "routing_gate_blocked")
+
+        # Env override wins over catalog pin and LIFO, and fails closed on invalid/uncleared/deprecated targets
+        self.assertEqual(
+            oc_attested.resolve_default_attested_model_id(
+                [model_a_pinned, model_b],
+                env={"FREE_INFERENCE_DEFAULT_ATTESTED_MODEL": "privatemode-glm-5-3-flash"},
+            ),
+            "privatemode-glm-5-3-flash",
+        )
+        cand_entry = copy.deepcopy(load_model("privatemode-glm-5-3"))
+        dep_entry = copy.deepcopy(load_model("tinfoil-kimi-k3"))
+        for bad_env_target in ("nonexistent-model", "privatemode-glm-5-3", "tinfoil-kimi-k3"):
+            with self.assertRaises(LocalAssistError) as ctx_bad_env:
+                oc_attested.resolve_default_attested_model_id(
+                    [model_a_pinned, model_b, cand_entry, dep_entry],
+                    env={"FREE_INFERENCE_DEFAULT_ATTESTED_MODEL": bad_env_target},
+                )
+            self.assertEqual(ctx_bad_env.exception.code, "routing_gate_blocked")
+
+        # 4. CPF1: Automatic selection ranks Rung 2 (enclave_weights_attested) strictly above Rung 3
+        rung2_entry = copy.deepcopy(model_a)
+        rung2_entry["id"] = "synthetic-rung2-weights-attested"
+        rung2_entry["serve_command"] = "./bin/missing-rung2-proxy --bind {host} --port {port}"
+        rung2_entry["promptfoo_provider"]["apiKeyKeychainService"] = "free-inference.rung2"
+        rung2_entry["remote_trust"]["tier"] = "enclave_weights_attested"
+
+        # Adverse catalog order ([rung2, rung3]): Rung 2 wins over later Rung 3
+        self.assertEqual(
+            oc_attested.resolve_default_attested_model_id([rung2_entry, model_b], env={}),
+            "synthetic-rung2-weights-attested",
+        )
+
+        with tempfile.TemporaryDirectory() as tmp_str:
+            tmp_dir = Path(tmp_str)
+            fake_root = tmp_dir / "repo"
+            (fake_root / "bin").mkdir(parents=True)
+            fake_runs = fake_root / "runs"
+            fake_runs.mkdir(parents=True)
+            fake_env_dir = tmp_dir / "envelopes"
+            fake_env_dir.mkdir(parents=True, mode=0o700)
+            os.chmod(fake_env_dir, 0o700)
+
+            def _write_sealed_envelope(env_dir_path: Path, service_name: str, mode: int = 0o600) -> Path:
+                stem = hashlib.sha256(f"{service_name}\0free-inference".encode("utf-8")).hexdigest()
+                epath = env_dir_path / f"{stem}.json"
+                epath.write_text('{"version": 1}\n', encoding="utf-8")
+                os.chmod(epath, mode)
+                return epath
+
+            my_lstart = get_process_lstart(os.getpid())
+            self.assertIsNotNone(my_lstart)
+
+            # Give Rung 3 model_b a live PID record, installed proxy binary, and sealed envelope while Rung 2 has none
+            pm_bin = fake_root / "bin" / "privatemode-proxy"
+            pm_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            pm_bin.chmod(0o755)
+            pid_file_for_model("privatemode-glm-5-3-flash", fake_runs).write_text(
+                json.dumps(
+                    {
+                        "model_id": "privatemode-glm-5-3-flash",
+                        "pid": os.getpid(),
+                        "pid_lstart": my_lstart,
+                        "status": "ready",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            _write_sealed_envelope(fake_env_dir, "free-inference.privatemode")
+
+            # CPF1: Rung 2 still wins despite lower-rung live session, binary, and envelope hints
+            self.assertEqual(
+                oc_attested.resolve_default_attested_model_id(
+                    [rung2_entry, model_b],
+                    env={},
+                    root_dir=fake_root,
+                    runs_dir=fake_runs,
+                    envelope_dir=fake_env_dir,
+                    prefer_host_state=True,
+                ),
+                "synthetic-rung2-weights-attested",
+            )
+
+            # CPF1: Stale default_private_attested=true on Rung 3 while Rung 2 is cleared fails closed
+            with self.assertRaises(LocalAssistError) as ctx_stale_pin:
+                oc_attested.resolve_default_attested_model_id(
+                    [rung2_entry, model_b_pinned],
+                    env={},
+                    root_dir=fake_root,
+                    runs_dir=fake_runs,
+                    envelope_dir=fake_env_dir,
+                    prefer_host_state=True,
+                )
+            self.assertEqual(ctx_stale_pin.exception.code, "routing_gate_blocked")
+
+            # Explicit operator env override can still intentionally select Rung 3
+            self.assertEqual(
+                oc_attested.resolve_default_attested_model_id(
+                    [rung2_entry, model_b],
+                    env={"FREE_INFERENCE_DEFAULT_ATTESTED_MODEL": "privatemode-glm-5-3-flash"},
+                    root_dir=fake_root,
+                    runs_dir=fake_runs,
+                    envelope_dir=fake_env_dir,
+                    prefer_host_state=True,
+                ),
+                "privatemode-glm-5-3-flash",
+            )
+
+            # 5. Same-rung host-state narrowing (6a live session, 6b binary, 6c envelope) + CPF2
+            # Reset fake_runs and fake_root/bin to test each narrowing tier in isolation on [model_a, model_b]
+            for f in fake_runs.glob("*"):
+                f.unlink()
+            pm_bin.unlink()
+            for f in fake_env_dir.glob("*"):
+                f.unlink()
+
+            # 5a. Live verified PID record on model_a beats later model_b; starting/unbound PID does not
+            pid_a_path = pid_file_for_model("tinfoil-deepseek-v4-1-flash", fake_runs)
+            pid_a_path.write_text(
+                json.dumps(
+                    {
+                        "model_id": "tinfoil-deepseek-v4-1-flash",
+                        "pid": os.getpid(),
+                        "status": "ready",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            # Missing pid_lstart -> ignored -> falls back to LIFO (model_b)
+            self.assertEqual(
+                oc_attested.resolve_default_attested_model_id(
+                    [model_a, model_b],
+                    env={},
+                    root_dir=fake_root,
+                    runs_dir=fake_runs,
+                    envelope_dir=fake_env_dir,
+                    prefer_host_state=True,
+                ),
+                "privatemode-glm-5-3-flash",
+            )
+            # Verified pid_lstart -> selects model_a
+            pid_a_path.write_text(
+                json.dumps(
+                    {
+                        "model_id": "tinfoil-deepseek-v4-1-flash",
+                        "pid": os.getpid(),
+                        "pid_lstart": my_lstart,
+                        "status": "ready",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                oc_attested.resolve_default_attested_model_id(
+                    [model_a, model_b],
+                    env={},
+                    root_dir=fake_root,
+                    runs_dir=fake_runs,
+                    envelope_dir=fake_env_dir,
+                    prefer_host_state=True,
+                ),
+                "tinfoil-deepseek-v4-1-flash",
+            )
+            pid_a_path.unlink()
+
+            # 5b. Proxy binary narrowing: only tinfoil-proxy installed -> selects model_a
+            tf_bin = fake_root / "bin" / "tinfoil-proxy"
+            tf_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            tf_bin.chmod(0o755)
+            self.assertEqual(
+                oc_attested.resolve_default_attested_model_id(
+                    [model_a, model_b],
+                    env={},
+                    root_dir=fake_root,
+                    runs_dir=fake_runs,
+                    envelope_dir=fake_env_dir,
+                    prefer_host_state=True,
+                ),
+                "tinfoil-deepseek-v4-1-flash",
+            )
+
+            # Both binaries installed -> proceeds to 5c envelope narrowing
+            pm_bin.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            pm_bin.chmod(0o755)
+            tf_env_file = _write_sealed_envelope(fake_env_dir, "free-inference.tinfoil", mode=0o600)
+            self.assertEqual(
+                oc_attested.resolve_default_attested_model_id(
+                    [model_a, model_b],
+                    env={},
+                    root_dir=fake_root,
+                    runs_dir=fake_runs,
+                    envelope_dir=fake_env_dir,
+                    prefer_host_state=True,
+                ),
+                "tinfoil-deepseek-v4-1-flash",
+            )
+
+            # Deleted lifecycle_state or permissive mode 0644 invalidates envelope narrowing -> LIFO (model_b)
+            tf_stem = hashlib.sha256(b"free-inference.tinfoil\0free-inference").hexdigest()
+            tf_state = fake_env_dir / f"{tf_stem}.state.json"
+            tf_state.write_text('{"lifecycle_state": "deleted"}\n', encoding="utf-8")
+            os.chmod(tf_state, 0o600)
+            self.assertEqual(
+                oc_attested.resolve_default_attested_model_id(
+                    [model_a, model_b],
+                    env={},
+                    root_dir=fake_root,
+                    runs_dir=fake_runs,
+                    envelope_dir=fake_env_dir,
+                    prefer_host_state=True,
+                ),
+                "privatemode-glm-5-3-flash",
+            )
+            tf_state.unlink()
+            os.chmod(tf_env_file, 0o644)
+            self.assertEqual(
+                oc_attested.resolve_default_attested_model_id(
+                    [model_a, model_b],
+                    env={},
+                    root_dir=fake_root,
+                    runs_dir=fake_runs,
+                    envelope_dir=fake_env_dir,
+                    prefer_host_state=True,
+                ),
+                "privatemode-glm-5-3-flash",
+            )
+            os.chmod(tf_env_file, 0o600)
+
+            # CPF2: Ambient FREE_INFERENCE_SE_ENVELOPE_DIR in env/os.environ is ignored in production mode
+            fake_pw_home = tmp_dir / "pw_home"
+            fake_pw_home.mkdir(parents=True, mode=0o755)
+            orig_pw = pwd.getpwuid(os.geteuid())
+            fake_pw = pwd.struct_passwd(
+                (
+                    orig_pw.pw_name,
+                    orig_pw.pw_passwd,
+                    orig_pw.pw_uid,
+                    orig_pw.pw_gid,
+                    orig_pw.pw_gecos,
+                    str(fake_pw_home),
+                    orig_pw.pw_shell,
+                )
+            )
+            with (
+                patch("pwd.getpwuid", return_value=fake_pw),
+                patch.dict(os.environ, {"FREE_INFERENCE_SE_ENVELOPE_DIR": str(fake_env_dir)}),
+            ):
+                # fake_env_dir has free-inference.tinfoil, while fake_pw_home has NO envelopes;
+                # production discovery must ignore FREE_INFERENCE_SE_ENVELOPE_DIR and fall back to LIFO (model_b)
+                self.assertEqual(
+                    oc_attested.resolve_default_attested_model_id(
+                        [model_a, model_b],
+                        env={"FREE_INFERENCE_SE_ENVELOPE_DIR": str(fake_env_dir)},
+                        root_dir=fake_root,
+                        runs_dir=fake_runs,
+                        envelope_dir=None,
+                        prefer_host_state=True,
+                    ),
+                    "privatemode-glm-5-3-flash",
+                )
 
 
 if __name__ == "__main__":

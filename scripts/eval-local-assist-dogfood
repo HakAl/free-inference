@@ -1,0 +1,1100 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import ast
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from typing import Any, Callable
+
+
+ROOT_DIR = Path(__file__).resolve().parent.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from local_assist.errors import LocalAssistError  # noqa: E402
+from local_assist.security_profile import _resolve_real_python_macho  # noqa: E402
+from local_assist.logging import caller_context  # noqa: E402
+from local_assist.tools import (  # noqa: E402
+    assist_status,
+    check_eval_assertion,
+    compress_context,
+    delegate_task,
+    extract_fields,
+    propose_eval_prompts,
+    select_context,
+)
+
+
+def _extract_json_value(raw_text: str) -> Any:
+    cleaned = raw_text.strip()
+    if cleaned.startswith("```"):
+        lines = cleaned.splitlines()
+        if len(lines) >= 2 and lines[-1].strip().startswith("```"):
+            cleaned = "\n".join(lines[1:-1]).strip()
+    return json.loads(cleaned)
+
+
+def _strip_code_fences(raw_text: str) -> str:
+    cleaned = raw_text.strip()
+    if cleaned.startswith("```"):
+        lines = cleaned.splitlines()
+        if len(lines) >= 2 and lines[-1].strip().startswith("```"):
+            return "\n".join(lines[1:-1]).strip()
+    return cleaned
+
+
+def _ref_sliding_counter(cap: int, calls: list[int]) -> list[bool]:
+    used = 0
+    out: list[bool] = []
+    for cost in calls:
+        if cost <= 0 or used + cost > cap:
+            out.append(False)
+        else:
+            used += cost
+            out.append(True)
+    return out
+
+
+def _mutant_zero_allowed(cap: int, calls: list[int]) -> list[bool]:
+    used = 0
+    out: list[bool] = []
+    for cost in calls:
+        if cost < 0 or used + cost > cap:
+            out.append(False)
+        else:
+            used += cost
+            out.append(True)
+    return out
+
+
+def _mutant_strict_less_than_cap(cap: int, calls: list[int]) -> list[bool]:
+    used = 0
+    out: list[bool] = []
+    for cost in calls:
+        if cost <= 0 or used + cost >= cap:
+            out.append(False)
+        else:
+            used += cost
+            out.append(True)
+    return out
+
+
+def _mutant_stateless_no_accumulate(cap: int, calls: list[int]) -> list[bool]:
+    out: list[bool] = []
+    for cost in calls:
+        if cost <= 0 or cost > cap:
+            out.append(False)
+        else:
+            out.append(True)
+    return out
+
+
+def grade_sliding_counter_test_cases(out: dict[str, Any]) -> bool:
+    """External behavioral + mutation-testing oracle for SlidingCounter(cap=3) test generation."""
+    raw_output = out.get("output")
+    if not isinstance(raw_output, str) or not raw_output.strip():
+        return False
+    try:
+        cases = _extract_json_value(raw_output)
+    except (ValueError, json.JSONDecodeError):
+        return False
+    if isinstance(cases, dict) and isinstance(cases.get("cases") or cases.get("test_cases"), list):
+        cases = cases.get("cases") or cases.get("test_cases")
+    if not isinstance(cases, list) or len(cases) < 3:
+        return False
+
+    seen_costs: set[int] = set()
+    has_stateful_sequence = False
+    normalized_scenarios: list[tuple[list[int], list[bool]]] = []
+
+    for item in cases:
+        if not isinstance(item, dict):
+            return False
+        calls = item.get("calls")
+        expected = item.get("expected")
+        if (
+            not isinstance(calls, list)
+            or not calls
+            or not all(isinstance(c, int) and not isinstance(c, bool) for c in calls)
+        ):
+            return False
+        if (
+            not isinstance(expected, list)
+            or len(expected) != len(calls)
+            or not all(isinstance(b, bool) for b in expected)
+        ):
+            return False
+        # Every scenario's expected vector must match the reference SlidingCounter(cap=3)
+        if _ref_sliding_counter(3, calls) != expected:
+            return False
+        seen_costs.update(calls)
+        if len(calls) >= 2:
+            has_stateful_sequence = True
+        normalized_scenarios.append((calls, expected))
+
+    # Must exercise boundary values 0, 1, 3, and 4 plus stateful multi-call accumulation
+    if not {0, 1, 3, 4}.issubset(seen_costs):
+        return False
+    if not has_stateful_sequence:
+        return False
+
+    # Generated suite must kill all three boundary/stateful mutants
+    for mutant_fn in (
+        _mutant_zero_allowed,
+        _mutant_strict_less_than_cap,
+        _mutant_stateless_no_accumulate,
+    ):
+        killed = any(
+            mutant_fn(3, calls) != expected for calls, expected in normalized_scenarios
+        )
+        if not killed:
+            return False
+
+    return True
+
+
+def _build_python_eval_seatbelt_profile(py_real: str) -> str:
+    esc_py = py_real.replace("\\", "\\\\").replace('"', '\\"')
+    py_path = Path(py_real)
+    reallow = ""
+    denied_roots = (
+        "/Users",
+        "/System/Volumes/Data/Users",
+        "/Volumes",
+        "/private/tmp",
+        "/tmp",
+        "/private/var/folders",
+        "/var/folders",
+        "/private/etc/ssh",
+    )
+    if any(py_real.startswith(r + "/") for r in denied_roots):
+        env_root = str(py_path.parent.parent)
+        esc_root = env_root.replace("\\", "\\\\").replace('"', '\\"')
+        reallow = (
+            f'\n(allow file-read* (subpath "{esc_root}"))'
+            f'\n(allow file-read-data (subpath "{esc_root}"))'
+        )
+    deny_subpaths = "\n  ".join(f'(subpath "{r}")' for r in denied_roots)
+    return (
+        "(version 1)\n"
+        "(allow default)\n"
+        "(deny network*)\n"
+        "(deny file-write*)\n"
+        '(allow file-write* (literal "/dev/null"))\n'
+        "(deny process-fork)\n"
+        "(deny process-exec)\n"
+        f'(allow process-exec (literal "{esc_py}"))\n'
+        f"(deny file-read*\n  {deny_subpaths})\n"
+        f"(deny file-read-data\n  {deny_subpaths})"
+        f"{reallow}\n"
+    )
+
+
+_PARSE_WINDOW_HARNESS_PY = r"""
+import json, sys
+
+payload = json.loads(sys.stdin.read())
+ns = {"__builtins__": __builtins__}
+exec(compile(payload["code"], "<generated_parse_window>", "exec"), ns, ns)
+fn = ns.get("parse_window")
+if not callable(fn):
+    print(json.dumps({"ok": False, "reason": "parse_window_not_callable"}))
+    raise SystemExit(0)
+
+valid_cases = [
+    ("1s", 1),
+    ("15s", 15),
+    ("5m", 300),
+    ("2h", 7200),
+    ("  10s  ", 10),
+]
+for raw_in, expected_sec in valid_cases:
+    got = fn(raw_in)
+    if type(got) is not int or got != expected_sec:
+        print(json.dumps({"ok": False, "reason": f"wrong_valid:{raw_in!r}->{got!r}"}))
+        raise SystemExit(0)
+
+invalid_cases = ["", "   ", "0s", "-5s", "-1m", "10d", "10", "s", "abc"]
+for bad_in in invalid_cases:
+    try:
+        got = fn(bad_in)
+    except ValueError:
+        continue
+    except Exception as exc:
+        print(json.dumps({"ok": False, "reason": f"wrong_exc:{bad_in!r}->{type(exc).__name__}"}))
+        raise SystemExit(0)
+    print(json.dumps({"ok": False, "reason": f"accepted_invalid:{bad_in!r}->{got!r}"}))
+    raise SystemExit(0)
+
+print(json.dumps({"ok": True}))
+"""
+
+
+def grade_parse_window_implementation(out: dict[str, Any]) -> bool:
+    """Sandboxed behavioral oracle executing generated parse_window against valid and invalid inputs."""
+    raw_code = out.get("output")
+    assumptions = out.get("assumptions")
+    if not isinstance(raw_code, str) or not raw_code.strip():
+        return False
+    if not isinstance(assumptions, list) or len(assumptions) < 1:
+        return False
+    code = _strip_code_fences(raw_code)
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return False
+    if not any(isinstance(node, ast.FunctionDef) and node.name == "parse_window" for node in tree.body):
+        return False
+
+    py_real = str(_resolve_real_python_macho())
+    if sys.platform == "darwin":
+        sb_bin = Path("/usr/bin/sandbox-exec")
+        if not sb_bin.is_file():
+            return False
+        cmd = [
+            str(sb_bin),
+            "-p",
+            _build_python_eval_seatbelt_profile(py_real),
+            py_real,
+            "-I",
+            "-B",
+            "-c",
+            _PARSE_WINDOW_HARNESS_PY,
+        ]
+    else:
+        cmd = [py_real, "-I", "-B", "-c", _PARSE_WINDOW_HARNESS_PY]
+
+    safe_cwd = "/var/empty" if Path("/var/empty").is_dir() else "/"
+    try:
+        proc = subprocess.run(
+            cmd,
+            input=json.dumps({"code": code}),
+            capture_output=True,
+            text=True,
+            cwd=safe_cwd,
+            env={},
+            timeout=2.5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if proc.returncode != 0:
+        return False
+    try:
+        verdict = json.loads(proc.stdout.strip())
+    except json.JSONDecodeError:
+        return False
+    return verdict.get("ok") is True
+
+
+def _is_json_schema_descriptor(obj: dict[str, Any]) -> bool:
+    return (
+        obj.get("type") == "object"
+        and isinstance(obj.get("properties"), dict)
+    ) or "$schema" in obj
+
+
+_CONSTANT_JSON_PROMPT_RE = re.compile(
+    r"^\s*(?:return|output|respond\s+with|reply\s+with)\s+"
+    r"(?:only\s+|exact\s+|the\s+exact\s+|valid\s+)?"
+    r"json(?:\s+object)?(?:\s+exactly)?\s*:?\s*"
+    r"(\{.+\})\s*(?:only\s*)?\.?\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _is_scalar_json_value(val: Any) -> bool:
+    return val is None or isinstance(val, (bool, int, float, str))
+
+
+def _derive_prompt_json_reference(prompt_text: str) -> dict[str, Any] | None:
+    """Derive a concrete flat scalar JSON object strictly from an anchored constant-output prompt.
+
+    Only full-string positive imperative constant-output specifications with scalar field values
+    (such as `Return JSON {"status": "ok", "count": 6}.`) produce an automatic reference object.
+    Any prompt containing input examples, transformations, negations, multiple objects, nested
+    arrays/objects, or unsupported surrounding prose returns None and is classified as ungraded.
+    """
+    m = _CONSTANT_JSON_PROMPT_RE.match(prompt_text)
+    if m is None:
+        return None
+    raw_json = m.group(1).strip()
+    decoder = json.JSONDecoder()
+    try:
+        parsed, end_idx = decoder.raw_decode(raw_json, 0)
+    except json.JSONDecodeError:
+        return None
+    if end_idx != len(raw_json):
+        return None
+    if not isinstance(parsed, dict) or not parsed or _is_json_schema_descriptor(parsed):
+        return None
+    if not all(_is_scalar_json_value(v) for v in parsed.values()):
+        return None
+    return parsed
+
+
+def _wrong_same_type_values(val: Any) -> list[Any]:
+    if isinstance(val, bool):
+        return [not val]
+    if isinstance(val, int):
+        # Include -1/+1 (catches <= / >= / off-by-one) and +10/17 (catches unanchored regexes).
+        return [val - 1, val + 1, (val + 10) if val != 0 else 17]
+    if isinstance(val, float):
+        return [round(val - 1.0, 6), round(val + 1.0, 6), round(val + 10.5, 6)]
+    if isinstance(val, str):
+        same_len = ("x" * len(val) if val != "x" * len(val) else "y" * len(val)) if val else "z"
+        return [f"{val}_WRONG_VALUE" if val else "WRONG_VALUE", same_len]
+    return ["__not_null__", {}, []]
+
+
+def _wrong_type_values(val: Any) -> list[Any]:
+    if isinstance(val, bool):
+        return ["true", 1] if val else ["false", 0, None]
+    if isinstance(val, (int, float)):
+        return [str(val), bool(val)]
+    if isinstance(val, str):
+        return [12345, None]
+    return [0, False, "null"]
+
+
+def _synthesize_prompt_reference_variants(prompt_text: str) -> tuple[list[str], list[str]] | None:
+    """Derive formatting-varied valid JSON alternatives and discriminating wrong JSON candidates
+    exclusively from prompt_text (never inspecting assertion_js).
+    """
+    ref_obj = _derive_prompt_json_reference(prompt_text)
+    if ref_obj is None:
+        return None
+
+    passing_alts = [
+        json.dumps(ref_obj, separators=(",", ":"), ensure_ascii=False),
+        "  \n" + json.dumps(ref_obj, indent=2, ensure_ascii=False) + "\n",
+    ]
+    if len(ref_obj) >= 2:
+        reversed_obj = dict(reversed(list(ref_obj.items())))
+        passing_alts.append(json.dumps(reversed_obj, indent=2, ensure_ascii=False))
+    passing_alts = list(dict.fromkeys(passing_alts))
+
+    failing_candidates: list[str] = [
+        "{}",
+        '{"__unrelated_wrong_key__": -99999}',
+    ]
+    for key, val in ref_obj.items():
+        for wrong_val in _wrong_same_type_values(val):
+            mutated_val_obj = dict(ref_obj)
+            mutated_val_obj[key] = wrong_val
+            failing_candidates.append(json.dumps(mutated_val_obj, ensure_ascii=False))
+
+        mutated_key_obj = {k: v for k, v in ref_obj.items() if k != key}
+        mutated_key_obj[f"{key}_wrong"] = val
+        failing_candidates.append(json.dumps(mutated_key_obj, ensure_ascii=False))
+
+        for wrong_typed in _wrong_type_values(val):
+            mutated_type_obj = dict(ref_obj)
+            mutated_type_obj[key] = wrong_typed
+            failing_candidates.append(json.dumps(mutated_type_obj, ensure_ascii=False))
+
+    failing_alts = [f for f in dict.fromkeys(failing_candidates) if f not in passing_alts]
+    return passing_alts, failing_alts
+
+
+def _executor_payload_size_bytes(
+    assertion_js: str,
+    p_batch: list[str],
+    f_batch: list[str],
+) -> int:
+    payload_obj = {
+        "mode": "eval",
+        "assertion": {"type": "javascript", "value": assertion_js},
+        "passing_outputs": p_batch,
+        "failing_outputs": f_batch,
+    }
+    return len(json.dumps(payload_obj, ensure_ascii=False).encode("utf-8"))
+
+
+def _pack_assertion_batches(
+    assertion_js: str,
+    passing_alts: list[str],
+    failing_alts: list[str],
+) -> list[tuple[list[str], list[str]]] | None:
+    max_side = int(check_eval_assertion.MAX_CANDIDATES_PER_SIDE)
+    max_cand_bytes = int(check_eval_assertion.MAX_CANDIDATE_BYTES)
+    max_payload_bytes = int(check_eval_assertion.MAX_STDIN_PAYLOAD_BYTES)
+
+    if len(passing_alts) > 100 or len(failing_alts) > 200:
+        return None
+    if any(len(c.encode("utf-8")) > max_cand_bytes for c in (*passing_alts, *failing_alts)):
+        return None
+
+    batches: list[tuple[list[str], list[str]]] = []
+    pi = 0
+    fi = 0
+    while pi < len(passing_alts) or fi < len(failing_alts):
+        if pi < len(passing_alts):
+            p_batch = [passing_alts[pi]]
+            pi += 1
+        else:
+            p_batch = [passing_alts[0]]
+
+        if fi < len(failing_alts):
+            f_batch = [failing_alts[fi]]
+            fi += 1
+        else:
+            f_batch = [failing_alts[0]]
+
+        if _executor_payload_size_bytes(assertion_js, p_batch, f_batch) > max_payload_bytes:
+            return None
+
+        while pi < len(passing_alts) and len(p_batch) < max_side:
+            cand_p = passing_alts[pi]
+            if _executor_payload_size_bytes(assertion_js, [*p_batch, cand_p], f_batch) > max_payload_bytes:
+                break
+            p_batch.append(cand_p)
+            pi += 1
+
+        while fi < len(failing_alts) and len(f_batch) < max_side:
+            cand_f = failing_alts[fi]
+            if _executor_payload_size_bytes(assertion_js, p_batch, [*f_batch, cand_f]) > max_payload_bytes:
+                break
+            f_batch.append(cand_f)
+            fi += 1
+
+        batches.append((p_batch, f_batch))
+
+    return batches
+
+
+def evaluate_proposed_eval_prompts(out: dict[str, Any]) -> dict[str, Any]:
+    """Evaluate proposed structured_output prompts against prompt-derived ground truth only.
+
+    Prompts without an unambiguous prompt-derived JSON reference are classified as ungraded
+    and never counted as automatic semantic passes.
+    """
+    prompts = out.get("prompts")
+    if not isinstance(prompts, list) or not (1 <= len(prompts) <= 2) or out.get("coverage_note") == "":
+        return {
+            "passed": False,
+            "graded_count": 0,
+            "passed_count": 0,
+            "failed_count": 1,
+            "ungraded_count": 0,
+        }
+
+    graded_count = 0
+    passed_count = 0
+    failed_count = 0
+    ungraded_count = 0
+
+    for p in prompts:
+        if not isinstance(p, dict):
+            failed_count += 1
+            continue
+        prompt_text = p.get("prompt")
+        assertion_js = p.get("assertion")
+        if not isinstance(prompt_text, str) or not isinstance(assertion_js, str):
+            failed_count += 1
+            continue
+        if len(assertion_js.encode("utf-8")) > int(check_eval_assertion.MAX_ASSERTION_VALUE_BYTES):
+            failed_count += 1
+            continue
+        syn_ok, _ = check_eval_assertion.validate_assertion_syntax("javascript", assertion_js)
+        if not syn_ok or "JSON.parse" not in assertion_js:
+            failed_count += 1
+            continue
+
+        synthesized = _synthesize_prompt_reference_variants(prompt_text)
+        if synthesized is None:
+            ungraded_count += 1
+            continue
+
+        passing_alts, failing_alts = synthesized
+        if len(passing_alts) < 2 or len(failing_alts) < 2:
+            ungraded_count += 1
+            continue
+
+        batches = _pack_assertion_batches(assertion_js, passing_alts, failing_alts)
+        if not batches:
+            ungraded_count += 1
+            continue
+
+        graded_count += 1
+        all_batches_ok = True
+        for p_batch, f_batch in batches:
+            eval_res = check_eval_assertion.run(
+                assertion={"type": "javascript", "value": assertion_js},
+                passing_outputs=p_batch,
+                failing_outputs=f_batch,
+            )
+            if not eval_res["passed"]:
+                all_batches_ok = False
+                break
+        if all_batches_ok:
+            passed_count += 1
+        else:
+            failed_count += 1
+
+    all_passed = graded_count >= 1 and failed_count == 0 and ungraded_count == 0
+    return {
+        "passed": all_passed,
+        "graded_count": graded_count,
+        "passed_count": passed_count,
+        "failed_count": failed_count,
+        "ungraded_count": ungraded_count,
+    }
+
+
+def grade_proposed_eval_prompts(out: dict[str, Any]) -> bool:
+    """External behavioral oracle checking proposed assertions against prompt-derived references only."""
+    return bool(evaluate_proposed_eval_prompts(out)["passed"])
+
+
+def _build_fixtures() -> list[dict[str, Any]]:
+    return [
+        # --- Seen dogfood regression fixtures ---
+        {
+            "id": "seen_compress_small_max_items_2",
+            "split": "seen",
+            "tool": "compress_context",
+            "args": {
+                "kind": "logs",
+                "text": (
+                    "2026-11-12T10:01:00Z INFO boot worker-1\n"
+                    "2026-11-12T10:01:02Z ERROR src/session_pool.py:88 KeyError: 'lease_id'\n"
+                    "2026-11-12T10:01:03Z WARN retrying lease handshake\n"
+                    "2026-11-12T10:01:05Z ERROR src/session_pool.py:114 TimeoutError: upstream close\n"
+                    "Re-run: pytest tests/test_session_pool.py -k lease_id\n"
+                ),
+                "max_items": 2,
+            },
+            "semantic_check": lambda out: (
+                len(out["key_points"]) <= 2
+                and 1 <= len(out["failures"]) <= 2
+                and all("session_pool" in f for f in out["changed_files"])
+                and any("lease_id" in f or "TimeoutError" in f for f in out["failures"])
+            ),
+        },
+        {
+            "id": "seen_compress_small_max_items_1",
+            "split": "seen",
+            "tool": "compress_context",
+            "args": {
+                "kind": "test_output",
+                "text": (
+                    "FAIL tests/test_quota.py::test_zero_quota - AssertionError: expected False got True\n"
+                    "FAIL tests/test_quota.py::test_exact_cap - AssertionError: expected True got False\n"
+                    "2 failed, 14 passed in 0.41s\n"
+                ),
+                "max_items": 1,
+            },
+            "semantic_check": lambda out: (
+                len(out["key_points"]) <= 1
+                and len(out["failures"]) == 1
+                and (
+                    "test_zero_quota" in out["failures"][0]
+                    or "test_exact_cap" in out["failures"][0]
+                )
+            ),
+        },
+        {
+            "id": "seen_delegate_generate_test_cases_array",
+            "split": "seen",
+            "tool": "delegate_task",
+            "args": {
+                "kind": "generate_test_cases",
+                "instruction": (
+                    "Return a JSON array of test scenarios for SlidingCounter(cap=3). "
+                    "Each element must be an object {\"calls\": [int, ...], \"expected\": [bool, ...]} "
+                    "tracing sequential allow_request(cost) calls on a fresh SlidingCounter(3). "
+                    "Cover boundary costs 0, 1, 3, and 4 plus multi-call stateful accumulation."
+                ),
+                "context": (
+                    "class SlidingCounter:\n"
+                    "    def __init__(self, cap: int) -> None:\n"
+                    "        self.cap = cap\n"
+                    "        self.used = 0\n"
+                    "    def allow_request(self, cost: int) -> bool:\n"
+                    "        if cost <= 0 or self.used + cost > self.cap:\n"
+                    "            return False\n"
+                    "        self.used += cost\n"
+                    "        return True\n"
+                ),
+            },
+            "semantic_check": grade_sliding_counter_test_cases,
+        },
+        {
+            "id": "seen_propose_eval_prompts_clean_note",
+            "split": "seen",
+            "tool": "propose_eval_prompts",
+            "args": {
+                "category": "structured_output",
+                "n": 2,
+            },
+            "semantic_check": grade_proposed_eval_prompts,
+        },
+        # --- Unseen held-out post-fix fixtures ---
+        {
+            "id": "unseen_extract_fields_context_path",
+            "split": "unseen",
+            "tool": "extract_fields",
+            "workspace_files": {
+                "reports/incident_404.txt": (
+                    "Incident: INC-404\n"
+                    "Duration minutes: 17\n"
+                    "Customer impact: false\n"
+                    "Affected services: billing-api, ledger-sync\n"
+                )
+            },
+            "args": {
+                "context_path": "reports/incident_404.txt",
+                "fields": {
+                    "incident_id": {"type": "string", "description": "Incident identifier", "required": True},
+                    "duration_minutes": {"type": "integer", "description": "Outage minutes", "required": True},
+                    "customer_impact": {"type": "boolean", "description": "Whether customers were impacted"},
+                    "affected_services": {"type": "string_list", "description": "Service names"},
+                },
+            },
+            "semantic_check": lambda out: (
+                out["extracted"]["incident_id"] == "INC-404"
+                and out["extracted"]["duration_minutes"] == 17
+                and out["extracted"]["customer_impact"] is False
+                and set(out["extracted"]["affected_services"]) == {"billing-api", "ledger-sync"}
+            ),
+        },
+        {
+            "id": "unseen_select_context_verbatim",
+            "split": "unseen",
+            "tool": "select_context",
+            "workspace_files": {
+                "pkg/retry.py": (
+                    "import time\n\n"
+                    "MAX_BACKOFF_SECONDS = 32\n"
+                    "JITTER_RATIO = 0.15\n\n"
+                    "def compute_delay(attempt: int) -> float:\n"
+                    "    raw = min(MAX_BACKOFF_SECONDS, 2 ** max(0, attempt))\n"
+                    "    return float(raw)\n"
+                ),
+                "pkg/unrelated.py": "def noop() -> None:\n    return None\n",
+            },
+            "args": {
+                "query": "What is MAX_BACKOFF_SECONDS and how does compute_delay cap backoff?",
+                "paths": ["pkg/retry.py", "pkg/unrelated.py"],
+                "max_excerpts": 2,
+                "max_lines_per_excerpt": 10,
+            },
+            "semantic_check": lambda out: (
+                len(out["excerpts"]) >= 1
+                and any(
+                    ex["path"] == "pkg/retry.py"
+                    and "MAX_BACKOFF_SECONDS = 32" in ex["excerpt"]
+                    and "compute_delay" in ex["excerpt"]
+                    for ex in out["excerpts"]
+                )
+                and all(ex["path"] != "pkg/unrelated.py" for ex in out["excerpts"])
+            ),
+        },
+        {
+            "id": "unseen_delegate_partial_context_assumptions",
+            "split": "unseen",
+            "tool": "delegate_task",
+            "args": {
+                "kind": "draft_code",
+                "instruction": (
+                    "Write a pure Python function parse_window(spec: str) -> int returning positive seconds "
+                    "for integer suffixes 's', 'm', 'h' (stripping outer whitespace). "
+                    "State any assumptions about uppercase suffixes or non-integer magnitudes."
+                ),
+                "constraints": [
+                    "Stdlib only.",
+                    "Raise ValueError on empty, zero, negative, or unknown/missing unit specs.",
+                ],
+            },
+            "semantic_check": grade_parse_window_implementation,
+        },
+    ]
+
+
+def _verify_oracle_discrimination_selftest() -> None:
+    """Confirm behavioral graders accept valid outputs and reject plausible schema-valid wrong outputs."""
+    # 1. SlidingCounter test-generation oracle
+    good_sc = {
+        "output": json.dumps(
+            [
+                {"calls": [0, -1], "expected": [False, False]},
+                {"calls": [1, 2, 1], "expected": [True, True, False]},
+                {"calls": [3, 1], "expected": [True, False]},
+                {"calls": [4], "expected": [False]},
+            ]
+        )
+    }
+    assert grade_sliding_counter_test_cases(good_sc) is True
+    # Wrong expected value on stateful second call (says True when 2+2 > 3)
+    wrong_expected_sc = {
+        "output": json.dumps(
+            [
+                {"calls": [0], "expected": [False]},
+                {"calls": [1, 3], "expected": [True, True]},
+                {"calls": [4], "expected": [False]},
+            ]
+        )
+    }
+    assert grade_sliding_counter_test_cases(wrong_expected_sc) is False
+    # Unrelated 20+ char prose (previously passed len >= 20!)
+    assert grade_sliding_counter_test_cases({"output": "Here are several great boundary test cases for you."}) is False
+    # Missing boundary coverage (omits exact cap 3 -> fails to kill < vs <= mutant!)
+    weak_sc = {
+        "output": json.dumps(
+            [
+                {"calls": [0], "expected": [False]},
+                {"calls": [1, 1], "expected": [True, True]},
+                {"calls": [4], "expected": [False]},
+            ]
+        )
+    }
+    assert grade_sliding_counter_test_cases(weak_sc) is False
+
+    # 2. parse_window behavioral oracle
+    good_pw = {
+        "output": (
+            "def parse_window(spec: str) -> int:\n"
+            "    s = spec.strip()\n"
+            "    if len(s) < 2 or s[-1] not in ('s', 'm', 'h'):\n"
+            "        raise ValueError('bad suffix')\n"
+            "    val = int(s[:-1])\n"
+            "    if val <= 0:\n"
+            "        raise ValueError('non-positive')\n"
+            "    mult = {'s': 1, 'm': 60, 'h': 3600}[s[-1]]\n"
+            "    return val * mult\n"
+        ),
+        "assumptions": ["Lowercase unit suffixes only; integer magnitudes only."],
+    }
+    assert grade_parse_window_implementation(good_pw) is True
+    # Always raises ValueError (previously passed substring check!)
+    always_raises_pw = {
+        "output": "def parse_window(spec: str) -> int:\n    raise ValueError('invalid')\n",
+        "assumptions": ["Assumes nothing is valid."],
+    }
+    assert grade_parse_window_implementation(always_raises_pw) is False
+    # Accepts negative values
+    neg_bug_pw = {
+        "output": (
+            "def parse_window(spec: str) -> int:\n"
+            "    s = spec.strip()\n"
+            "    if len(s) < 2 or s[-1] not in ('s', 'm', 'h'): raise ValueError('u')\n"
+            "    return int(s[:-1]) * {'s': 1, 'm': 60, 'h': 3600}[s[-1]]\n"
+        ),
+        "assumptions": ["Integer magnitudes."],
+    }
+    assert grade_parse_window_implementation(neg_bug_pw) is False
+
+    # 3. propose_eval_prompts assertion discrimination oracle
+    good_pep = {
+        "prompts": [
+            {
+                "id": "p1",
+                "prompt": 'Return JSON {"status": "ok", "count": 6}.',
+                "expected_signal": "Exact JSON fields",
+                "assertion": '(() => { const d = JSON.parse(output); return d.status === "ok" && d.count === 6; })()',
+                "category": "structured_output",
+            }
+        ],
+        "coverage_note": "Model returned 1 of 2 requested prompts.",
+    }
+    assert grade_proposed_eval_prompts(good_pep) is True
+    # Tautological assertion (accepts wrong outputs!)
+    tautology_pep = {
+        "prompts": [
+            {
+                "id": "p2",
+                "prompt": 'Return JSON {"status": "ok", "count": 6}.',
+                "expected_signal": "Tautology",
+                "assertion": "typeof JSON.parse(output) === 'object'",
+                "category": "structured_output",
+            }
+        ],
+        "coverage_note": "1 of 2",
+    }
+    assert grade_proposed_eval_prompts(tautology_pep) is False
+    # Brittle whitespace-locked assertion (rejects pretty-printed valid JSON!)
+    brittle_pep = {
+        "prompts": [
+            {
+                "id": "p3",
+                "prompt": 'Return JSON {"status": "ok", "count": 6}.',
+                "expected_signal": "Brittle string match",
+                "assertion": 'JSON.parse(output) && output === \'{"status":"ok","count":6}\'',
+                "category": "structured_output",
+            }
+        ],
+        "coverage_note": "1 of 2",
+    }
+    assert grade_proposed_eval_prompts(brittle_pep) is False
+    # Contradictory expected value, key name, and value type vs prompt ground truth MUST fail (LDF-W3)!
+    for bad_id, bad_assertion in (
+        ("wrong_val", "JSON.parse(output).count === 7"),
+        ("wrong_key", '(() => { const d = JSON.parse(output); return d.status === "ok" && d.total === 6; })()'),
+        ("wrong_type", '(() => { const d = JSON.parse(output); return d.status === "ok" && typeof d.count === "string"; })()'),
+        ("loose_coercion", '(() => { const d = JSON.parse(output); return d.status === "ok" && d.count == 6; })()'),
+    ):
+        assert (
+            grade_proposed_eval_prompts(
+                {
+                    "prompts": [
+                        {
+                            "id": bad_id,
+                            "prompt": 'Return JSON {"status": "ok", "count": 6}.',
+                            "expected_signal": "Contradictory assertion",
+                            "assertion": bad_assertion,
+                            "category": "structured_output",
+                        }
+                    ],
+                    "coverage_note": "1 of 2",
+                }
+            )
+            is False
+        )
+    # Prompts without an unambiguous constant-output JSON specification (including input examples,
+    # transformations, negations, or open-ended wording) are reported as ungraded, never passed!
+    for ug_id, ug_prompt, ug_assert in (
+        (
+            "ungraded_open",
+            "Summarize the server health report as a JSON object with fields status and count.",
+            "JSON.parse(output).count === 7",
+        ),
+        (
+            "ungraded_input_transform",
+            'Given {"count": 6}, return JSON with count increased by one.',
+            "JSON.parse(output).count === 6",
+        ),
+        (
+            "ungraded_example",
+            'For example, {"count": 6} is an integer count. Return JSON for an empty queue.',
+            "JSON.parse(output).count === 6",
+        ),
+        (
+            "ungraded_negation",
+            'Do not return JSON {"count": 6}; return a different count.',
+            "JSON.parse(output).count === 6",
+        ),
+    ):
+        ungraded_pep = {
+            "prompts": [
+                {
+                    "id": ug_id,
+                    "prompt": ug_prompt,
+                    "expected_signal": "Non-constant or ambiguous prompt",
+                    "assertion": ug_assert,
+                    "category": "structured_output",
+                }
+            ],
+            "coverage_note": "1 of 2",
+        }
+        ungraded_detail = evaluate_proposed_eval_prompts(ungraded_pep)
+        assert ungraded_detail["passed"] is False
+        assert ungraded_detail["ungraded_count"] == 1
+        assert grade_proposed_eval_prompts(ungraded_pep) is False
+
+
+def validate_fixtures_offline() -> dict[str, Any]:
+    fixtures = _build_fixtures()
+    seen = [f for f in fixtures if f["split"] == "seen"]
+    unseen = [f for f in fixtures if f["split"] == "unseen"]
+
+    for fx in fixtures:
+        assert isinstance(fx["id"], str) and fx["id"]
+        assert fx["tool"] in {
+            "compress_context",
+            "extract_fields",
+            "delegate_task",
+            "propose_eval_prompts",
+            "select_context",
+        }
+        assert callable(fx["semantic_check"])
+
+    status_out = assist_status.run()
+    assert status_out["server"]["name"] == "local-assist-server"
+    with tempfile.TemporaryDirectory() as td:
+        old_log = os.environ.get("LOCAL_ASSIST_LOG_DIR")
+        os.environ["LOCAL_ASSIST_LOG_DIR"] = td
+        try:
+            chk = check_eval_assertion.run(
+                assertion={"type": "javascript", "value": "JSON.parse(output).ok === true"},
+                passing_outputs=['{"ok": true}'],
+                failing_outputs=['{"ok": false}'],
+            )
+            assert chk["passed"] is True
+            _verify_oracle_discrimination_selftest()
+        finally:
+            if old_log is None:
+                os.environ.pop("LOCAL_ASSIST_LOG_DIR", None)
+            else:
+                os.environ["LOCAL_ASSIST_LOG_DIR"] = old_log
+
+    return {
+        "mode": "offline_validation",
+        "fixtures_valid": True,
+        "oracle_selftests_passed": True,
+        "total_fixtures": len(fixtures),
+        "seen_count": len(seen),
+        "unseen_count": len(unseen),
+        "fixture_ids": [f["id"] for f in fixtures],
+    }
+
+
+def _invoke_fixture(fx: dict[str, Any], ws_dir: Path) -> dict[str, Any]:
+    for rel, content in fx.get("workspace_files", {}).items():
+        target = ws_dir / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+
+    tool_name = fx["tool"]
+    args = fx["args"]
+    if tool_name == "compress_context":
+        return dict(compress_context.run(**args))
+    if tool_name == "extract_fields":
+        return dict(extract_fields.run(**args))
+    if tool_name == "delegate_task":
+        return dict(delegate_task.run(**args))
+    if tool_name == "propose_eval_prompts":
+        return dict(propose_eval_prompts.run(**args))
+    if tool_name == "select_context":
+        return dict(select_context.run(**args))
+    raise ValueError(f"Unsupported fixture tool: {tool_name}")
+
+
+def run_live_benchmark(repeats: int) -> dict[str, Any]:
+    fixtures = _build_fixtures()
+    per_fixture: list[dict[str, Any]] = []
+    total_runs = 0
+    total_schema_rejects = 0
+    total_semantic_passes = 0
+    total_ungraded_runs = 0
+
+    with tempfile.TemporaryDirectory() as td:
+        ws_dir = Path(td) / "ws"
+        ws_dir.mkdir()
+        old_ws = os.environ.get("LOCAL_ASSIST_WORKSPACE_ROOT")
+        os.environ["LOCAL_ASSIST_WORKSPACE_ROOT"] = str(ws_dir)
+        try:
+            with caller_context(transport="cli", client_name="eval-local-assist-dogfood"):
+                for fx in fixtures:
+                    schema_rejects = 0
+                    other_errors = 0
+                    semantic_passes = 0
+                    ungraded_runs = 0
+                    latencies_ms: list[int] = []
+                    check_fn: Callable[[dict[str, Any]], bool] = fx["semantic_check"]
+                    for _ in range(repeats):
+                        total_runs += 1
+                        t0 = time.perf_counter()
+                        try:
+                            out = _invoke_fixture(fx, ws_dir)
+                            latencies_ms.append(int(round((time.perf_counter() - t0) * 1000)))
+                            if fx["tool"] == "propose_eval_prompts":
+                                pep_detail = evaluate_proposed_eval_prompts(out)
+                                if pep_detail["passed"]:
+                                    semantic_passes += 1
+                                    total_semantic_passes += 1
+                                elif pep_detail["failed_count"] == 0 and pep_detail["ungraded_count"] > 0:
+                                    ungraded_runs += 1
+                                    total_ungraded_runs += 1
+                            elif check_fn(out):
+                                semantic_passes += 1
+                                total_semantic_passes += 1
+                        except LocalAssistError as exc:
+                            if exc.code == "malformed_model_output":
+                                schema_rejects += 1
+                                total_schema_rejects += 1
+                            else:
+                                other_errors += 1
+                    per_fixture.append(
+                        {
+                            "id": fx["id"],
+                            "split": fx["split"],
+                            "tool": fx["tool"],
+                            "repeats": repeats,
+                            "schema_rejections": schema_rejects,
+                            "other_errors": other_errors,
+                            "semantic_passes": semantic_passes,
+                            "ungraded_runs": ungraded_runs,
+                            "latencies_ms": latencies_ms,
+                        }
+                    )
+        finally:
+            if old_ws is None:
+                os.environ.pop("LOCAL_ASSIST_WORKSPACE_ROOT", None)
+            else:
+                os.environ["LOCAL_ASSIST_WORKSPACE_ROOT"] = old_ws
+
+    graded_denominator = max(1, total_runs - total_ungraded_runs)
+    return {
+        "mode": "live",
+        "repeats": repeats,
+        "total_runs": total_runs,
+        "total_schema_rejections": total_schema_rejects,
+        "total_semantic_passes": total_semantic_passes,
+        "total_ungraded_runs": total_ungraded_runs,
+        "schema_rejection_rate": round(total_schema_rejects / max(1, total_runs), 4),
+        "semantic_pass_rate": round(total_semantic_passes / graded_denominator, 4),
+        "fixtures": per_fixture,
+    }
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Repeatable seen + unseen dogfood benchmark for local_assist tools. "
+            "Runs offline fixture and behavioral-oracle self-tests unless --live --operator-approved is passed."
+        )
+    )
+    parser.add_argument(
+        "--validate-fixtures",
+        action="store_true",
+        help="Run offline fixture and behavioral-oracle validation without contacting 127.0.0.1:8080 (default when --live is omitted).",
+    )
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help="Execute live Rung 1 benchmark runs against 127.0.0.1:8080 (requires --operator-approved).",
+    )
+    parser.add_argument(
+        "--operator-approved",
+        action="store_true",
+        help="Confirm operator approval for live local inference execution.",
+    )
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=3,
+        help="Number of live repeats per fixture when --live is set (1..10, default: 3).",
+    )
+    args = parser.parse_args(argv)
+    if args.live and args.validate_fixtures:
+        print("ERROR: Pass either --validate-fixtures or --live, not both.", file=sys.stderr)
+        return 2
+    if not args.live:
+        summary = validate_fixtures_offline()
+        print(json.dumps(summary, indent=2, ensure_ascii=False))
+        return 0
+    if not args.operator_approved:
+        print(
+            "Refusing --live without --operator-approved. Run with --validate-fixtures for offline checks, "
+            "or pass --live --operator-approved after starting the Rung 1 model with operator approval.",
+            file=sys.stderr,
+        )
+        return 2
+    if args.repeats < 1 or args.repeats > 10:
+        print("ERROR: --repeats must be in 1..10.", file=sys.stderr)
+        return 2
+    report = run_live_benchmark(args.repeats)
+    print(json.dumps(report, indent=2, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

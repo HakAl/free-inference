@@ -543,6 +543,11 @@ def _demote_routing_and_preserve_evidence(model: dict[str, Any], *, new_status: 
     if old_pa != "blocked":
         changes["routing.private_attested"] = {"from": old_pa, "to": "blocked"}
         routing["private_attested"] = "blocked"
+    if routing.get("default_private_attested") is True:
+        routing.pop("default_private_attested", None)
+        changes["routing.default_private_attested"] = {"from": True, "to": False}
+    elif "default_private_attested" in routing:
+        routing.pop("default_private_attested", None)
 
     ev = model.pop("eval_evidence_artifact", None)
     if ev is None and isinstance(routing, dict):
@@ -1430,7 +1435,12 @@ def apply_catalog_healing(
 
             for field_path, diff in item.changes.items():
                 new_val = diff.get("to")
-                if field_path in ("status", "routing.private_attested", "eval_evidence_artifact"):
+                if field_path in (
+                    "status",
+                    "routing.private_attested",
+                    "routing.default_private_attested",
+                    "eval_evidence_artifact",
+                ):
                     if field_path == "status":
                         if not has_weight_change or new_val in ("candidate", "archived"):
                             cur_rank = _STATUS_RANK.get(str(target.get("status")), -1)
@@ -1439,7 +1449,16 @@ def apply_catalog_healing(
                                 target["status"] = new_val
                     elif field_path == "routing.private_attested":
                         if not has_weight_change or new_val == "blocked":
-                            target.setdefault("routing", {})["private_attested"] = new_val
+                            r_dict = target.setdefault("routing", {})
+                            r_dict["private_attested"] = new_val
+                            if new_val != "cleared":
+                                r_dict.pop("default_private_attested", None)
+                    elif field_path == "routing.default_private_attested":
+                        r_dict = target.setdefault("routing", {})
+                        if new_val is True and r_dict.get("private_attested") == "cleared":
+                            r_dict["default_private_attested"] = True
+                        else:
+                            r_dict.pop("default_private_attested", None)
                     elif field_path == "eval_evidence_artifact" and new_val is None:
                         _demote_routing_and_preserve_evidence(
                             target, new_status=str(target.get("status") or "candidate")

@@ -10,8 +10,9 @@ from typing import TypedDict
 from ..client import chat, default_timeout_seconds
 from ..errors import LocalAssistError, ModelOutputMalformed
 from ..lifecycle import require_chat_succeeds
-from ..logging import log_call
+from ..logging import caller_context, log_call
 from ..routing import JOB_TO_MODEL
+from .check_eval_assertion import validate_assertion_syntax
 
 
 JOB = "propose_eval_prompts"
@@ -49,21 +50,29 @@ Output a JSON object with fields: prompts, coverage_note.
 prompts is an array of objects. Each prompt object has:
 - prompt: the exact user prompt to send to the model
 - expected_signal: one-line human-readable description of what the prompt tests
-- assertion: a promptfoo JavaScript expression that returns boolean and can be
-  used directly as assert[].value
+- assertion: a synchronous promptfoo JavaScript expression that returns a boolean
+  and can be used directly as assert[].value
 - category: one of format, reasoning, coding, long_context,
   instruction_following, structured_output
 
-The assertion must be executable JavaScript, not prose. It may reference the
-promptfoo variable output. If it is a multi-statement assertion, include an
-explicit return. Output JSON only, no commentary, no markdown.
+Assertion authoring rules (CRITICAL):
+- The assertion must be valid, synchronous executable JavaScript (never prose,
+  never async/Promise). It may reference `output`. If multi-statement, include
+  an explicit `return`.
+- NEVER assert on unrequested formatting, key names, or value types (for example
+  requiring `"30"` vs `30` or exact whitespace) unless `prompt` explicitly
+  demands that exact schema, key name, and JSON type.
+- NEVER use unanchored substring regexes on numbers or short tokens (for example
+  `/6/.test(output)` falsely accepts `"16"` and `"60"`); use word boundaries
+  such as `/\\b6\\b/.test(output)` or parse structured JSON fields explicitly.
+- Set `coverage_note` to `null` (never empty string `""`) when returning N
+  prompts. Only set a non-empty `coverage_note` when returning fewer than N
+  prompts because additional prompts would be near-duplicates.
 
-Do not pad with near-duplicates. If you cannot produce N distinct prompts that
-meaningfully differ, return fewer and set coverage_note to a short explanation.
+Output JSON only, no commentary, no markdown.
 
-Important: your prompts are candidates only. A downstream skill will keep only
-candidates that produce non-uniform pass/fail vectors across at least two
-runnable models. Usefulness of a discriminating prompt remains a human decision."""
+Important: your prompts are candidates only. Verify assertions with
+check_eval_assertion against passing and failing outputs before promoting them."""
 
 
 def run(category: str, n: int = 5) -> EvalPromptResult:
@@ -78,22 +87,29 @@ def run(category: str, n: int = 5) -> EvalPromptResult:
                     "category must be one of the allowed signal categories.",
                     details={"allowed": sorted(ALLOWED_CATEGORIES), "observed": category},
                 )
-            if n < 1 or n > 25:
-                raise ModelOutputMalformed("invalid_arguments", "n must be between 1 and 25.", details={"n": n})
+            if isinstance(n, bool) or not isinstance(n, int) or n < 1 or n > 25:
+                raise ModelOutputMalformed(
+                    "invalid_arguments",
+                    "n must be an integer between 1 and 25.",
+                    details={"n": n},
+                )
 
             deadline = time.monotonic() + float(default_timeout_seconds())
-            require_chat_succeeds(model, deadline=deadline)
+            with call.measure_readiness():
+                require_chat_succeeds(model, deadline=deadline)
             call.record_prompt(system=SYSTEM, prompt=prompt)
             result = chat(
                 model,
                 SYSTEM,
                 prompt,
                 response_format="json",
+                max_tokens=1536,
                 timeout_seconds=max(1, int(deadline - time.monotonic())),
             )
+            call.record_completion(result)
             call.record_raw_response(raw_response=result.raw_text, normalized_response=result.text)
-            parsed = parse_and_validate(result.text)
-            prompts = parsed["prompts"][:n]
+            parsed = parse_and_validate(result.text, n=n)
+            prompts = parsed["prompts"]
             output: EvalPromptResult = {
                 "prompts": prompts,
                 "coverage_note": parsed["coverage_note"],
@@ -118,7 +134,7 @@ def run(category: str, n: int = 5) -> EvalPromptResult:
             raise
 
 
-def parse_and_validate(text: str) -> EvalPromptResult:
+def parse_and_validate(text: str, *, n: int | None = None) -> EvalPromptResult:
     try:
         raw = json.loads(text)
     except json.JSONDecodeError as exc:
@@ -138,41 +154,65 @@ def parse_and_validate(text: str) -> EvalPromptResult:
     if coverage_note_raw is not None and not isinstance(coverage_note_raw, str):
         raise ModelOutputMalformed("malformed_model_output", "coverage_note must be a string or null.")
 
+    allow_partial = n is not None and n >= 2
     prompts: list[EvalPrompt] = []
+    dropped_reasons: list[str] = []
+    first_item_error: ModelOutputMalformed | None = None
     seen_ids: set[str] = set()
     seen_prompts: set[str] = set()
     for idx, item in enumerate(prompts_raw):
-        if not isinstance(item, dict):
-            raise ModelOutputMalformed("malformed_model_output", f"prompts[{idx}] must be an object.")
+        try:
+            if not isinstance(item, dict):
+                raise ModelOutputMalformed("malformed_model_output", f"prompts[{idx}] must be an object.")
 
-        prompt_value = item.get("prompt")
-        expected_signal = item.get("expected_signal")
-        assertion = item.get("assertion")
-        category = item.get("category")
+            prompt_value = item.get("prompt")
+            expected_signal = item.get("expected_signal")
+            assertion = item.get("assertion")
+            category = item.get("category")
 
-        if not isinstance(prompt_value, str) or not prompt_value.strip():
-            raise ModelOutputMalformed("malformed_model_output", f"prompts[{idx}].prompt must be non-empty.")
-        if not isinstance(expected_signal, str) or not expected_signal.strip():
-            raise ModelOutputMalformed("malformed_model_output", f"prompts[{idx}].expected_signal must be non-empty.")
-        if not isinstance(assertion, str) or not assertion.strip():
-            raise ModelOutputMalformed("malformed_model_output", f"prompts[{idx}].assertion must be non-empty.")
-        if not isinstance(category, str) or category not in ALLOWED_CATEGORIES:
-            raise ModelOutputMalformed(
-                "malformed_model_output",
-                f"prompts[{idx}].category is invalid.",
-                details={"allowed": sorted(ALLOWED_CATEGORIES), "observed": category},
-            )
+            if not isinstance(prompt_value, str) or not prompt_value.strip():
+                raise ModelOutputMalformed("malformed_model_output", f"prompts[{idx}].prompt must be non-empty.")
+            if not isinstance(expected_signal, str) or not expected_signal.strip():
+                raise ModelOutputMalformed("malformed_model_output", f"prompts[{idx}].expected_signal must be non-empty.")
+            if not isinstance(assertion, str) or not assertion.strip():
+                raise ModelOutputMalformed("malformed_model_output", f"prompts[{idx}].assertion must be non-empty.")
+            if "```" in assertion:
+                raise ModelOutputMalformed(
+                    "malformed_model_output",
+                    f"prompts[{idx}].assertion must not contain markdown code fences.",
+                )
+            if not isinstance(category, str) or category not in ALLOWED_CATEGORIES:
+                raise ModelOutputMalformed(
+                    "malformed_model_output",
+                    f"prompts[{idx}].category is invalid.",
+                    details={"allowed": sorted(ALLOWED_CATEGORIES), "observed": category},
+                )
 
-        normalized_prompt = " ".join(prompt_value.split())
-        if normalized_prompt in seen_prompts:
-            raise ModelOutputMalformed("malformed_model_output", f"prompts[{idx}].prompt duplicates an earlier prompt.")
+            syn_ok, syn_err = validate_assertion_syntax("javascript", assertion)
+            if not syn_ok:
+                raise ModelOutputMalformed(
+                    "malformed_model_output",
+                    f"prompts[{idx}].assertion failed JavaScript syntax validation: {syn_err}",
+                    details={"index": idx, "syntax_error": syn_err},
+                )
+
+            normalized_prompt = " ".join(prompt_value.split())
+            if normalized_prompt in seen_prompts:
+                raise ModelOutputMalformed("malformed_model_output", f"prompts[{idx}].prompt duplicates an earlier prompt.")
+
+            prompt_id = stable_id(prompt_value)
+            if prompt_id in seen_ids:
+                raise ModelOutputMalformed("malformed_model_output", f"prompts[{idx}].id collision.")
+        except ModelOutputMalformed as exc:
+            if not allow_partial:
+                raise
+            if first_item_error is None:
+                first_item_error = exc
+            dropped_reasons.append(exc.message)
+            continue
+
         seen_prompts.add(normalized_prompt)
-
-        prompt_id = stable_id(prompt_value)
-        if prompt_id in seen_ids:
-            raise ModelOutputMalformed("malformed_model_output", f"prompts[{idx}].id collision.")
         seen_ids.add(prompt_id)
-
         prompts.append(
             {
                 "id": prompt_id,
@@ -183,7 +223,27 @@ def parse_and_validate(text: str) -> EvalPromptResult:
             }
         )
 
-    return {"prompts": prompts, "coverage_note": coverage_note_raw}
+    if not prompts and first_item_error is not None:
+        raise first_item_error
+
+    if n is not None:
+        prompts = prompts[:n]
+
+    normalized_note: str | None = None
+    if isinstance(coverage_note_raw, str):
+        stripped = coverage_note_raw.strip()
+        if stripped:
+            normalized_note = stripped
+    if dropped_reasons and (n is None or len(prompts) < n):
+        drop_summary = (
+            f"Retained {len(prompts)} of {n if n is not None else len(prompts_raw)} requested prompts "
+            f"(dropped {len(dropped_reasons)} invalid or duplicate candidate(s))."
+        )
+        normalized_note = f"{normalized_note} {drop_summary}".strip() if normalized_note else drop_summary
+    elif normalized_note is None and n is not None and len(prompts) < n:
+        normalized_note = f"Model returned {len(prompts)} of {n} requested prompts."
+
+    return {"prompts": prompts, "coverage_note": normalized_note}
 
 
 def stable_id(text: str) -> str:
@@ -196,7 +256,8 @@ def main() -> int:
     parser.add_argument("--n", type=int, default=5)
     args = parser.parse_args()
     try:
-        result = run(args.category, args.n)
+        with caller_context(transport="cli", client_name=f"local_assist.tools.{JOB}"):
+            result = run(args.category, args.n)
         print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0
     except LocalAssistError as exc:

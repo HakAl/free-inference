@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Sequence
 import json
 import os
 import shutil
@@ -12,8 +13,25 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
-if __name__ == "__main__" and VENV_PYTHON.exists() and Path(sys.executable) != VENV_PYTHON:
-    os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), __file__, *sys.argv[1:]])
+if __name__ == "__main__":
+    _SENSITIVE_LAUNCH_ENV_KEYS = (
+        "LOCAL_ASSIST_SESSION_TOKEN",
+        "OPENCODE_PASSWORD",
+        "OPENCODE_SERVER_PASSWORD",
+        "_FREE_INFERENCE_TOKEN_FD",
+    )
+    if any(_k in os.environ for _k in _SENSITIVE_LAUNCH_ENV_KEYS):
+        _clean_env = dict(os.environ)
+        for _k in _SENSITIVE_LAUNCH_ENV_KEYS:
+            _clean_env.pop(_k, None)
+        _target_py = str(VENV_PYTHON) if VENV_PYTHON.exists() else sys.executable
+        os.execve(
+            _target_py,
+            [_target_py, str(Path(__file__).resolve()), *sys.argv[1:]],
+            _clean_env,
+        )
+    if VENV_PYTHON.exists() and Path(sys.executable) != VENV_PYTHON:
+        os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), __file__, *sys.argv[1:]])
 
 sys.path.insert(0, str(ROOT))
 
@@ -26,6 +44,7 @@ from local_assist.launch import (
     allocate_side_by_side_port,
     build_isolated_opencode_env,
     check_endpoint_lifecycle_status,
+    check_uncontained_legacy_home,
     execute_worker_profile_session,
     is_port_owned_by_different_active_model,
     json_escape as _json_escape,
@@ -57,6 +76,14 @@ DEFAULT_WAIT_SECONDS = 60.0
 
 TEMPLATE_CONFIG = ROOT / "config" / "opencode-private-local.json.tmpl"
 DEFAULT_ISOLATED_HOME = ROOT / ".home" / "opencode-private-local"
+ISOLATED_HOME_ENV_VAR = "FREE_INFERENCE_OPENCODE_LOCAL_HOME"
+
+
+def _resolve_isolated_home() -> Path:
+    raw = os.environ.get(ISOLATED_HOME_ENV_VAR, "").strip()
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return DEFAULT_ISOLATED_HOME
 
 
 def validate_private_local_endpoint(
@@ -120,7 +147,9 @@ def render_private_local_config(
     context_limit: int = DEFAULT_CONTEXT_LIMIT,
     output_limit: int = DEFAULT_OUTPUT_LIMIT,
     edit_permission: str = "ask",
+    bash_permission: str = "ask",
     allow_subagents: bool = False,
+    plugins: Sequence[str] = (),
     lab_python: Path | None = None,
     lab_root: Path | None = None,
     workspace_dir: Path | None = None,
@@ -128,6 +157,8 @@ def render_private_local_config(
 ) -> str:
     if edit_permission not in ("ask", "allow", "deny"):
         raise ValueError(f"Invalid edit_permission: {edit_permission}")
+    if bash_permission not in ("ask", "allow", "deny"):
+        raise ValueError(f"Invalid bash_permission: {bash_permission}")
     if context_limit <= 0 or output_limit <= 0:
         raise ValueError("context_limit and output_limit must be positive integers")
 
@@ -141,15 +172,18 @@ def render_private_local_config(
     effective_workspace = (workspace_dir or Path.cwd()).resolve()
     subagent_enabled = "true" if allow_subagents else "false"
     subagent_permission = "allow" if allow_subagents else "deny"
+    plugins_json_str = json.dumps([str(p) for p in plugins])
 
     rendered = (
-        tmpl.replace("__API_BASE_URL__", _json_escape(effective_base_url))
+        tmpl.replace("__PLUGINS_JSON__", plugins_json_str)
+        .replace("__API_BASE_URL__", _json_escape(effective_base_url))
         .replace("__API_KEY_VALUE__", _json_escape(api_key_placeholder))
         .replace("__SERVED_MODEL_ID__", _json_escape(endpoint.served_model_id))
         .replace("__MODEL_ID__", _json_escape(endpoint.model_id))
         .replace("__CONTEXT_LIMIT__", str(int(context_limit)))
         .replace("__OUTPUT_LIMIT__", str(int(output_limit)))
         .replace("__EDIT_PERMISSION__", _json_escape(edit_permission))
+        .replace("__BASH_PERMISSION__", _json_escape(bash_permission))
         .replace("__SUBAGENT_ENABLED__", subagent_enabled)
         .replace("__SUBAGENT_PERMISSION__", subagent_permission)
         .replace("__LAB_PYTHON__", _json_escape(effective_python))
@@ -170,7 +204,7 @@ def build_private_local_env(
     base_env: dict[str, str] | None = None,
 ) -> dict[str, str]:
     pass_keys = (endpoint.api_key_envar,) if endpoint.api_key_envar else ()
-    return build_isolated_opencode_env(
+    env = build_isolated_opencode_env(
         workspace_dir,
         isolated_home,
         opencode_config_path,
@@ -179,6 +213,14 @@ def build_private_local_env(
         base_env=base_env,
         pass_through_env_keys=pass_keys,
     )
+    for secret_key in (
+        "LOCAL_ASSIST_SESSION_TOKEN",
+        "OPENCODE_PASSWORD",
+        "OPENCODE_SERVER_PASSWORD",
+        "_FREE_INFERENCE_TOKEN_FD",
+    ):
+        env.pop(secret_key, None)
+    return env
 
 
 def ensure_model_served(
@@ -379,6 +421,14 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
 
 
 def main(argv: list[str]) -> int:
+    for secret_key in (
+        "LOCAL_ASSIST_SESSION_TOKEN",
+        "OPENCODE_PASSWORD",
+        "OPENCODE_SERVER_PASSWORD",
+        "_FREE_INFERENCE_TOKEN_FD",
+    ):
+        os.environ.pop(secret_key, None)
+
     caller_cwd = Path.cwd()
     args, opencode_args = parse_args(argv)
 
@@ -405,6 +455,14 @@ def main(argv: list[str]) -> int:
 
     explicit_port = getattr(args, "port", None)
     refresh_session = bool(getattr(args, "refresh_session", False))
+
+    prechecked_isolated_home: Path | None = None
+    if active_profile is None:
+        prechecked_isolated_home = _resolve_isolated_home()
+        legacy_err = check_uncontained_legacy_home(prechecked_isolated_home)
+        if legacy_err is not None:
+            print(legacy_err, file=sys.stderr)
+            return 1
 
     try:
         model = load_model(args.model)
@@ -447,7 +505,9 @@ def main(argv: list[str]) -> int:
         print("opencode binary not found on PATH", file=sys.stderr)
         return 1
 
-    sandbox_exec_bin = Path("/usr/bin/sandbox-exec")
+    sandbox_exec_bin = Path(
+        os.environ.get("FREE_INFERENCE_SANDBOX_EXEC_BIN", "/usr/bin/sandbox-exec")
+    )
     worker_ok, validated_worker_args, worker_err = validate_worker_binary_and_args(
         args,
         active_profile,
@@ -519,20 +579,25 @@ def main(argv: list[str]) -> int:
                 "isolated_home": str(iso_home),
                 "config": compiled_cfg,
             },
+            endpoint_port=endpoint.port,
+            local_assist_port=int(endpoint.port or 8080),
             allocate_worker_home_fn=allocate_worker_home,
         )
 
-    isolated_home = DEFAULT_ISOLATED_HOME
-    for subdir in (".config", ".local/share", ".cache", ".local/state"):
-        (isolated_home / subdir).mkdir(parents=True, exist_ok=True)
-
+    isolated_home = (
+        prechecked_isolated_home
+        if prechecked_isolated_home is not None
+        else _resolve_isolated_home()
+    )
     edit_permission = "allow" if args.allow_edit else "ask"
+    bash_permission = "allow" if bool(getattr(args, "allow_bash", False)) else "ask"
     allow_subagents = bool(getattr(args, "allow_subagents", False))
     config_text = render_private_local_config(
         endpoint,
         context_limit=args.context_limit,
         output_limit=args.output_limit,
         edit_permission=edit_permission,
+        bash_permission=bash_permission,
         allow_subagents=allow_subagents,
         workspace_dir=caller_cwd,
     )
@@ -565,6 +630,13 @@ def main(argv: list[str]) -> int:
             "isolated_home": str(isolated_home),
             "config": cfg_dict,
         },
+        endpoint_port=endpoint.port,
+        local_assist_port=int(endpoint.port or 8080),
+        use_token_relay=False,
+        allowed_shell_localhost_ports=tuple(getattr(args, "allow_shell_localhost_port", None) or ()),
+        allow_ssh_remote=bool(getattr(args, "allow_ssh_remote", False)),
+        allow_self_edit=bool(getattr(args, "allow_self_edit", False)),
+        sandbox_exec_bin=sandbox_exec_bin,
     )
 
 

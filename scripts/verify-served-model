@@ -24,6 +24,12 @@ if (
     and (ROOT / ".venv" / "pyvenv.cfg").is_file()
     and Path(sys.executable) != VENV_PYTHON
 ):
+    _tok_fd_raw = os.environ.get("_FREE_INFERENCE_TOKEN_FD", "").strip()
+    if _tok_fd_raw.isdigit() and int(_tok_fd_raw) >= 3:
+        try:
+            os.set_inheritable(int(_tok_fd_raw), True)
+        except OSError:
+            pass
     os.environ["_LOCAL_ASSIST_VENV_REEXEC"] = "1"
     os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), __file__, *sys.argv[1:]])
 
@@ -402,12 +408,60 @@ def check_once_detailed(
     return True, endpoint.served_model_id, False
 
 
+def compute_probe_timeout_seconds(
+    endpoint: EndpointConfig,
+    *,
+    wait_seconds: float,
+    remaining_seconds: float,
+) -> float:
+    if endpoint.runtime != "proxy":
+        return 5.0
+    if wait_seconds <= 0.0:
+        return 15.0
+    return float(min(max(15.0, remaining_seconds), 30.0))
+
+
 def check_once(endpoint: EndpointConfig, timeout_seconds: float) -> tuple[bool, str]:
     ok, message, _ = check_once_detailed(endpoint, timeout_seconds)
     return ok, message
 
 
+def _consume_handoff_token_fd() -> str | None:
+    raw_fd = os.environ.pop("_FREE_INFERENCE_TOKEN_FD", "").strip()
+    if not raw_fd:
+        return None
+    try:
+        fd = int(raw_fd)
+    except ValueError:
+        return None
+    if fd < 3:
+        return None
+    try:
+        os.set_inheritable(fd, False)
+    except OSError:
+        return None
+    chunks: list[bytes] = []
+    total = 0
+    try:
+        while total < 4096:
+            chunk = os.read(fd, 4096 - total)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+    except OSError:
+        return None
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+    tok = b"".join(chunks).decode("utf-8", errors="replace").strip()
+    return tok or None
+
+
 def main(argv: list[str]) -> int:
+    handoff_token = _consume_handoff_token_fd()
     parser = argparse.ArgumentParser(
         description="Verify the configured model endpoint is serving the expected model."
     )
@@ -467,6 +521,7 @@ def main(argv: list[str]) -> int:
                 pid_record=pid_record,
                 require_api_key=True,
                 port_override=args.port,
+                session_token_override=handoff_token,
             )
         except RegistryError as exc:
             if time.monotonic() >= deadline:
@@ -475,9 +530,14 @@ def main(argv: list[str]) -> int:
             time.sleep(args.poll_interval)
             continue
 
+        probe_timeout = compute_probe_timeout_seconds(
+            endpoint,
+            wait_seconds=args.wait,
+            remaining_seconds=max(0.0, deadline - time.monotonic()),
+        )
         ok, message, is_mismatch = check_once_detailed(
             endpoint,
-            timeout_seconds=5,
+            timeout_seconds=probe_timeout,
             pid_record=pid_record,
             require_offline=args.require_offline,
         )

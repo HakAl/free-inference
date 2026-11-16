@@ -16,26 +16,33 @@ A small MCP server that exposes a locally-served model as a set of structured-ou
 free-inference/
 ├── scripts/
 │   ├── local-assist-server          # MCP entry point (--auto-serve optional)
-│   ├── delegate-local               # CLI entry point for planner delegation
+│   ├── assist-status                # Credential-free CLI status check for Rung 1 & active proxies
+│   ├── delegate-local               # CLI entry point (delegate_task + status/compress-context/extract-fields/select-context/check-assertion)
 │   ├── delegate-local-e2e           # Live D1 negative test + lsof-sampled cold-start check
+│   ├── eval-local-assist-dogfood    # Repeated 3-5x unseen-fixture reliability & latency harness
 │   └── sync-model-catalog           # Upstream model catalog drift checker & issue reconciler
 ├── local_assist/                    # Python package (stdlib-portable)
 │   ├── _miniyaml.py                 # Fail-closed zero-dependency YAML 1.2 subset parser
 │   ├── catalog_sync.py              # Self-healing model catalog verifier & surgical YAML updater
 │   ├── client.py                    # Loopback HTTP client + 5-rung data-control admission gates
 │   ├── lifecycle.py                 # Pre-chat listener verification + opt-in auto-serve + chat check
-│   ├── logging.py                   # JSONL writer (redacts delegate_task context and compress/extract text)
+│   ├── logging.py                   # JSONL writer (redacts file/context inputs; separates error_tokens)
 │   ├── mcp_server.py                # Stdlib JSON-RPC 2.0 / MCP stdio framing (line + Content-Length)
 │   ├── registry.py                  # 5-rung models.yaml validator, endpoint resolver, pid_lstart helpers
+│   ├── relay.py                     # Parent-process SessionAuthRelay + credential leak detectors
 │   ├── routing.py                   # Job -> served OpenAI model ID table
 │   ├── se_key.py                    # Secure Enclave proxy verifier + serve_command / binary ownership checks
-│   ├── security_profile.py          # Unattended worker Seatbelt + OpenCode profile compiler & lifecycle
+│   ├── security_profile.py          # Interactive & worker Seatbelt + OpenCode profile compiler & lifecycle
 │   ├── server.py                    # MCP tool registration and dispatch
+│   ├── workspace.py                 # Shared O_NOFOLLOW + workspace realpath confinement helper
 │   └── tools/
+│       ├── assist_status.py
+│       ├── check_eval_assertion.py
 │       ├── propose_eval_prompts.py
 │       ├── extract_fields.py
 │       ├── compress_context.py
-│       └── delegate_task.py
+│       ├── delegate_task.py
+│       └── select_context.py
 └── runs/
     └── local-assist/
         ├── YYYY-MM-DD.jsonl         # daily index, append-only
@@ -54,6 +61,8 @@ free-inference/
 | `LOCAL_ASSIST_AUTO_SERVE` | unset (`0`) | Set to `1` (or pass `--auto-serve`) to let `ensure_local_model_served()` auto-start the cleared Rung 1 model (`qwen3-30b-a3b-2507-mlx-4bit`) on `127.0.0.1:8080`. |
 | `LOCAL_ASSIST_TIMEOUT_SECONDS` | `120` | Overall deadline in seconds (`1..3600`) shared across `ensure_local_model_served()`, `require_chat_succeeds()`, and `chat()`. |
 | `LOCAL_ASSIST_WORKSPACE_ROOT` | Caller `pwd -P` | Workspace directory confinement boundary enforced on `delegate_task` `context_path` reads. |
+| `LOCAL_ASSIST_CALLER` | unset | Optional human-readable caller label (`<= 128` chars, control chars stripped) recorded in `caller.label` inside `runs/local-assist/` telemetry. Self-reported telemetry only (not authentication). |
+| `LOCAL_ASSIST_LOG_DIR` | `runs/local-assist` | Optional override directory for `YYYY-MM-DD.jsonl` index files and per-call `YYYY-MM-DD/<slug>.json` payloads. |
 
 ## Client responsibilities (`client.py`)
 
@@ -66,48 +75,74 @@ Neither strip is "fixing" model behavior; both are normalizing known artifacts s
 
 ## MCP tool surface
 
-Four tools. Return types are shaped so consuming skills can verify each item independently:
+Seven tools. Return types are shaped so consuming skills can verify each item independently:
 
 ```python
+assist_status() -> AssistStatusResult
+check_eval_assertion(
+    assertion: dict[str, str],          # {"type": "javascript"|"regex"|"icontains"|"is-json", "value": ...}
+    passing_outputs: list[str],         # 1..20 outputs that must satisfy assertion
+    failing_outputs: list[str],         # 1..20 outputs that must fail assertion
+) -> CheckEvalAssertionResult
 propose_eval_prompts(category: str, n: int = 5) -> EvalPromptResult
-extract_fields(text: str, fields: dict[str, FieldSpec]) -> ExtractFieldsResult
+extract_fields(
+    fields: dict[str, FieldSpec],
+    text: str | None = None,            # mutually exclusive with context_path
+    context_path: str | None = None,
+) -> ExtractFieldsResult
 compress_context(
-    kind: str,                  # one of: diff, test_output, logs
-    text: str,
+    kind: str,                          # one of: diff, test_output, logs
+    text: str | None = None,            # mutually exclusive with context_path
+    context_path: str | None = None,
     focus: str | None = None,
-    max_items: int = 10,
+    max_items: int = 10,                # 1..50
 ) -> CompressContextResult
+select_context(
+    query: str,                         # 1..2000 chars
+    paths: list[str],                   # 1..10 workspace-confined file paths (<= 32768B each, <= 96000B combined)
+    max_excerpts: int = 5,              # 1..10
+    max_lines_per_excerpt: int = 40,    # 1..120
+) -> SelectContextResult
 delegate_task(
-    kind: str,                  # one of: draft_code, generate_test_cases, transform_text, focused_qa
-    instruction: str,           # 1..8000 chars
-    context: str | None = None, # <= 32000 chars; mutually exclusive with context_path
+    kind: str,                          # one of: draft_code, generate_test_cases, transform_text, focused_qa
+    instruction: str,                   # 1..8000 chars
+    context: str | None = None,         # <= 32000 chars; mutually exclusive with context_path
     context_path: str | None = None,
     constraints: list[str] | None = None,
-    max_tokens: int = 1536,     # 256..2048
+    max_tokens: int = 1536,             # 256..2048
 ) -> DelegateTaskResult
 ```
 
+### `assist_status` and `check_eval_assertion` (deterministic, 0 model tokens)
+
+- `assist_status` returns credential-free server/workspace metadata, Rung 1 model readiness (`pid_alive`, `offline_verified`, `live_served`), and deduplicated active session metadata (`session_token_managed` boolean only; never environment variables, raw tokens, or token file paths; zero audit log writes and zero auto-serve). Also available via `./scripts/assist-status` (`--json`) and `./scripts/delegate-local status` (`assist_status`).
+- `check_eval_assertion` runs a candidate `javascript`, `regex`, `icontains`, or `is-json` assertion against caller-supplied `passing_outputs` and `failing_outputs` (`1..20` items each) inside an OS Seatbelt + Node `--permission` sandbox (`sandbox-exec` on host, or inherited interactive/worker Seatbelt verified with immutable `0500` `bin/local-assist-node`), reporting `false_rejects`, `false_accepts`, and `runtime_errors`.
+
 ### `propose_eval_prompts`
 
-Generates candidate promptfoo eval prompts with executable JavaScript assertions. The model returns prompt text, expected signal description, the assertion expression, and a category. The tool validates parse/schema/non-empty fields/category/duplicate prompt text and assigns stable IDs.
+Generates candidate promptfoo eval prompts with syntax-checked synchronous JavaScript assertions (`max_tokens=1536` completion ceiling; rejects fenced code blocks inside `assertion` and invalid JS syntax). When `n >= 2` and a subset of candidates fails validation or duplicates an earlier prompt, valid surviving items are retained with an explanatory `coverage_note` instead of discarding the entire batch.
 
-The consuming skill provides the external contract: render candidates into a generated JSON promptfoo config, run against at least two runnable models, keep candidates whose pass/fail vector is non-uniform across models, print observed vectors.
+The consuming skill provides the external contract: test candidate assertions with `check_eval_assertion`, render candidates into a generated JSON promptfoo config, run against at least two runnable models, keep candidates whose pass/fail vector is non-uniform across models, print observed vectors.
 
 ### `extract_fields`
 
-Extracts a caller-supplied flat schema from source text. The caller defines each field as `string`, `integer`, `number`, `boolean`, or `string_list`, with a description and optional `required` flag.
+Extracts a caller-supplied flat schema from `text` or workspace-confined `context_path` (descriptor-pinned `O_NOFOLLOW`, `<= 400000` bytes, `<= 100000` chars). The caller defines each field as `string`, `integer`, `number`, `boolean`, or `string_list`, with a description and optional `required` flag.
 
-The tool validates that scalar fields match their requested JSON type or return `null` when absent, `string_list` fields always return an array of strings (never `null`), and `missing_required` is computed by the tool from required fields whose extracted value is `null`.
+The tool validates that scalar fields match their requested JSON type or return `null` when absent (normalizing model `"null"`/`"None"`/`"N/A"` sentinel strings to JSON `null`), `string_list` fields always return an array of strings (never `null`), and `missing_required` is computed by the tool from required fields whose extracted value is `null`.
 
 ### `compress_context`
 
-Compresses noisy context into structured action notes. Supported kinds are `diff`, `test_output`, and `logs`. Returns `summary`, `key_points`, `changed_files`, `failures`, `risks`, `commands`, `followups`, and `omitted`.
+Compresses noisy context from `text` or workspace-confined `context_path` (`<= 800000` bytes, `<= 200000` chars) into structured action notes. Supported kinds are `diff`, `test_output`, and `logs`. Returns `summary`, `key_points`, `changed_files`, `failures`, `risks`, `commands`, `followups`, and `omitted` (`max_tokens = min(1536, 256 + 180 * max_items)` with deterministic clamping to `max_items`).
 
-For `kind=diff`, every `changed_files` entry is mechanically verified against paths present in diff headers; the tool guarantees those came from the input. The other fields are model judgment, not extracted facts; the caller validates them externally.
+For `kind=diff`, every `changed_files` entry is mechanically verified against paths present in diff headers; for `kind != diff`, `changed_files` and `commands` entries are filtered so only paths and commands grounded in the source text survive.
+
+### `select_context`
+
+Selects relevant workspace excerpts (`1..10` confined files, `<= 32768` bytes each and `<= 96000` bytes combined) for a caller `query` (`1..2000` chars) without sending full raw files to a remote planner. The local Rung 1 model proposes `{path, start_line, end_line, reason}` ranges only; `select_context` numbers lines strictly on ASCII `\n` boundaries (`\n` and `\r\n`, without splitting on bare `\r` or Unicode line separators such as `\u2028`), slices exact verbatim `excerpt` substrings preserving original source line endings (`\n` or `\r\n`), and computes `source_sha256` directly from disk, clamping/rejecting out-of-bounds ranges, deduplicating overlapping spans, and returning `{excerpts, unanswered_aspects}`. Returned excerpts still enter the calling planner's data-control rung.
 
 ### `delegate_task`
 
-Delegates a bounded code/test/text/Q&A subtask (`draft_code`, `generate_test_cases`, `transform_text`, or `focused_qa`) to the cleared Rung 1 local model (`qwen3-30b-a3b-2507-mlx-4bit`) at $0 marginal cost. Accepts `instruction` (`<= 8000` chars), optional mutually exclusive `context` or `context_path` (`<= 32000` chars; `context_path` must be a regular non-symlink file inside `LOCAL_ASSIST_WORKSPACE_ROOT` / `cwd` with no `..` traversal and `<= 128000` bytes), optional `constraints` (`<= 20` items), and `max_tokens` (`256..2048`, default `1536`).
+Delegates a bounded code/test/text/Q&A subtask (`draft_code`, `generate_test_cases`, `transform_text`, or `focused_qa`) to the cleared Rung 1 local model (`qwen3-30b-a3b-2507-mlx-4bit`) at $0 marginal cost. Accepts `instruction` (`<= 8000` chars), optional mutually exclusive `context` or `context_path` (`<= 32000` chars; `context_path` must be a regular non-symlink file inside `LOCAL_ASSIST_WORKSPACE_ROOT` / `cwd` with descriptor-pinned `O_NOFOLLOW`, no `..` traversal, and `<= 128000` bytes), optional `constraints` (`<= 20` items), and `max_tokens` (`256..2048`, default `1536`). Enforces completion length rejection (`finish_reason == "length"` raises `output_truncated`) and deterministically serializes non-empty JSON array/object `output` payloads when a model emits structured JSON instead of a string. Also exposed via `./scripts/delegate-local` (`delegate_task` / `delegate-task`, `assist_status` / `status`, `compress_context` / `compress-context`, `extract_fields` / `extract-fields`, `propose_eval_prompts` / `propose-eval-prompts`, `select_context` / `select-context`, and `check_eval_assertion` / `check-assertion` subcommands).
 
 Returns `id`, `kind`, `summary`, `output`, `ungrounded_identifiers`, `assumptions`, and `unverified_claims`:
 - **Mechanical fields**: `id` is `sha256(normalized_output)[:10]`; `ungrounded_identifiers` is computed deterministically by scanning `output` for URLs, Python/JS imports, and multi-word proper nouns absent as whole tokens/phrases from `instruction + context + constraints` (excluding `<pkg>-free` tokens from grounding).
@@ -123,6 +158,7 @@ JOB_TO_MODEL = {
     "extract_fields": "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit",
     "compress_context": "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit",
     "delegate_task": "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit",
+    "select_context": "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit",
 }
 ```
 
@@ -140,24 +176,39 @@ Every tool's system prompt follows the same shape:
 
 ## Logging schema
 
-JSONL index for fast scan, full payload as a sibling JSON file:
+JSONL index (`runs/local-assist/<YYYY-MM-DD>.jsonl`) for fast scan, full payload (`runs/local-assist/<YYYY-MM-DD>/<slug>.json`) as a sibling JSON file:
 
 ```json
 {
-  "ts": "2026-10-31T14:30:00-04:00",
+  "ts": "2026-11-11T14:30:00-05:00",
   "tool": "propose_eval_prompts",
+  "caller": {
+    "transport": "mcp",
+    "client_name": "codex-mcp-client",
+    "client_version": "0.164.0",
+    "protocol_version": "2025-03-26",
+    "label": "codex"
+  },
   "requested_model": "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit",
   "served_model": "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit",
+  "startup_state": "warm",
+  "readiness_ok": true,
+  "ready_ms": 18,
   "args_summary": {"category": "reasoning", "n_requested": 5},
   "observed": {"n_returned": 5, "coverage_note_present": false},
   "usage": {"prompt_tokens": 120, "completion_tokens": 480},
   "latency_ms": 4321,
+  "elapsed_ms": 4340,
   "finish_reason": "stop",
-  "payload_path": "runs/local-assist/2026-10-31/14-30-00-propose-eval-prompts-a4f3.json"
+  "payload_path": "runs/local-assist/2026-11-11/14-30-00-propose-eval-prompts-a4f3.json"
 }
 ```
 
-`payload_path` is relative to the repo root. `served_model` is captured separately from `requested_model` so audits can detect any drift between what the tool asked for and what answered.
+- `payload_path` is relative to the repo root. `served_model` is captured separately from `requested_model` so audits can detect any drift between what the tool asked for and what answered.
+- `caller` records `transport` (`"mcp"`, `"cli"`, or `"direct"`), sanitized MCP `initialize` `clientInfo` (`client_name`, `client_version`, `protocol_version`), and optional `LOCAL_ASSIST_CALLER` (`label`). Note that `caller` and `clientInfo` are self-reported telemetry for usage attribution, not authentication evidence.
+- `startup_state` records the observed `ensure_local_model_served()` branch (`"warm"`, `"worker_handoff"`, `"auto_served"`, `"auto_serve_reused"` when `scripts/serve-model` reused an already active/starting server, `"auto_serve_failed"`, `"not_served"`, or `null` when readiness did not run). Note that mocked `serve-model` runners without `serve-model`'s reuse stdout banner record `"auto_served"`.
+- `readiness_ok` (`true`, `false`, or `null` if input validation failed before readiness ran) and `ready_ms` record phase-level `require_chat_succeeds()` outcome and wall time separately from model completion `latency_ms` and total tool `elapsed_ms`. Unhandled internal `Exception`s inside tool bodies are also logged with `error.code = "internal_error"`.
+- Summarize telemetry offline across callers and tools with `./scripts/local-assist-stats` (`--days N` trailing `America/New_York` calendar window, `--date YYYY-MM-DD`, `--as-of YYYY-MM-DD`, `--log-dir PATH`, `--json`), which reports inclusive token totals across all logged calls (`tokens.prompt_tokens`, `tokens.completion_tokens`, `tokens.total_tokens`, `tokens.cached_tokens`) alongside nested failed/rejected-call token totals (`error_tokens.prompt_tokens`, `error_tokens.completion_tokens`, `error_tokens.total_tokens`, `error_tokens.cached_tokens`).
 
 ## Lifecycle expectations
 
@@ -198,7 +249,7 @@ See `docs/decisions/2026-11-10-codex-claude-agy-wire-discovery.md` for the wire-
 
 ### Tool annotations, approval behavior, and timeout budgets
 
-- **Truthful MCP `ToolAnnotations` (`readOnlyHint: false`, `openWorldHint: false`)**: Every `local_assist` tool persists local run audit logs under `runs/local-assist/` and, when `--auto-serve` (`LOCAL_ASSIST_AUTO_SERVE=1`) is enabled, can start a persistent detached local MLX server via `scripts/serve-model --started-by auto-serve`. Therefore all four tools advertise `annotations: {"readOnlyHint": false, "openWorldHint": false}` rather than claiming `readOnlyHint: true`.
+- **Truthful MCP `ToolAnnotations`**: Side-effect-free `assist_status` (zero disk writes, zero model inference, zero auto-serve, zero secret access) advertises `annotations: {"readOnlyHint": true, "openWorldHint": false}`. The six logged tools (`check_eval_assertion`, `propose_eval_prompts`, `extract_fields`, `compress_context`, `select_context`, `delegate_task`) persist local run audit logs under `runs/local-assist/` and, when `--auto-serve` (`LOCAL_ASSIST_AUTO_SERVE=1`) is enabled on model-backed tools, can start a persistent detached local MLX server via `scripts/serve-model --started-by auto-serve`; therefore those six tools advertise `annotations: {"readOnlyHint": false, "openWorldHint": false}` with `destructiveHint` omitted.
 - **Timeout budget (`180` seconds recommended)**: `local_assist` defaults to a `120`-second request budget (`LOCAL_ASSIST_TIMEOUT_SECONDS=120`), shared across optional `--auto-serve` cold-start (`45`s default wait), `/v1/models` + smoke health check, and completion. Set your MCP client's tool timeout to `180` seconds (`tool_timeout_sec = 180` in Codex, `timeout: 180000` in OpenCode) so the client does not cut off a valid cold-start or long completion after `60` seconds. If you increase `LOCAL_ASSIST_TIMEOUT_SECONDS` above `120`, keep `tool_timeout_sec >= LOCAL_ASSIST_TIMEOUT_SECONDS + 60`.
 - **Data-control boundary when called from a Rung 4/5 planner**: When `codex`, `claude`, or `agy` calls `local_assist`, the subtask inference runs locally on Rung 1 (`127.0.0.1:8080/v1`, `$0` marginal API cost). `local_assist/client.py` (`open_loopback_http`) and `scripts/verify-served-model` open loopback connections via `ProxyHandler({})` and refuse HTTP redirects, so ambient `HTTP_PROXY` / `ALL_PROXY` variables or macOS system proxy settings inherited by a bare MCP registration never divert local Rung 1 requests to an external proxy. Passing `context_path` to `delegate_task` reads the file directly inside the local tool without putting the raw file contents into the remote planner's outbound prompt, but the returned tool output enters the calling planner's session context and data-control rung.
 

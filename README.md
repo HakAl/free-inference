@@ -6,8 +6,8 @@ Most "free inference" lists optimize for `$0` API tiers where your prompts and c
 
 1. **5-rung data control**: Keep prompts, repository context, and outputs under the highest practical data control that clears the capability bar for the task.
 2. **Freedom of use**: Run open-weight coding models without opaque third-party content filters or silent middleware blocking legitimate engineering and security work.
-3. **Verifiable boundaries**: Prompts leave the machine for a remote confidential compute enclave only through a local verifying proxy (`se-key-proxy` -> `tinfoil-proxy`), with an explicit registry boundary between **weight-attested** enclaves on Rung 2 and **runtime-attested** enclaves on Rung 3.
-4. **Hardware-backed key sealing**: Remote API keys never sit in `.env` files, shell profiles, or `os.environ`. They are sealed with an Apple Silicon Secure Enclave `.biometryCurrentSet` ECIES key and unsealed into `se-key-proxy` memory via a single live Touch ID tap per 12-hour session.
+3. **Verifiable boundaries**: Prompts leave the machine for a remote confidential compute enclave only through a local verifying proxy (`se-key-proxy` -> `tinfoil-proxy` or `privatemode-proxy`), with an explicit registry boundary between **weight-attested** enclaves on Rung 2 and **runtime-attested** enclaves on Rung 3.
+4. **Hardware-backed key sealing**: Remote API keys never sit in `.env` files, shell profiles, or `os.environ`. They are sealed with an Apple Silicon Secure Enclave `.biometryCurrentSet` ECIES key and unsealed into `se-key-proxy` memory through live Touch ID authorization. Interactive windows default to 2 hours and can be renewed explicitly.
 5. **No silent downgrades**: Every model is gated by executable evals across `sanity`, `v1`, `tools`, and `opencode-smoke`, and no launcher or client ever silently falls back to a lower-control rung.
 
 ---
@@ -20,7 +20,7 @@ Every endpoint in [`models.yaml`](models.yaml) is ordered along five explicit da
 |---|---|---|
 | **1**<br>Local | `local`: Local weights (`mlx-lm`), localhost `127.0.0.1:8080`, `HF_HUB_OFFLINE=1` forced at serve time | `qwen3-30b-a3b-2507-mlx-4bit`<br>`1/1` sanity, `10/10` v1, `4/4` tools, `PASS` smoke ([evidence](docs/evals/qwen3-30b-a3b-2507-mlx-4bit.json))<br>Launcher: `./scripts/opencode-local` |
 | **2**<br>Weights TEE | `enclave_weights_attested`: Hardware TEE + local proxy verifies enclave measurement **and** local `dm-verity` `weights_hash` reproduction against a pinned HF commit | *`0` models today (requires local `modelwrap --verify` build)*<br>Launcher: `./scripts/opencode-attested` |
-| **3**<br>Runtime TEE | `enclave_runtime_attested`: Hardware TEE + `tinfoil-proxy` verifies SEV-SNP / TDX measurement & Sigstore provenance + `se-key-proxy` verifies kernel socket PCB (`libproc`) | `tinfoil-deepseek-v4-1-flash` (1M ctx)<br>`1/1` sanity, `9/10` v1, `4/4` tools, `PASS` smoke ([evidence](docs/evals/tinfoil-deepseek-v4-1-flash.json))<br>Launcher: `./scripts/opencode-attested` |
+| **3**<br>Runtime TEE | `enclave_runtime_attested`: Hardware TEE + local attesting proxy (`tinfoil-proxy` or `privatemode-proxy`) verifies SEV-SNP / TDX / NVIDIA CC measurement + `se-key-proxy` verifies kernel socket PCB (`libproc`) | `tinfoil-deepseek-v4-1-flash` (1M ctx, US, catalog default: [evidence](docs/evals/tinfoil-deepseek-v4-1-flash.json))<br>`privatemode-glm-5-3-flash` (1M ctx, DE/EU, cleared: [evidence](docs/evals/privatemode-glm-5-3-flash.json))<br>Launcher: `./scripts/opencode-attested` |
 | **4**<br>ZDR API | `zdr_contract`: Contractual zero data retention over standard TLS (`store=False`) | Blocked from private coding *(eval / general only)* |
 | **5**<br>Standard API | `standard_api`: Standard retaining third-party API | Blocked from private coding *(eval / general only)* |
 
@@ -98,18 +98,22 @@ Seal your [Tinfoil](https://tinfoil.sh) API key into the Apple Silicon Secure En
 ./scripts/se-key migrate free-inference.tinfoil
 ```
 
-Then launch OpenCode from your target project workspace against the default cleared Rung 3 enclave model (`tinfoil-deepseek-v4-1-flash`, 1M token context window):
+Then launch OpenCode from your target project workspace against a cleared Rung 3 enclave model (`tinfoil-deepseek-v4-1-flash` is pinned as the catalog default via `routing.default_private_attested: true` in `models.yaml`; `privatemode-glm-5-3-flash` in `DE/EU` is also cleared and runs without `--allow-uncleared-model` after `./scripts/setup --with-privatemode` and `./scripts/se-key store free-inference.privatemode`):
 
-> **Pricing & Spend Ceiling (`tinfoil-deepseek-v4-1-flash`)**: Paid API calls bill against your Tinfoil account at **$0.60 / 1M input tokens ($0.01 cached) and $1.45 / 1M output tokens** (verified `2026-11-07` via `./scripts/sync-model-catalog` against Tinfoil's attested router and `tinfoil.sh/pricing`). Pass `--max-session-usd <usd>` (for example `--max-session-usd 5.00`) to enforce a pre-flight worst-case session spend ceiling before starting or attaching to a proxy session.
+> **Default Model Selection & Spend Ceiling**: When `--model` is omitted, `opencode-attested` checks `FREE_INFERENCE_DEFAULT_ATTESTED_MODEL`, then `routing.default_private_attested: true` at the highest cleared data-control rung, then active session / installed proxy / sealed envelope narrowing within that rung, then LIFO catalog order. Paid API calls on `tinfoil-deepseek-v4-1-flash` bill at **$0.60 / 1M input tokens ($0.01 cached) and $1.45 / 1M output tokens** (`2026-11-07`), and `privatemode-glm-5-3-flash` bills at **EUR 0.20 / 1M input ($0.22 equiv, EUR 0.05 cached) and EUR 0.65 / 1M output ($0.72 equiv)** (`2026-11-13`). Pass `--max-session-usd <usd>` (for example `--max-session-usd 5.00`) to enforce a pre-flight worst-case session spend ceiling before starting or attaching to a proxy session.
 
 ```bash
 cd /path/to/your/project
 
-# Interactive TUI session (prompts Touch ID once to start a 12-hour proxy session)
+# Interactive TUI session (prompts Touch ID once to start a 2-hour proxy session)
 /path/to/free-inference/scripts/opencode-attested
 
-# Renew/restart the 12-hour proxy session at any time (prompts Touch ID once for a fresh 12h TTL)
-/path/to/free-inference/scripts/opencode-attested --refresh-session
+# Launch the cleared DE/EU Privatemode Rung 3 model directly (or set FREE_INFERENCE_DEFAULT_ATTESTED_MODEL=privatemode-glm-5-3-flash)
+/path/to/free-inference/scripts/opencode-attested --model privatemode-glm-5-3-flash
+
+# Inspect time and shared requests, or renew in place with fresh Touch ID
+/path/to/free-inference/scripts/session status --model tinfoil-deepseek-v4-1-flash
+/path/to/free-inference/scripts/session renew --model tinfoil-deepseek-v4-1-flash --for 2h
 
 # Interactive session with an explicit $5.00 worst-case spend ceiling
 /path/to/free-inference/scripts/opencode-attested --max-session-usd 5.00 --max-chat-requests 100 --max-request-bytes 262144 --max-tokens-cap 4096
@@ -118,7 +122,7 @@ cd /path/to/your/project
 /path/to/free-inference/scripts/opencode-attested -- run "Review the current git diff for security issues"
 ```
 
-To try another evaluated Rung 3 candidate (`tinfoil-kimi-k3-1-pro`, `tinfoil-glm-5-3`, or `tinfoil-gpt-oss-120b`), pass `--model <id> --allow-uncleared-model`. If another model is already serving on port `8081`, `opencode-attested` automatically allocates the next free side-by-side localhost port pair (`8082`/`9082`, `8083`/`9083`, ...) and writes an isolated per-invocation OpenCode config so both sessions run concurrently without interfering (models with `deprecated: true` or a `deprecation_date` in `models.yaml`, such as `tinfoil-kimi-k3`, are blocked unless `--allow-deprecated-model` is also passed):
+To try an uncleared Rung 3 candidate (`tinfoil-kimi-k3-1-pro`, `tinfoil-glm-5-3`, `tinfoil-gpt-oss-120b`, or `privatemode-glm-5-3`), pass `--model <id> --allow-uncleared-model`. If another model is already serving on port `8081`, `opencode-attested` automatically allocates the next free side-by-side localhost port pair (`8082`/`9082`, `8083`/`9083`, ...) and writes an isolated per-invocation OpenCode config so both sessions run concurrently without interfering (models with `deprecated: true` or a `deprecation_date` in `models.yaml`, such as `tinfoil-kimi-k3`, are blocked unless `--allow-deprecated-model` is also passed):
 
 ```bash
 # Runs side-by-side (automatically selects 127.0.0.1:8082 if 8081 is occupied by another model)
@@ -151,16 +155,16 @@ See [`docs/runbooks.md`](docs/runbooks.md) for copy-paste operator runbooks cove
    extract_fields, propose_eval_prompts)
 ```
 
-- **One Touch ID per session, zero prompts per CLI call**: When `scripts/serve-model` starts `se-key-proxy` on `127.0.0.1:8081`, `scripts/serve-model` generates a random `0600` session token (`runs/.se-session-*.token`) and passes it to `se-key-proxy` over an inherited pipe (`--session-token-fd`). You tap Touch ID once, and `se-key-proxy` unseals the API key into process memory (`PT_DENY_ATTACH`) for up to 12 hours (`--ttl-seconds 43200`) and 1,000 chat turns (`--max-chat-requests 1000`). All parallel OpenCode panes and CLI calls attach automatically using the session token without re-prompting Touch ID.
+- **Explicit Touch ID windows, zero prompts per attached CLI call**: `scripts/serve-model` passes a random proxy token through an inherited pipe. The key holder unseals the API key into process memory (`PT_DENY_ATTACH`), publishes a protected generation-bound credential envelope, and exposes credential-free status through an owner-only control socket. Interactive sessions default to 2 hours and 1,000 shared chat requests, including title generation. `scripts/session renew --for 2h` requires fresh Touch ID, rotates the token in place, and preserves the remaining request budget. `session stop` revokes it immediately; `session watch --notify` provides foreground warnings. Windows are capped at 24 hours. Stop and expiry interrupt active streams.
 - **Kernel socket ownership verification (`F1`)**: Before forwarding any request or `Authorization` header over loopback to `tinfoil-proxy` (`127.0.0.1:9081`), `se-key-proxy` queries XNU `<libproc.h>` (`proc_pidinfo` + `proc_pidfdinfo`) to verify that the expected `tinfoil-proxy` PID and matching kernel start time (`pbi_start_tvsec`/`pbi_start_tvusec`) own the non-`SO_REUSEPORT` listening TCP kernel control block (`soi_pcb`).
-- **Isolated OpenCode home & zero cloud leakage**: Both `./scripts/opencode-local` and `./scripts/opencode-attested` run `opencode` with an isolated `HOME` (`.home/opencode-*`), `OPENCODE_DISABLE_MODELS_FETCH=1`, `OPENCODE_DISABLE_AUTOUPDATE=1`, `OPENCODE_DISABLE_PROJECT_CONFIG=1`, `webfetch`/`websearch` denied, and `apiKey: "{env:LOCAL_ASSIST_SESSION_TOKEN}"` so the literal session token is never written to `opencode.json`.
+- **Isolated OpenCode home and credential custody**: Both launchers isolate OpenCode state and disable model fetching, auto-update, project config, webfetch, and websearch. The attested launcher keeps the proxy token in its trusted parent relay; OpenCode receives only a per-invocation relay credential, confined by the Seatbelt sandbox and credential guard. See [SECURITY.md](SECURITY.md) for the enforced boundary and residual limits.
 
 ### Threat Model & Asset Boundary
 
 See [`SECURITY.md`](SECURITY.md) for the full threat model. Key operational boundaries:
 
-- **Ephemeral session token (`LOCAL_ASSIST_SESSION_TOKEN`) vs. sealed API key**: The launchers write `"apiKey": "{env:LOCAL_ASSIST_SESSION_TOKEN}"` to `opencode.json` rather than writing the literal token to config. Scans of evaluated `opencode-smoke` and `opencode-attested-e2e` runs found `0` literal token matches across `.home/` (including `opencode.db`), though OpenCode's internal SQLite persistence is not independently audited. Because `LOCAL_ASSIST_SESSION_TOKEN` resides in the `opencode` process environment, it is inherited by child processes (such as operator-approved `bash` tool commands) and is readable by same-UID local processes; an approved `bash` command that prints its environment (such as `env` or `printenv`) could also place the session token into tool output and OpenCode's stored session database (`opencode.db`). This session token **never** exposes your Secure Enclave-sealed provider API key; it grants access only to the active single-model loopback proxy (`127.0.0.1:8081`) within the session's `--max-chat-requests`, `--max-tokens-cap`, `--max-request-bytes`, and `--ttl-seconds` limits, and is revoked immediately by `./scripts/stop-model <model-id>`.
-- **Operator-approved `bash` commands and `SSH_AUTH_SOCK`**: Interactive `bash`, `edit`, `write`, and `patch` tools require operator approval (`"ask"`). Once approved, `bash` commands run in your normal user shell without an OS-level network sandbox (unless enforced by a host firewall such as LuLu), and `SSH_AUTH_SOCK` is passed through in `SAFE_ENV_ALLOWLIST` so approved `git` operations can authenticate via your SSH agent.
+- **Proxy credential vs. sealed API key**: The provider API key stays in key-holder memory. The upstream proxy token stays in the trusted launcher and its protected credential file; it is not exported to OpenCode or child environments. Each successful renewal replaces it, while stop or hard expiry terminates its authority. Interactive relays follow the live window; workers keep their own deadlines and budgets. This does not clean up credentials stored by historical sessions; containment remains a separate operator action.
+- **Operator-approved shell commands and `SSH_AUTH_SOCK`**: Interactive shell, edit, write, and patch tools require operator approval and run within the launcher's Seatbelt confinement. `SSH_AUTH_SOCK` preserves permitted SSH agent signing; outbound SSH requires the explicit `--allow-ssh-remote` option. See [SECURITY.md](SECURITY.md) for the process, filesystem, and network boundaries.
 - **Rung 1 offline check is pre-flight**: `scripts/serve-model` launches Rung 1 servers with `HF_HUB_OFFLINE=1` and `TRANSFORMERS_OFFLINE=1`, and `scripts/verify-served-model --require-offline` verifies `hf_offline: true` in the `pid_lstart`-bound PID record plus the live OS listener `--model` flag (`lsof` + `ps`) before `opencode-local` or `local_assist` sends any chat request. This is a pre-flight process/listener check rather than a kernel packet filter.
 - **Trusted `models.yaml` `serve_command`**: `models.yaml` is operator-authored configuration in the trusted repository root. Proxy `serve_command` strings are split with `shlex.split` (`shell=False`) and checked by a heuristic localhost flag validator (`validate_custom_command_localhost`), which is a denylist that a shell or interpreter wrapper can bypass, and `bin/tinfoil-proxy`'s digest and Developer ID signature are verified during `./scripts/setup` rather than re-hashed at launch. Review changes to `models.yaml` with the same care as executable code.
 
@@ -171,6 +175,7 @@ See [`SECURITY.md`](SECURITY.md) for the full threat model. Key operational boun
 | Command | Purpose |
 |---|---|
 | `./scripts/models` | List all models in `models.yaml` with data-control rung, status, and usage policy (`--active` / `--sessions` inspects live served models, ports, caps, and TTL; `--json` emits JSON) |
+| `./scripts/session status\|start\|stop\|renew\|watch` | Operator authorization windows, live time/shared requests, explicit revocation, in-place Touch ID renewal, and foreground warnings (`--model`, `--for 2h`, `--json`, `--notify`) |
 | `./scripts/sync-model-catalog` | `--check` or `--apply` upstream model catalog drift against live enclave and Hugging Face sources |
 | `./scripts/serve-model <id>` | Start a local MLX server (`127.0.0.1:8080`) or dual attested proxy (`:8081` + `:9081`; `--interactive`, `--eval-caps`, `--thinking`, `--port`, `--refresh-session`) |
 | `./scripts/verify-served-model <id>` | Verify active PID records (`pid_lstart`), `/v1/models`, and OS listener `--model` flags (`--require-offline` for Rung 1) |
@@ -185,7 +190,7 @@ See [`SECURITY.md`](SECURITY.md) for the full threat model. Key operational boun
 ### Key Rotation, Session Refresh & Clean Uninstall
 
 ```bash
-# Refresh an active 12-hour attested enclave session (or restart after TTL expiry)
+# Restart an attested enclave session with fresh caps (or recover after TTL expiry)
 ./scripts/opencode-attested --refresh-session
 
 # Rotate a sealed API key (stop any active proxy first since a running session holds the old key in memory,

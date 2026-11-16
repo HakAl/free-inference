@@ -14,7 +14,8 @@ Because full promptfoo and `opencode-smoke` run directories under `runs/` are gi
 Current committed manifests:
 
 - [`qwen3-30b-a3b-2507-mlx-4bit.json`](./qwen3-30b-a3b-2507-mlx-4bit.json): Rung 1 (`local`) default model cleared for `private-local` (`sanity` 1/1, `v1` 10/10, `tools` 4/4, `tool_call_chunks: 1`, `opencode-smoke` PASS).
-- [`tinfoil-deepseek-v4-1-flash.json`](./tinfoil-deepseek-v4-1-flash.json): Rung 3 (`enclave_runtime_attested`) default model cleared for `private-attested` (`sanity` 1/1, `v1` 9/10 with documented `operator_clearance_decision` on `patch-like-edit-gitignore`, `tools` 4/4, `tool_call_chunks: 4`, `opencode-smoke` PASS, 0 session token leaks).
+- [`tinfoil-deepseek-v4-1-flash.json`](./tinfoil-deepseek-v4-1-flash.json): Rung 3 (`enclave_runtime_attested`, `US`) pinned catalog default cleared for `private-attested` (`sanity` 1/1, `v1` 9/10 with documented `operator_clearance_decision` on `patch-like-edit-gitignore`, `tools` 4/4, `tool_call_chunks: 4`, `opencode-smoke` PASS, 0 session token leaks).
+- [`privatemode-glm-5-3-flash.json`](./privatemode-glm-5-3-flash.json): Rung 3 (`enclave_runtime_attested`, `DE/EU`) model cleared for `private-attested` (`sanity` 1/1, `v1` 9/10 with documented `operator_clearance_decision` on `patch-like-edit-gitignore`, `tools` 4/4, `tool_call_chunks: 5`, `opencode-smoke` PASS with `smoke_seatbelt_enforced: true`, 0 session token leaks).
 
 ## Regenerating and Verifying Manifests
 

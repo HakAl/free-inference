@@ -26,8 +26,11 @@ from urllib.parse import urlparse
 
 from ._miniyaml import safe_load
 from .paths import LOCAL_ASSIST_RUNS, ROOT
+from .relay import SessionAuthRelay, _WorkerTokenRelay, redact_session_tokens
 from .registry import (
+    DEFAULT_RUNS_DIR,
     RegistryError,
+    _effective_runs_dir,
     get_process_lstart,
     list_pid_records,
     load_model,
@@ -213,7 +216,7 @@ RESERVED_WORKER_ENV_NAMES: tuple[str, ...] = (
     "LOCAL_ASSIST_VERIFIED_MODELS_FILE",
 )
 
-RESERVED_PORT_DENYLIST: tuple[int, ...] = (8080, 8081, 9081, 9181, 49374)
+RESERVED_PORT_DENYLIST: tuple[int, ...] = (8080, 8081, 8082, 9081, 9082, 9181, 9182, 49374)
 
 ALLOWED_RUN_BOOLEAN_FLAGS: frozenset[str] = frozenset({"--standalone", "--thinking"})
 ALLOWED_RUN_VALUE_FLAGS: frozenset[str] = frozenset({"--format", "--title", "--variant"})
@@ -920,7 +923,6 @@ def validate_worker_opencode_args(opencode_args: Sequence[str]) -> list[str]:
         )
 
     validated: list[str] = ["run"]
-    has_standalone = False
     prompt_tokens: list[str] = []
     i = 1
     while i < len(args):
@@ -938,9 +940,8 @@ def validate_worker_opencode_args(opencode_args: Sequence[str]) -> list[str]:
                     "pass allowed flags as separate tokens."
                 )
             if token in ALLOWED_RUN_BOOLEAN_FLAGS:
-                if token == "--standalone":
-                    has_standalone = True
-                validated.append(token)
+                if token != "--standalone":
+                    validated.append(token)
                 i += 1
                 continue
             if token in ALLOWED_RUN_VALUE_FLAGS:
@@ -969,8 +970,6 @@ def validate_worker_opencode_args(opencode_args: Sequence[str]) -> list[str]:
         raise SecurityProfileError(
             "Unattended worker 'run' invocation requires a non-empty prompt message."
         )
-    if not has_standalone:
-        validated.insert(1, "--standalone")
     return validated
 
 
@@ -1051,6 +1050,7 @@ def compile_opencode_security_config(
     profile: WorkerSecurityProfile,
     *,
     isolated_home: Path | None = None,
+    workspace_dir: Path | None = None,
 ) -> dict[str, Any]:
     cfg = json.loads(json.dumps(base_config))
     effective_allowed = _expand_tool_set(
@@ -1118,6 +1118,10 @@ def compile_opencode_security_config(
         env_block = dict(local_assist_entry.get("environment") or {})
         env_block["LOCAL_ASSIST_AUTO_SERVE"] = "0"
         env_block["LOCAL_ASSIST_WORKER_SANDBOX"] = "1"
+        if workspace_dir is not None:
+            env_block["LOCAL_ASSIST_WORKSPACE_ROOT"] = str(workspace_dir.resolve())
+        if "FREE_INFERENCE_RUNS_DIR" in os.environ and "FREE_INFERENCE_RUNS_DIR" not in env_block:
+            env_block["FREE_INFERENCE_RUNS_DIR"] = os.environ["FREE_INFERENCE_RUNS_DIR"]
         if isolated_home is not None:
             iso_resolved = isolated_home.resolve()
             env_block["LOCAL_ASSIST_LOG_DIR"] = str(
@@ -1126,6 +1130,10 @@ def compile_opencode_security_config(
             env_block["LOCAL_ASSIST_VERIFIED_MODELS_FILE"] = str(
                 iso_resolved / "verified-models.json"
             )
+            if _locate_host_node_binary() is not None:
+                env_block["LOCAL_ASSIST_ASSERTION_NODE_BIN"] = str(
+                    iso_resolved / "bin" / "local-assist-node"
+                )
             env_block["PYTHONSAFEPATH"] = "1"
             env_block["PYTHONNOUSERSITE"] = "1"
             local_assist_entry["cwd"] = str(iso_resolved / "runtime")
@@ -1210,6 +1218,13 @@ def compile_opencode_security_config(
             sub_entry["disable"] = True
             agents_cfg[subagent_name] = sub_entry
         cfg["agent"] = agents_cfg
+
+    if isolated_home is not None:
+        plugin_dir_str = str(isolated_home.resolve() / "plugins" / "credential-guard")
+        existing_plugins = [str(p) for p in (cfg.get("plugins") or []) if isinstance(p, str) and p]
+        if plugin_dir_str not in existing_plugins:
+            existing_plugins.append(plugin_dir_str)
+        cfg["plugins"] = existing_plugins
 
     return cfg
 
@@ -1397,16 +1412,22 @@ def _resolve_and_validate_roots(
     return resolved_roots
 
 
-def _collect_credential_deny_paths(profile: WorkerSecurityProfile) -> list[Path]:
+def _collect_credential_deny_paths(
+    profile: WorkerSecurityProfile | None = None,
+) -> list[Path]:
     host_home = Path.home()
     paths: list[Path] = [host_home / rel for rel in DEFAULT_CREDENTIAL_DENY_RELPATHS]
     paths.append(ROOT / "runs")
+    eff_runs = _effective_runs_dir()
+    if eff_runs != (ROOT / "runs") and eff_runs not in paths:
+        paths.append(eff_runs)
     paths.append(ROOT / ".home")
-    for raw in profile.credential_deny_paths:
-        p = Path(raw).expanduser()
-        if not p.is_absolute():
-            p = host_home / p
-        paths.append(p)
+    if profile is not None:
+        for raw in profile.credential_deny_paths:
+            p = Path(raw).expanduser()
+            if not p.is_absolute():
+                p = host_home / p
+            paths.append(p)
     return paths
 
 
@@ -1479,6 +1500,47 @@ def check_tracked_protected_files(
     return sorted(set(flagged))
 
 
+def _resolve_git_commondir(workspace_dir: Path) -> Path | None:
+    dot_git = workspace_dir / ".git"
+    try:
+        st = os.lstat(dot_git)
+    except OSError:
+        return None
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISREG(st.st_mode):
+        return None
+    try:
+        first_line = dot_git.read_text(encoding="utf-8").splitlines()[0].strip()
+    except (OSError, IndexError, UnicodeDecodeError):
+        return None
+    if not first_line.startswith("gitdir:"):
+        return None
+    raw_gitdir = first_line[len("gitdir:") :].strip()
+    if not raw_gitdir:
+        return None
+    gitdir_path = Path(raw_gitdir)
+    if not gitdir_path.is_absolute():
+        gitdir_path = workspace_dir / gitdir_path
+    try:
+        gitdir_real = gitdir_path.resolve(strict=True)
+    except OSError:
+        return None
+    commondir_file = gitdir_real / "commondir"
+    candidate = gitdir_real
+    if commondir_file.is_file() and not commondir_file.is_symlink():
+        try:
+            rel_common = commondir_file.read_text(encoding="utf-8").strip()
+            if rel_common:
+                common_p = Path(rel_common)
+                if not common_p.is_absolute():
+                    common_p = gitdir_real / common_p
+                candidate = common_p.resolve(strict=True)
+        except (OSError, UnicodeDecodeError):
+            candidate = gitdir_real
+    if not candidate.is_dir() or candidate in _forbidden_broad_roots(is_write_root=True):
+        return None
+    return candidate
+
+
 def compile_seatbelt_profile(
     profile: WorkerSecurityProfile,
     *,
@@ -1487,6 +1549,9 @@ def compile_seatbelt_profile(
     opencode_bin: Path,
     sandbox_exec_bin: Path = Path("/usr/bin/sandbox-exec"),
     upstream_port: int | None = None,
+    endpoint_port: int | None = None,
+    service_port: int | None = None,
+    local_assist_port: int = 8080,
     use_token_relay: bool = False,
 ) -> str:
     ws_real = workspace_dir.resolve(strict=True)
@@ -1565,11 +1630,42 @@ def compile_seatbelt_profile(
         + ")"
     )
 
+    local_assist_node_variants: list[str] = [
+        f"{iv}/bin/local-assist-node" for iv in iso_variants
+    ]
+    local_assist_node_proc_expr = (
+        f'(process-path "{_seatbelt_escape_literal(local_assist_node_variants[0])}")'
+        if len(local_assist_node_variants) == 1
+        else "(require-any "
+        + " ".join(
+            f'(process-path "{_seatbelt_escape_literal(p)}")'
+            for p in local_assist_node_variants
+        )
+        + ")"
+    )
+    local_assist_node_target_expr = (
+        f'(literal "{_seatbelt_escape_literal(local_assist_node_variants[0])}")'
+        if len(local_assist_node_variants) == 1
+        else "(require-any "
+        + " ".join(
+            f'(literal "{_seatbelt_escape_literal(p)}")'
+            for p in local_assist_node_variants
+        )
+        + ")"
+    )
+
     exec_deny_literals: list[str] = []
     for p_str in (
         str(opencode_real),
         str(opencode_bin_abs),
         *local_assist_py_variants,
+        *local_assist_node_variants,
+        str(ROOT / "bin" / "se-key-proxy"),
+        str(ROOT / "bin" / "se-key-proxy-test"),
+        "/bin/ps",
+        "/usr/sbin/lsof",
+        "/usr/bin/lsof",
+        "/usr/bin/sandbox-exec",
         "/usr/bin/open",
         "/usr/bin/osascript",
         "/bin/launchctl",
@@ -1632,6 +1728,21 @@ def compile_seatbelt_profile(
                 f"    {local_assist_py_target_expr}",
                 "  )",
                 ")",
+                "(allow process-exec",
+                "  (require-all",
+                f"    {local_assist_py_proc_expr}",
+                f"    {local_assist_node_target_expr}",
+                "  )",
+                ")",
+                f"(deny process-exec {local_assist_node_proc_expr})",
+                f"(deny process-fork {local_assist_node_proc_expr})",
+                f"(deny network* {local_assist_node_proc_expr})",
+                "(deny file-write*",
+                "  (require-all",
+                f"    {local_assist_node_proc_expr}",
+                '    (require-not (literal "/dev/null"))',
+                "  )",
+                ")",
             ]
         )
 
@@ -1657,12 +1768,6 @@ def compile_seatbelt_profile(
                     f'(allow network-outbound (remote unix-socket (path-literal "{_seatbelt_escape_literal(sock_var)}")))'
                 )
 
-    # opencode run --standalone spins up an internal Bun/Hono HTTP server on an ephemeral
-    # loopback port (127.0.0.1:0) and connects its CLI client to that ephemeral port as well
-    # as the inference endpoint (8080 or the parent _WorkerTokenRelay port). Direct access to
-    # se-key-proxy (8081), tinfoil-proxy (9081/9181), and profile-denied ports is blocked by
-    # the subsequent (deny network-outbound ...) rule below, and worker-shell child processes
-    # do not inherit this process-path grant.
     lines.extend(
         [
             "(allow network-bind",
@@ -1687,7 +1792,7 @@ def compile_seatbelt_profile(
                 "(allow network-outbound",
                 "  (require-all",
                 f"    {local_assist_py_proc_expr}",
-                '    (remote ip "localhost:8080")',
+                f'    (remote ip "localhost:{int(local_assist_port)}")',
                 "  )",
                 ")",
             ]
@@ -1699,11 +1804,25 @@ def compile_seatbelt_profile(
             lines.append(f'  (remote ip "localhost:{port}")')
         lines.append(")")
 
-    denied_ports: list[int] = [9081, 9181, 49374]
+    if service_port is not None:
+        lines.extend(
+            [
+                "(deny network-outbound",
+                "  (require-all",
+                f'    (require-not (process-path "{_seatbelt_escape_literal(str(opencode_real))}"))',
+                f'    (remote ip "localhost:{int(service_port)}")',
+                "  )",
+                ")",
+            ]
+        )
+
+    denied_ports: list[int] = [9081, 9082, 9181, 9182, 49374]
     if upstream_port is not None and upstream_port not in denied_ports:
         denied_ports.append(upstream_port)
-    if use_token_relay and 8081 not in denied_ports:
-        denied_ports.append(8081)
+    if use_token_relay:
+        for relay_upstream_port in (8081, 8082, endpoint_port):
+            if relay_upstream_port is not None and relay_upstream_port not in denied_ports:
+                denied_ports.append(relay_upstream_port)
     for port in profile.network_denied_localhost_ports:
         if port not in denied_ports:
             denied_ports.append(port)
@@ -1797,6 +1916,9 @@ def compile_seatbelt_profile(
     for iv in iso_variants:
         lines.append(f'  (literal "{_seatbelt_escape_literal(iv)}/opencode.json")')
         lines.append(f'  (subpath "{_seatbelt_escape_literal(iv)}/.config")')
+        lines.append(f'  (subpath "{_seatbelt_escape_literal(iv)}/plugins")')
+        lines.append(f'  (subpath "{_seatbelt_escape_literal(iv)}/.local")')
+        lines.append(f'  (subpath "{_seatbelt_escape_literal(iv)}/.cache")')
     lines.append(")")
 
     lines.append("(allow file-read-data")
@@ -1806,6 +1928,9 @@ def compile_seatbelt_profile(
     for iv in iso_variants:
         lines.append(f'      (literal "{_seatbelt_escape_literal(iv)}/opencode.json")')
         lines.append(f'      (subpath "{_seatbelt_escape_literal(iv)}/.config")')
+        lines.append(f'      (subpath "{_seatbelt_escape_literal(iv)}/plugins")')
+        lines.append(f'      (subpath "{_seatbelt_escape_literal(iv)}/.local")')
+        lines.append(f'      (subpath "{_seatbelt_escape_literal(iv)}/.cache")')
     lines.append("    )")
     lines.append("  )")
     lines.append(")")
@@ -1822,13 +1947,13 @@ def compile_seatbelt_profile(
             lines.append(f'  (subpath "{_seatbelt_escape_literal(sp)}")')
         lines.append(")")
 
-    # Re-allow this worker's runtime subdirectories inside isolated_home (since isolated_home is under LAB_ROOT/.home).
+    # Re-allow this worker's non-secret runtime subdirectories inside isolated_home (since isolated_home is under LAB_ROOT/.home).
     for op_name in ("file-read*", "file-read-data"):
         lines.append(f"(allow {op_name}")
         for iv in iso_variants:
             lines.append(f'  (literal "{_seatbelt_escape_literal(iv)}/verified-models.json")')
             lines.append(f'  (literal "{_seatbelt_escape_literal(iv)}/pyvenv.cfg")')
-            for sub in ("bin", "lib", "runtime", ".tmp", ".local", ".cache"):
+            for sub in ("bin", "lib", "runtime", ".tmp"):
                 lines.append(f'  (subpath "{_seatbelt_escape_literal(iv)}/{sub}")')
         lines.append(")")
         lines.append(f"(allow {op_name}")
@@ -1840,6 +1965,61 @@ def compile_seatbelt_profile(
         lines.append("    )")
         lines.append("  )")
         lines.append(")")
+        if profile.mcp_enable_local_assist:
+            lines.append(f"(allow {op_name}")
+            lines.append("  (require-all")
+            lines.append(f"    {local_assist_py_proc_expr}")
+            lines.append("    (require-any")
+            for iv in iso_variants:
+                lines.append(f'      (literal "{_seatbelt_escape_literal(iv)}")')
+                lines.append(f'      (literal "{_seatbelt_escape_literal(iv)}/.local")')
+                lines.append(f'      (literal "{_seatbelt_escape_literal(iv)}/.local/share")')
+                lines.append(
+                    f'      (subpath "{_seatbelt_escape_literal(iv)}/.local/share/local-assist-runs")'
+                )
+            for rdir in (ROOT / "runs", _effective_runs_dir()):
+                for rv in _dual_realpath_variants(rdir):
+                    esc_rv = _seatbelt_escape_regex(rv)
+                    lines.append(f'      (literal "{_seatbelt_escape_literal(rv)}")')
+                    lines.append(f'      (regex #"^{esc_rv}/\\.serve(\\..*)?\\.pid$")')
+            lines.append("    )")
+            lines.append("  )")
+            lines.append(")")
+
+    if profile.mcp_enable_local_assist:
+        lines.extend(
+            [
+                "(deny file-read-data",
+                "  (require-all",
+                f"    {local_assist_node_proc_expr}",
+                "    (require-any",
+                '      (subpath "/Users")',
+                '      (subpath "/System/Volumes/Data/Users")',
+                '      (subpath "/Volumes")',
+                '      (subpath "/private/tmp")',
+                '      (subpath "/tmp")',
+                '      (subpath "/private/var/folders")',
+                '      (subpath "/var/folders")',
+                "    )",
+                "  )",
+                ")",
+            ]
+        )
+        for node_op in ("file-read*", "file-read-data"):
+            lines.extend(
+                [
+                    f"(allow {node_op}",
+                    "  (require-all",
+                    f"    {local_assist_node_proc_expr}",
+                    "    (require-any",
+                ]
+            )
+            for iv in iso_variants:
+                lines.append(f'      (literal "{_seatbelt_escape_literal(iv)}")')
+                lines.append(f'      (literal "{_seatbelt_escape_literal(iv)}/bin")')
+                lines.append(f'      (literal "{_seatbelt_escape_literal(iv)}/bin/local-assist-node")')
+                lines.append(f'      (subpath "{_seatbelt_escape_literal(iv)}/lib")')
+            lines.extend(["    )", "  )", ")"])
 
     # 4. Filesystem write boundary
     lines.extend(
@@ -1967,6 +2147,8 @@ def compile_seatbelt_profile(
         lines.append(f'  (subpath "{_seatbelt_escape_literal(iv)}/runtime")')
         lines.append(f'  (literal "{_seatbelt_escape_literal(iv)}/.config")')
         lines.append(f'  (subpath "{_seatbelt_escape_literal(iv)}/.config")')
+        lines.append(f'  (literal "{_seatbelt_escape_literal(iv)}/plugins")')
+        lines.append(f'  (subpath "{_seatbelt_escape_literal(iv)}/plugins")')
 
     for wr_var in all_writable_root_variants:
         esc_wr = _seatbelt_escape_regex(wr_var)
@@ -2045,6 +2227,639 @@ def compile_seatbelt_profile(
                 protected_entries.append(sub_rule)
 
     for pp in (*explicit_protected_paths, *_discover_existing_protected_paths(write_roots)):
+        for pp_var in _dual_realpath_variants(pp):
+            pp_path = Path(pp_var)
+            for wr_var in write_root_variants:
+                wr_path = Path(wr_var)
+                if wr_path in pp_path.parents:
+                    cur = pp_path.parent
+                    while cur != wr_path and wr_path in cur.parents:
+                        anc_rule = f'  (literal "{_seatbelt_escape_literal(str(cur))}")'
+                        if anc_rule not in protected_entries:
+                            protected_entries.append(anc_rule)
+                        cur = cur.parent
+
+    lines.extend(protected_entries)
+    lines.append(")")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def compile_interactive_seatbelt_profile(
+    *,
+    workspace_dir: Path,
+    isolated_home: Path,
+    invocation_dir: Path,
+    opencode_bin: Path,
+    sandbox_exec_bin: Path = Path("/usr/bin/sandbox-exec"),
+    service_port: int,
+    relay_port: int | None = None,
+    endpoint_port: int | None = None,
+    upstream_port: int | None = None,
+    local_assist_port: int = 8080,
+    use_token_relay: bool = False,
+    allowed_shell_localhost_ports: Sequence[int] = (),
+    allow_ssh_remote: bool = False,
+    allow_self_edit: bool = False,
+) -> str:
+    ws_real = workspace_dir.resolve(strict=True)
+    iso_real = isolated_home.resolve(strict=True)
+    inv_real = invocation_dir.resolve(strict=True)
+    opencode_real = opencode_bin.resolve(strict=True)
+    opencode_bin_abs = opencode_bin.expanduser().absolute()
+    sandbox_real = sandbox_exec_bin.resolve(strict=True)
+
+    if ws_real in _forbidden_broad_roots(is_write_root=True):
+        raise SecurityProfileError(
+            f"Interactive workspace directory '{ws_real}' is an overly broad root directory."
+        )
+
+    cred_deny_paths = _collect_credential_deny_paths()
+    for dp in cred_deny_paths:
+        try:
+            dp_real = dp.expanduser().resolve()
+        except OSError:
+            dp_real = dp.expanduser().absolute()
+        if ws_real == dp_real or dp_real in ws_real.parents:
+            raise SecurityProfileError(
+                f"Interactive workspace directory '{ws_real}' overlaps denied credential path '{dp_real}'."
+            )
+
+    forbidden_shell_ports: set[int] = {
+        8080,
+        8081,
+        8082,
+        9081,
+        9082,
+        9181,
+        9182,
+        49374,
+        int(service_port),
+        int(local_assist_port),
+    }
+    for opt_port in (relay_port, endpoint_port, upstream_port):
+        if opt_port is not None:
+            forbidden_shell_ports.add(int(opt_port))
+
+    clean_shell_ports: list[int] = []
+    for raw_port in allowed_shell_localhost_ports:
+        if isinstance(raw_port, bool) or not isinstance(raw_port, int) or not (1 <= raw_port <= 65535):
+            raise SecurityProfileError(f"Invalid --allow-shell-localhost-port value: {raw_port!r}")
+        if raw_port in forbidden_shell_ports:
+            raise SecurityProfileError(
+                f"--allow-shell-localhost-port cannot grant reserved/service/relay port {raw_port}."
+            )
+        if raw_port not in clean_shell_ports:
+            clean_shell_ports.append(raw_port)
+
+    iso_variants = _dual_realpath_variants(iso_real)
+    inv_variants = _dual_realpath_variants(inv_real)
+    local_assist_py_variants = [f"{iv}/bin/local-assist-python" for iv in inv_variants]
+    local_assist_py_proc_expr = (
+        f'(process-path "{_seatbelt_escape_literal(local_assist_py_variants[0])}")'
+        if len(local_assist_py_variants) == 1
+        else "(require-any "
+        + " ".join(
+            f'(process-path "{_seatbelt_escape_literal(p)}")' for p in local_assist_py_variants
+        )
+        + ")"
+    )
+    local_assist_py_target_expr = (
+        f'(literal "{_seatbelt_escape_literal(local_assist_py_variants[0])}")'
+        if len(local_assist_py_variants) == 1
+        else "(require-any "
+        + " ".join(f'(literal "{_seatbelt_escape_literal(p)}")' for p in local_assist_py_variants)
+        + ")"
+    )
+
+    local_assist_node_variants = [f"{iv}/bin/local-assist-node" for iv in inv_variants]
+    local_assist_node_proc_expr = (
+        f'(process-path "{_seatbelt_escape_literal(local_assist_node_variants[0])}")'
+        if len(local_assist_node_variants) == 1
+        else "(require-any "
+        + " ".join(
+            f'(process-path "{_seatbelt_escape_literal(p)}")' for p in local_assist_node_variants
+        )
+        + ")"
+    )
+    local_assist_node_target_expr = (
+        f'(literal "{_seatbelt_escape_literal(local_assist_node_variants[0])}")'
+        if len(local_assist_node_variants) == 1
+        else "(require-any "
+        + " ".join(
+            f'(literal "{_seatbelt_escape_literal(p)}")' for p in local_assist_node_variants
+        )
+        + ")"
+    )
+
+    lines: list[str] = [
+        "(version 1)",
+        "(allow default)",
+        "",
+        ";; 1. Process signaling, job-creation, preferences, and Mach / host-escape lockdown",
+        "(deny job-creation)",
+        "(deny user-preference-read)",
+        "(deny user-preference-write)",
+        "(deny signal)",
+        "(allow signal (target same-sandbox))",
+        "(deny appleevent-send)",
+        "(deny lsopen)",
+        "(deny mach-lookup)",
+        "(allow mach-lookup",
+        '  (global-name "com.apple.logd")',
+        '  (global-name "com.apple.system.logger")',
+        '  (global-name "com.apple.system.notification_center")',
+        '  (global-name "com.apple.system.DirectoryService.libinfo_v1")',
+        '  (global-name "com.apple.system.opendirectoryd.libinfo")',
+        '  (global-name "com.apple.system.opendirectoryd.membership")',
+        ")",
+    ]
+
+    exec_deny_literals: list[str] = []
+    for p_str in (
+        str(opencode_real),
+        str(opencode_bin_abs),
+        *local_assist_py_variants,
+        *local_assist_node_variants,
+        str(ROOT / "bin" / "se-key-proxy"),
+        str(ROOT / "bin" / "se-key-proxy-test"),
+        "/bin/ps",
+        "/usr/sbin/lsof",
+        "/usr/bin/lsof",
+        "/usr/bin/sandbox-exec",
+        "/usr/bin/open",
+        "/usr/bin/osascript",
+        "/bin/launchctl",
+        "/usr/bin/security",
+        "/usr/bin/defaults",
+        "/usr/bin/crontab",
+        "/usr/bin/at",
+        "/usr/bin/pbcopy",
+        "/usr/bin/pbpaste",
+        "/usr/sbin/screencapture",
+        "/usr/bin/screencapture",
+    ):
+        if p_str not in exec_deny_literals:
+            exec_deny_literals.append(p_str)
+
+    lines.append("(deny process-exec")
+    for p_str in exec_deny_literals:
+        lines.append(f'  (literal "{_seatbelt_escape_literal(p_str)}")')
+    lines.append(")")
+
+    opencode_exec_targets = [f'(literal "{_seatbelt_escape_literal(str(opencode_real))}")']
+    if str(opencode_bin_abs) != str(opencode_real):
+        opencode_exec_targets.append(
+            f'(literal "{_seatbelt_escape_literal(str(opencode_bin_abs))}")'
+        )
+    target_expr = (
+        opencode_exec_targets[0]
+        if len(opencode_exec_targets) == 1
+        else f"(require-any {' '.join(opencode_exec_targets)})"
+    )
+
+    lines.extend(
+        [
+            "(allow process-exec",
+            "  (require-all",
+            f'    (process-path "{_seatbelt_escape_literal(str(sandbox_real))}")',
+            f"    {target_expr}",
+            "  )",
+            ")",
+            "(allow process-exec",
+            "  (require-all",
+            f'    (process-path "{_seatbelt_escape_literal(str(opencode_real))}")',
+            f"    {target_expr}",
+            "  )",
+            ")",
+            "(allow process-exec",
+            "  (require-all",
+            f'    (process-path "{_seatbelt_escape_literal(str(opencode_real))}")',
+            f"    {local_assist_py_target_expr}",
+            "  )",
+            ")",
+            "(allow process-exec",
+            "  (require-all",
+            f"    {local_assist_py_proc_expr}",
+            f"    {local_assist_py_target_expr}",
+            "  )",
+            ")",
+            "(allow process-exec",
+            "  (require-all",
+            f"    {local_assist_py_proc_expr}",
+            f"    {local_assist_node_target_expr}",
+            "  )",
+            ")",
+            f"(deny process-exec {local_assist_node_proc_expr})",
+            f"(deny process-fork {local_assist_node_proc_expr})",
+            f"(deny network* {local_assist_node_proc_expr})",
+            "(deny file-write*",
+            "  (require-all",
+            f"    {local_assist_node_proc_expr}",
+            '    (require-not (literal "/dev/null"))',
+            "  )",
+            ")",
+            "",
+            ";; 2. Network isolation",
+            "(deny network-outbound)",
+            "(deny network-bind)",
+        ]
+    )
+
+    for u_var in (*iso_variants, *(f"{iv}/.tmp" for iv in inv_variants)):
+        lines.append(
+            f'(allow network-outbound (remote unix-socket (subpath "{_seatbelt_escape_literal(u_var)}")))'
+        )
+
+    ssh_sock = os.environ.get("SSH_AUTH_SOCK", "").strip()
+    if ssh_sock:
+        for sock_var in _dual_realpath_variants(Path(ssh_sock)):
+            lines.append(
+                f'(allow network-outbound (remote unix-socket (path-literal "{_seatbelt_escape_literal(sock_var)}")))'
+            )
+
+    if allow_ssh_remote:
+        for mdns_sock in ("/private/var/run/mDNSResponder", "/var/run/mDNSResponder"):
+            lines.append(
+                f'(allow network-outbound (remote unix-socket (path-literal "{mdns_sock}")))'
+            )
+        lines.append('(allow network-outbound (remote tcp "*:22"))')
+
+    lines.extend(
+        [
+            "(allow network-bind",
+            "  (require-all",
+            f'    (process-path "{_seatbelt_escape_literal(str(opencode_real))}")',
+            '    (local ip "localhost:*")',
+            "  )",
+            ")",
+            "(allow network-outbound",
+            "  (require-all",
+            f'    (process-path "{_seatbelt_escape_literal(str(opencode_real))}")',
+            '    (remote ip "localhost:*")',
+            "  )",
+            ")",
+            "(allow network-outbound",
+            "  (require-all",
+            f"    {local_assist_py_proc_expr}",
+            f'    (remote ip "localhost:{int(local_assist_port)}")',
+            "  )",
+            ")",
+        ]
+    )
+
+    if clean_shell_ports:
+        lines.append("(allow network-outbound")
+        for port in clean_shell_ports:
+            lines.append(f'  (remote ip "localhost:{port}")')
+        lines.append(")")
+
+    lines.extend(
+        [
+            "(deny network-outbound",
+            "  (require-all",
+            f'    (require-not (process-path "{_seatbelt_escape_literal(str(opencode_real))}"))',
+            f'    (remote ip "localhost:{int(service_port)}")',
+            "  )",
+            ")",
+        ]
+    )
+    if relay_port is not None:
+        lines.extend(
+            [
+                "(deny network-outbound",
+                "  (require-all",
+                f'    (require-not (process-path "{_seatbelt_escape_literal(str(opencode_real))}"))',
+                f'    (remote ip "localhost:{int(relay_port)}")',
+                "  )",
+                ")",
+            ]
+        )
+
+    denied_ports: list[int] = [9081, 9082, 9181, 9182, 49374]
+    if upstream_port is not None and upstream_port not in denied_ports:
+        denied_ports.append(int(upstream_port))
+    if use_token_relay:
+        for relay_up_port in (8081, 8082, endpoint_port):
+            if relay_up_port is not None and int(relay_up_port) not in denied_ports:
+                denied_ports.append(int(relay_up_port))
+
+    lines.append("(deny network-outbound")
+    for port in denied_ports:
+        lines.append(f'  (remote ip "localhost:{port}")')
+    lines.append(")")
+
+    # 3. Filesystem read boundary (deny credential paths, isolated_home, and invocation_dir)
+    lines.extend(["", ";; 3. Filesystem read boundary"])
+    read_deny_subpaths: list[str] = []
+    for p in (*cred_deny_paths, iso_real, inv_real):
+        for var in _dual_realpath_variants(p):
+            if var not in read_deny_subpaths:
+                read_deny_subpaths.append(var)
+
+    for op_name in ("file-read*", "file-read-data"):
+        lines.append(f"(deny {op_name}")
+        for sp in read_deny_subpaths:
+            lines.append(f'  (subpath "{_seatbelt_escape_literal(sp)}")')
+        lines.append(")")
+
+        # Re-allow <inv_dir>/.tmp to sandbox processes so TMPDIR works
+        lines.append(f"(allow {op_name}")
+        for iv in inv_variants:
+            lines.append(f'  (subpath "{_seatbelt_escape_literal(iv)}/.tmp")')
+        lines.append(")")
+
+        # Re-allow <iso_real>/{.local,.cache} and <inv_real> exclusively to opencode_real
+        lines.append(f"(allow {op_name}")
+        lines.append("  (require-all")
+        lines.append(f'    (process-path "{_seatbelt_escape_literal(str(opencode_real))}")')
+        lines.append("    (require-any")
+        for isv in iso_variants:
+            lines.append(f'      (literal "{_seatbelt_escape_literal(isv)}")')
+            lines.append(f'      (literal "{_seatbelt_escape_literal(isv)}/.invocations")')
+            lines.append(f'      (subpath "{_seatbelt_escape_literal(isv)}/.local")')
+            lines.append(f'      (subpath "{_seatbelt_escape_literal(isv)}/.cache")')
+        for iv in inv_variants:
+            lines.append(f'      (subpath "{_seatbelt_escape_literal(iv)}")')
+        lines.append("    )")
+        lines.append("  )")
+        lines.append(")")
+
+        # Re-allow dedicated local-assist-python runtime, logs, and non-secret .serve*.pid metadata
+        lines.append(f"(allow {op_name}")
+        lines.append("  (require-all")
+        lines.append(f"    {local_assist_py_proc_expr}")
+        lines.append("    (require-any")
+        for iv in inv_variants:
+            lines.append(f'      (literal "{_seatbelt_escape_literal(iv)}")')
+            lines.append(f'      (literal "{_seatbelt_escape_literal(iv)}/verified-models.json")')
+            lines.append(f'      (literal "{_seatbelt_escape_literal(iv)}/pyvenv.cfg")')
+            for sub in ("bin", "lib", "runtime", ".tmp"):
+                lines.append(f'      (subpath "{_seatbelt_escape_literal(iv)}/{sub}")')
+        for rdir in (ROOT / "runs", _effective_runs_dir()):
+            for rv in _dual_realpath_variants(rdir):
+                esc_rv = _seatbelt_escape_regex(rv)
+                lines.append(f'      (literal "{_seatbelt_escape_literal(rv)}")')
+                lines.append(f'      (subpath "{_seatbelt_escape_literal(rv)}/local-assist")')
+                lines.append(f'      (regex #"^{esc_rv}/\\.serve(\\..*)?\\.pid$")')
+        lines.append("    )")
+        lines.append("  )")
+        lines.append(")")
+
+    # Confine local-assist-node reads strictly to its own binary and libnode*.dylib
+    lines.extend(
+        [
+            "(deny file-read-data",
+            "  (require-all",
+            f"    {local_assist_node_proc_expr}",
+            "    (require-any",
+            '      (subpath "/Users")',
+            '      (subpath "/System/Volumes/Data/Users")',
+            '      (subpath "/Volumes")',
+            '      (subpath "/private/tmp")',
+            '      (subpath "/tmp")',
+            '      (subpath "/private/var/folders")',
+            '      (subpath "/var/folders")',
+            "    )",
+            "  )",
+            ")",
+        ]
+    )
+    for node_op in ("file-read*", "file-read-data"):
+        lines.extend(
+            [
+                f"(allow {node_op}",
+                "  (require-all",
+                f"    {local_assist_node_proc_expr}",
+                "    (require-any",
+            ]
+        )
+        for iv in inv_variants:
+            lines.append(f'      (literal "{_seatbelt_escape_literal(iv)}")')
+            lines.append(f'      (literal "{_seatbelt_escape_literal(iv)}/bin")')
+            lines.append(f'      (literal "{_seatbelt_escape_literal(iv)}/bin/local-assist-node")')
+            lines.append(f'      (subpath "{_seatbelt_escape_literal(iv)}/lib")')
+        lines.extend(["    )", "  )", ")"])
+
+    # 4. Filesystem write boundary
+    git_commondir = _resolve_git_commondir(ws_real)
+    write_roots: list[Path] = [ws_real]
+    if git_commondir is not None and git_commondir not in write_roots:
+        write_roots.append(git_commondir)
+
+    write_deny_paths: list[Path] = list(cred_deny_paths)
+    if not allow_self_edit:
+        for rwp in _collect_runtime_write_deny_paths():
+            if rwp not in write_deny_paths:
+                write_deny_paths.append(rwp)
+    else:
+        for always_deny in (
+            ROOT / "bin" / "se-key-proxy",
+            ROOT / "bin" / "se-key-proxy-test",
+        ):
+            if always_deny not in write_deny_paths:
+                write_deny_paths.append(always_deny)
+
+    lines.extend(
+        [
+            "",
+            ";; 4. Filesystem write boundary",
+            "(deny file-write*)",
+            "(allow file-write*",
+            '  (literal "/dev/null")',
+            '  (literal "/dev/zero")',
+            '  (literal "/dev/random")',
+            '  (literal "/dev/urandom")',
+            '  (literal "/dev/tty")',
+            '  (literal "/dev/dtracehelper")',
+            '  (literal "/dev/ptmx")',
+            '  (regex #"^/dev/ttys[0-9]+$")',
+        ]
+    )
+    for wr in write_roots:
+        for var in _dual_realpath_variants(wr):
+            lines.append(f'  (subpath "{_seatbelt_escape_literal(var)}")')
+    lines.append(")")
+
+    write_deny_subpaths: list[str] = []
+    for wp in write_deny_paths:
+        for var in _dual_realpath_variants(wp):
+            if var not in write_deny_subpaths:
+                write_deny_subpaths.append(var)
+
+    lines.append("(deny file-write*")
+    for sp in write_deny_subpaths:
+        lines.append(f'  (literal "{_seatbelt_escape_literal(sp)}")')
+        lines.append(f'  (subpath "{_seatbelt_escape_literal(sp)}")')
+    lines.append(")")
+
+    # Re-allow mutable invocation/home subtrees and local-assist telemetry logs
+    lines.append("(allow file-write*")
+    for iv in inv_variants:
+        lines.append(f'  (subpath "{_seatbelt_escape_literal(iv)}/.tmp")')
+    lines.append(")")
+
+    lines.append("(allow file-write*")
+    lines.append("  (require-all")
+    lines.append(f'    (process-path "{_seatbelt_escape_literal(str(opencode_real))}")')
+    lines.append("    (require-any")
+    for isv in iso_variants:
+        lines.append(f'      (subpath "{_seatbelt_escape_literal(isv)}/.local")')
+        lines.append(f'      (subpath "{_seatbelt_escape_literal(isv)}/.cache")')
+    for iv in inv_variants:
+        lines.append(f'      (subpath "{_seatbelt_escape_literal(iv)}/.state")')
+    lines.append("    )")
+    lines.append("  )")
+    lines.append(")")
+
+    lines.append("(allow file-write*")
+    lines.append("  (require-all")
+    lines.append(f"    {local_assist_py_proc_expr}")
+    lines.append("    (require-any (vnode-type REGULAR-FILE) (vnode-type DIRECTORY))")
+    lines.append("    (require-any")
+    for rdir in (ROOT / "runs", _effective_runs_dir()):
+        for rv in _dual_realpath_variants(rdir):
+            esc_rv = _seatbelt_escape_regex(rv)
+            lines.append(f'      (literal "{_seatbelt_escape_literal(rv)}/local-assist")')
+            lines.append(f'      (regex #"^{esc_rv}/local-assist/.+$")')
+    lines.append("    )")
+    lines.append("  )")
+    lines.append(")")
+
+    write_root_variants: list[str] = []
+    for wr in write_roots:
+        for var in _dual_realpath_variants(wr):
+            if var not in write_root_variants:
+                write_root_variants.append(var)
+
+    all_writable_root_variants: list[str] = []
+    for var in (*write_root_variants, *(f"{iv}/.tmp" for iv in inv_variants)):
+        if var not in all_writable_root_variants:
+            all_writable_root_variants.append(var)
+
+    if all_writable_root_variants:
+        lines.append("(deny file-write*")
+        for wr_var in all_writable_root_variants:
+            esc_wr = _seatbelt_escape_regex(wr_var)
+            lines.append(f'  (regex #"^{esc_wr}(/.*)?/\\.git(/.*)?$")')
+        if git_commondir is not None:
+            for gc_var in _dual_realpath_variants(git_commondir):
+                lines.append(f'  (subpath "{_seatbelt_escape_literal(gc_var)}")')
+        lines.append(")")
+
+        lines.append("(allow file-write*")
+        for wr_var in all_writable_root_variants:
+            esc_wr = _seatbelt_escape_regex(wr_var)
+            lines.append(
+                f'  (regex #"^{esc_wr}(/.*)?/\\.git/'
+                r"(index(\.lock)?|next-index-[0-9]+(\.lock)?|index\.stash\.[0-9]+(\.lock)?|"
+                r"(HEAD|ORIG_HEAD|FETCH_HEAD|MERGE_HEAD|CHERRY_PICK_HEAD|REVERT_HEAD|BISECT_HEAD|"
+                r"AUTO_MERGE|BISECT_LOG|BISECT_NAMES|BISECT_START|BISECT_TERMS|BISECT_ANCESTORS_OK|"
+                r"BISECT_EXPECTED_REV)(\.lock)?|"
+                r"(MERGE_MODE|MERGE_MSG|COMMIT_EDITMSG|SQUASH_MSG|TAG_EDITMSG|NOTES_EDITMSG)(\..*|\.lock)?|"
+                r"packed-refs(\.lock|\.new)?|gc\.(pid|log)(\.lock)?|info/refs(\.lock)?|"
+                r'(objects|refs|logs|sequencer)(/.*)?)$")'
+            )
+        if git_commondir is not None:
+            for gc_var in _dual_realpath_variants(git_commondir):
+                esc_gc = _seatbelt_escape_regex(gc_var)
+                lines.append(
+                    f'  (regex #"^{esc_gc}(/worktrees/[^/]+)?/'
+                    r"(index(\.lock)?|next-index-[0-9]+(\.lock)?|index\.stash\.[0-9]+(\.lock)?|"
+                    r"(HEAD|ORIG_HEAD|FETCH_HEAD|MERGE_HEAD|CHERRY_PICK_HEAD|REVERT_HEAD|BISECT_HEAD|"
+                    r"AUTO_MERGE|BISECT_LOG|BISECT_NAMES|BISECT_START|BISECT_TERMS|BISECT_ANCESTORS_OK|"
+                    r"BISECT_EXPECTED_REV)(\.lock)?|"
+                    r"(MERGE_MODE|MERGE_MSG|COMMIT_EDITMSG|SQUASH_MSG|TAG_EDITMSG|NOTES_EDITMSG)(\..*|\.lock)?|"
+                    r"packed-refs(\.lock|\.new)?|gc\.(pid|log)(\.lock)?|info/refs(\.lock)?|"
+                    r'(objects|refs|logs|sequencer)(/.*)?)$")'
+                )
+        lines.append(")")
+
+    # Final unconditional write deny
+    lines.append("(deny file-write*")
+    for isv in iso_variants:
+        lines.append(f'  (literal "{_seatbelt_escape_literal(isv)}")')
+        lines.append(f'  (literal "{_seatbelt_escape_literal(isv)}/.local")')
+        lines.append(f'  (literal "{_seatbelt_escape_literal(isv)}/.invocations")')
+    for iv in inv_variants:
+        lines.append(f'  (literal "{_seatbelt_escape_literal(iv)}")')
+        lines.append(f'  (literal "{_seatbelt_escape_literal(iv)}/opencode.json")')
+        lines.append(f'  (literal "{_seatbelt_escape_literal(iv)}/interactive.sb")')
+        lines.append(f'  (literal "{_seatbelt_escape_literal(iv)}/owner.json")')
+        lines.append(f'  (literal "{_seatbelt_escape_literal(iv)}/service-identity.json")')
+        lines.append(f'  (literal "{_seatbelt_escape_literal(iv)}/verified-models.json")')
+        lines.append(f'  (literal "{_seatbelt_escape_literal(iv)}/pyvenv.cfg")')
+        lines.append(f'  (literal "{_seatbelt_escape_literal(iv)}/.state")')
+        for imm_sub in (".config", "plugins", "bin", "lib", "runtime"):
+            lines.append(f'  (literal "{_seatbelt_escape_literal(iv)}/{imm_sub}")')
+            lines.append(f'  (subpath "{_seatbelt_escape_literal(iv)}/{imm_sub}")')
+
+    for wr_var in all_writable_root_variants:
+        esc_wr = _seatbelt_escape_regex(wr_var)
+        lines.append(
+            f'  (regex #"^{esc_wr}(/.*)?/\\.git/'
+            r'(hooks|config|config\.worktree|info|modules|commondir|gitdir|worktrees|shallow|rebase-merge|rebase-apply)(/.*)?$")'
+        )
+        lines.append(
+            f'  (regex #"^{esc_wr}(/.*)?/'
+            r"(\.opencode|opencode\.json|opencode\.jsonc|\.env|"
+            r"\.env\.(local|development|production|staging|test|secret|secrets|private)(\..*)?|"
+            r'\.envrc|\.mcp\.json|\.gitmodules)(/.*)?$")'
+        )
+
+    if git_commondir is not None:
+        for gc_var in _dual_realpath_variants(git_commondir):
+            esc_gc = _seatbelt_escape_regex(gc_var)
+            lines.append(
+                f'  (regex #"^{esc_gc}/'
+                r'(hooks|config|config\.worktree|info|modules|commondir|gitdir|shallow|rebase-merge|rebase-apply)(/.*)?$")'
+            )
+
+    carveout_paths: list[Path] = [
+        iso_real / ".local",
+        iso_real / ".cache",
+        inv_real / ".state",
+        inv_real / ".tmp",
+        ROOT / "runs" / "local-assist",
+        _effective_runs_dir() / "local-assist",
+    ]
+    carveout_variants: list[str] = []
+    for cvp in carveout_paths:
+        for var in _dual_realpath_variants(cvp):
+            if var not in carveout_variants:
+                carveout_variants.append(var)
+    carveout_not_clauses = " ".join(
+        f'(require-not (subpath "{_seatbelt_escape_literal(cv)}"))' for cv in carveout_variants
+    )
+
+    protected_entries: list[str] = []
+    for cp in (*write_deny_paths, iso_real, inv_real):
+        for cp_var in _dual_realpath_variants(cp):
+            cp_path = Path(cp_var)
+            lit_rule = f'  (literal "{_seatbelt_escape_literal(cp_var)}")'
+            if lit_rule not in protected_entries:
+                protected_entries.append(lit_rule)
+            if not any(cp_path == Path(cv) or cp_path in Path(cv).parents for cv in carveout_variants):
+                sub_rule = f'  (subpath "{_seatbelt_escape_literal(cp_var)}")'
+                if sub_rule not in protected_entries:
+                    protected_entries.append(sub_rule)
+            else:
+                sub_not_rule = (
+                    f'  (require-all (subpath "{_seatbelt_escape_literal(cp_var)}") {carveout_not_clauses})'
+                )
+                if sub_not_rule not in protected_entries:
+                    protected_entries.append(sub_not_rule)
+            for wr_var in write_root_variants:
+                wr_path = Path(wr_var)
+                if wr_path in cp_path.parents:
+                    cur = cp_path.parent
+                    while cur != wr_path and wr_path in cur.parents:
+                        anc_rule = f'  (literal "{_seatbelt_escape_literal(str(cur))}")'
+                        if anc_rule not in protected_entries:
+                            protected_entries.append(anc_rule)
+                        cur = cur.parent
+
+    for pp in _discover_existing_protected_paths(write_roots):
         for pp_var in _dual_realpath_variants(pp):
             pp_path = Path(pp_var)
             for wr_var in write_root_variants:
@@ -2280,6 +3095,143 @@ def write_verified_local_models_handoff(
     return handoff_path
 
 
+def _allocate_loopback_ephemeral_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _locate_host_node_binary() -> Path | None:
+    for cand in (
+        shutil.which("node"),
+        "/opt/homebrew/bin/node",
+        "/usr/local/bin/node",
+    ):
+        if not cand:
+            continue
+        try:
+            resolved = Path(cand).resolve(strict=True)
+            if resolved.is_file() and os.access(resolved, os.X_OK):
+                return resolved
+        except OSError:
+            continue
+    return None
+
+
+def _stage_credential_guard_plugin(base_dir: Path) -> Path:
+    src_plugin = ROOT / "config" / "plugins" / "credential-guard" / "server.js"
+    if not src_plugin.is_file():
+        raise SecurityProfileError(
+            f"Missing required credential-guard plugin at '{src_plugin}'."
+        )
+    plugins_root = base_dir / "plugins"
+    if plugins_root.exists() or plugins_root.is_symlink():
+        _safe_rmtree_nofollow(plugins_root)
+    dest_dir = plugins_root / "credential-guard"
+    dest_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    dest_js = dest_dir / "server.js"
+    shutil.copy2(src_plugin, dest_js)
+    os.chmod(dest_js, 0o400)
+    os.chmod(dest_dir, 0o500)
+    os.chmod(plugins_root, 0o500)
+    return dest_dir
+
+
+def _provision_dedicated_local_assist_node(iso_real: Path) -> Path | None:
+    src_node = _locate_host_node_binary()
+    if src_node is None:
+        return None
+    bin_dir = iso_real / "bin"
+    lib_dir = iso_real / "lib"
+    bin_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lib_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        os.chmod(bin_dir, 0o700)
+        os.chmod(lib_dir, 0o700)
+    except OSError:
+        pass
+
+    dest_node = bin_dir / "local-assist-node"
+    if dest_node.exists() or dest_node.is_symlink():
+        try:
+            os.chmod(dest_node, 0o700)
+        except OSError:
+            pass
+        dest_node.unlink()
+
+    cp_done = False
+    if Path("/bin/cp").is_file():
+        try:
+            cp_proc = subprocess.run(
+                ["/bin/cp", "-c", str(src_node), str(dest_node)],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            cp_done = cp_proc.returncode == 0 and dest_node.is_file()
+        except (OSError, subprocess.SubprocessError):
+            cp_done = False
+    if not cp_done:
+        shutil.copy2(src_node, dest_node)
+
+    os.chmod(dest_node, 0o700)
+    if Path("/usr/bin/codesign").is_file():
+        verify_sig = subprocess.run(
+            ["/usr/bin/codesign", "-v", str(dest_node)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if verify_sig.returncode != 0:
+            sign_proc = subprocess.run(
+                ["/usr/bin/codesign", "--force", "--sign", "-", str(dest_node)],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            if sign_proc.returncode != 0:
+                raise SecurityProfileError(
+                    f"Failed to ad-hoc codesign dedicated local-assist-node '{dest_node}': "
+                    f"{(sign_proc.stderr or sign_proc.stdout or '').strip()}"
+                )
+    os.chmod(dest_node, 0o500)
+
+    for cand_lib in (src_node.parent.parent / "lib", src_node.parent):
+        if not cand_lib.is_dir():
+            continue
+        for dylib in cand_lib.glob("libnode*.dylib"):
+            if not dylib.is_file():
+                continue
+            dst_dylib = lib_dir / dylib.name
+            if dst_dylib.exists():
+                continue
+            real_dylib = dylib.resolve()
+            dylib_copied = False
+            if Path("/bin/cp").is_file():
+                try:
+                    cp_dl = subprocess.run(
+                        ["/bin/cp", "-c", str(real_dylib), str(dst_dylib)],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                        check=False,
+                    )
+                    dylib_copied = cp_dl.returncode == 0 and dst_dylib.is_file()
+                except (OSError, subprocess.SubprocessError):
+                    dylib_copied = False
+            if not dylib_copied:
+                shutil.copyfile(real_dylib, dst_dylib)
+            try:
+                os.chmod(dst_dylib, 0o400)
+            except OSError:
+                pass
+
+    return dest_node
+
+
 def _resolve_real_python_macho() -> Path:
     for cand in (
         Path(sys.base_prefix).resolve()
@@ -2439,6 +3391,8 @@ def _provision_dedicated_local_assist_python(iso_real: Path) -> Path:
             if not dylib_copied:
                 shutil.copyfile(real_dylib, dst_dylib)
 
+    _provision_dedicated_local_assist_node(iso_real)
+
     for tree_root in (runtime_dir, lib_dir):
         for dirpath, _dirnames, filenames in os.walk(tree_root, topdown=False, followlinks=False):
             dp = Path(dirpath)
@@ -2466,6 +3420,8 @@ def write_worker_runtime_artifacts(
     profile: WorkerSecurityProfile,
     opencode_config: dict[str, Any],
     seatbelt_text: str,
+    service_port: int | None = None,
+    service_password: str | None = None,
 ) -> tuple[Path, Path, Path]:
     iso_real = isolated_home.resolve(strict=True)
     config_path = iso_real / "opencode.json"
@@ -2481,6 +3437,40 @@ def write_worker_runtime_artifacts(
         os.chmod(seatbelt_path, 0o600)
     seatbelt_path.write_text(seatbelt_text, encoding="utf-8")
     os.chmod(seatbelt_path, 0o400)
+
+    _stage_credential_guard_plugin(iso_real)
+
+    opencode_cfg_dir = iso_real / ".config" / "opencode"
+    opencode_cfg_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        os.chmod(iso_real / ".config", 0o700)
+        os.chmod(opencode_cfg_dir, 0o700)
+    except OSError:
+        pass
+    svc_cfg_path = opencode_cfg_dir / "service.json"
+    if svc_cfg_path.exists() or svc_cfg_path.is_symlink():
+        try:
+            os.chmod(svc_cfg_path, 0o600)
+        except OSError:
+            pass
+        svc_cfg_path.unlink()
+    eff_service_port = (
+        int(service_port) if service_port is not None else _allocate_loopback_ephemeral_port()
+    )
+    eff_service_password = (
+        service_password.strip()
+        if isinstance(service_password, str) and service_password.strip()
+        else secrets.token_urlsafe(32)
+    )
+    svc_cfg_path.write_text(
+        json.dumps(
+            {"hostname": "127.0.0.1", "port": eff_service_port, "password": eff_service_password},
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    os.chmod(svc_cfg_path, 0o400)
 
     if profile.mcp_enable_local_assist:
         if not (iso_real / "verified-models.json").exists():
@@ -2499,13 +3489,9 @@ def write_worker_runtime_artifacts(
     )
     os.chmod(shell_path, 0o500)
     os.chmod(iso_real / "bin", 0o500)
-    os.chmod(iso_real / ".config" / "opencode", 0o500)
+    os.chmod(opencode_cfg_dir, 0o500)
     os.chmod(iso_real / ".config", 0o500)
     return config_path, seatbelt_path, shell_path
-
-
-def redact_session_tokens(text: str) -> str:
-    return SE_SESSION_REDACT_RE.sub("se-session-REDACTED", text)
 
 
 MAX_DEFAULT_CHAT_PARAMS_BYTES = 4096
@@ -2550,352 +3536,6 @@ def validate_default_chat_params(raw_params: dict[str, Any] | None) -> dict[str,
             f"default_chat_params exceeds {MAX_DEFAULT_CHAT_PARAMS_BYTES} bytes ({len(serialized)} bytes)."
         )
     return copy.deepcopy(raw_params)
-
-
-class _WorkerTokenRelay:
-    """In-process loopback HTTP relay that keeps se-session-* tokens outside the worker sandbox."""
-
-    def __init__(
-        self,
-        *,
-        upstream_base_url: str,
-        upstream_session_token: str,
-        max_chat_requests: int = 25,
-        max_request_bytes: int = 131072,
-        max_tokens_cap: int = 2048,
-        upstream_timeout_seconds: float = 120.0,
-        max_response_bytes: int = 16 * 1024 * 1024,
-        default_chat_params: dict[str, Any] | None = None,
-    ) -> None:
-        parsed = urlparse(upstream_base_url.rstrip("/"))
-        if parsed.hostname not in ("127.0.0.1", "localhost") or parsed.port is None:
-            raise SecurityProfileError(
-                f"_WorkerTokenRelay requires a localhost upstream URL with explicit port, got {upstream_base_url!r}."
-            )
-        if not upstream_session_token or not upstream_session_token.strip():
-            raise SecurityProfileError("_WorkerTokenRelay requires a non-empty upstream token.")
-        self.upstream_host = parsed.hostname
-        self.upstream_port = parsed.port
-        self._upstream_session_token = upstream_session_token.strip()
-        self.relay_token = f"worker-relay-{secrets.token_hex(16)}"
-        self.max_chat_requests = max(1, int(max_chat_requests))
-        self.max_request_bytes = max(256, int(max_request_bytes))
-        self.max_tokens_cap = max(1, int(max_tokens_cap))
-        self.upstream_timeout_seconds = max(1.0, float(upstream_timeout_seconds))
-        self.max_response_bytes = max(4096, int(max_response_bytes))
-        self.default_chat_params = validate_default_chat_params(default_chat_params)
-        self._lock = threading.Lock()
-        self._inflight_sem = threading.BoundedSemaphore(16)
-        self.chat_requests_used = 0
-        self._httpd: ThreadingHTTPServer | None = None
-        self._thread: threading.Thread | None = None
-
-    @property
-    def api_base_url(self) -> str:
-        if self._httpd is None:
-            raise RuntimeError("_WorkerTokenRelay has not been started.")
-        _, port = self._httpd.server_address[:2]
-        return f"http://127.0.0.1:{port}/v1"
-
-    @property
-    def port(self) -> int:
-        if self._httpd is None:
-            raise RuntimeError("_WorkerTokenRelay has not been started.")
-        return int(self._httpd.server_address[1])
-
-    def start(self) -> "_WorkerTokenRelay":
-        relay = self
-
-        class _Handler(BaseHTTPRequestHandler):
-            protocol_version = "HTTP/1.1"
-
-            def setup(self) -> None:
-                try:
-                    self.request.settimeout(min(30.0, relay.upstream_timeout_seconds))
-                except OSError:
-                    pass
-                super().setup()
-
-            def log_message(self, format: str, *args: Any) -> None:
-                return
-
-            def _send_json_error(self, status: int, message: str, err_type: str) -> None:
-                safe_msg = redact_session_tokens(
-                    message.replace(relay._upstream_session_token, "[REDACTED]")
-                )
-                payload = json.dumps(
-                    {"error": {"message": safe_msg, "type": err_type}}
-                ).encode("utf-8")
-                self.send_response(status)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(payload)))
-                self.send_header("Connection", "close")
-                self.end_headers()
-                try:
-                    self.wfile.write(payload)
-                    self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError):
-                    pass
-
-            def _check_auth(self) -> bool:
-                auth_hdr = self.headers.get("Authorization", "")
-                if not auth_hdr.startswith("Bearer "):
-                    self._send_json_error(
-                        401, "Missing Bearer token for worker relay.", "auth_error"
-                    )
-                    return False
-                candidate = auth_hdr[len("Bearer ") :].strip()
-                if not hmac.compare_digest(
-                    candidate.encode("utf-8"), relay.relay_token.encode("utf-8")
-                ):
-                    self._send_json_error(
-                        401, "Invalid Bearer token for worker relay.", "auth_error"
-                    )
-                    return False
-                return True
-
-            def do_GET(self) -> None:
-                if not self._check_auth():
-                    return
-                if self.path != "/v1/models":
-                    self._send_json_error(
-                        404, f"Worker relay path {self.path!r} is not permitted.", "not_found"
-                    )
-                    return
-                self._forward_upstream("GET", "/v1/models", None)
-
-            def do_POST(self) -> None:
-                if not self._check_auth():
-                    return
-                if self.path != "/v1/chat/completions":
-                    if self.path == "/v1/models":
-                        self._send_json_error(405, "Method not allowed.", "method_not_allowed")
-                    else:
-                        self._send_json_error(
-                            404, f"Worker relay path {self.path!r} is not permitted.", "not_found"
-                        )
-                    return
-
-                if self.headers.get("Transfer-Encoding") is not None:
-                    self._send_json_error(
-                        400,
-                        "Chunked Transfer-Encoding is not supported; Content-Length is required.",
-                        "invalid_request_error",
-                    )
-                    return
-                raw_cl = self.headers.get("Content-Length")
-                if raw_cl is None:
-                    self._send_json_error(
-                        411, "Content-Length header is required.", "invalid_request_error"
-                    )
-                    return
-                try:
-                    content_length = int(raw_cl)
-                except ValueError:
-                    self._send_json_error(
-                        400, "Invalid Content-Length header.", "invalid_request_error"
-                    )
-                    return
-                if content_length < 0:
-                    self._send_json_error(
-                        400, "Negative Content-Length is invalid.", "invalid_request_error"
-                    )
-                    return
-                if content_length > relay.max_request_bytes:
-                    self._send_json_error(
-                        413,
-                        f"Request body ({content_length} bytes) exceeds worker max_request_bytes ({relay.max_request_bytes}).",
-                        "request_too_large",
-                    )
-                    return
-
-                raw_body = self.rfile.read(content_length)
-                try:
-                    parsed_body = json.loads(raw_body.decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError):
-                    self._send_json_error(
-                        400, "Request body must be valid UTF-8 JSON.", "invalid_request_error"
-                    )
-                    return
-                if not isinstance(parsed_body, dict):
-                    self._send_json_error(
-                        400, "Request body must be a JSON object.", "invalid_request_error"
-                    )
-                    return
-
-                # Merge non-overwriting default chat parameters (e.g. passthrough thinking=false / include_reasoning=false).
-                for k, default_val in relay.default_chat_params.items():
-                    if k == "chat_template_kwargs" and isinstance(default_val, dict):
-                        if k not in parsed_body or parsed_body[k] is None:
-                            parsed_body[k] = copy.deepcopy(default_val)
-                        elif isinstance(parsed_body[k], dict):
-                            merged_kw = dict(parsed_body[k])
-                            for sub_k, sub_v in default_val.items():
-                                if sub_k not in merged_kw:
-                                    merged_kw[sub_k] = copy.deepcopy(sub_v)
-                            parsed_body[k] = merged_kw
-                    elif k not in parsed_body:
-                        parsed_body[k] = copy.deepcopy(default_val)
-
-                # Clamp n (and best_of when present) to 1 so worst-case output spend is bounded to 1 completion per request.
-                if "n" in parsed_body:
-                    parsed_body["n"] = 1
-                if "best_of" in parsed_body:
-                    parsed_body["best_of"] = 1
-
-                # Clamp max_tokens and max_completion_tokens (and strip maxOutputTokens) on the forwarded payload.
-                req_max_tok = parsed_body.get("max_tokens")
-                req_max_out = parsed_body.pop("maxOutputTokens", None)
-                if isinstance(req_max_tok, int) and not isinstance(req_max_tok, bool):
-                    parsed_body["max_tokens"] = min(max(1, req_max_tok), relay.max_tokens_cap)
-                elif isinstance(req_max_out, int) and not isinstance(req_max_out, bool):
-                    parsed_body["max_tokens"] = min(max(1, req_max_out), relay.max_tokens_cap)
-                else:
-                    parsed_body["max_tokens"] = relay.max_tokens_cap
-
-                req_max_comp = parsed_body.get("max_completion_tokens")
-                if isinstance(req_max_comp, int) and not isinstance(req_max_comp, bool):
-                    parsed_body["max_completion_tokens"] = min(
-                        max(1, req_max_comp), relay.max_tokens_cap
-                    )
-
-                forwarded_bytes = json.dumps(parsed_body).encode("utf-8")
-                if len(forwarded_bytes) > relay.max_request_bytes:
-                    self._send_json_error(
-                        413,
-                        "Clamped request body exceeds worker max_request_bytes.",
-                        "request_too_large",
-                    )
-                    return
-
-                with relay._lock:
-                    if relay.chat_requests_used >= relay.max_chat_requests:
-                        self._send_json_error(
-                            429,
-                            f"Worker relay max_chat_requests ({relay.max_chat_requests}) reached.",
-                            "rate_limit_error",
-                        )
-                        return
-                    relay.chat_requests_used += 1
-
-                self._forward_upstream("POST", "/v1/chat/completions", forwarded_bytes)
-
-            def do_PUT(self) -> None:
-                if not self._check_auth():
-                    return
-                self._send_json_error(405, "Method not allowed.", "method_not_allowed")
-
-            def do_DELETE(self) -> None:
-                if not self._check_auth():
-                    return
-                self._send_json_error(405, "Method not allowed.", "method_not_allowed")
-
-            def _forward_upstream(
-                self, method: str, path: str, body: bytes | None
-            ) -> None:
-                if not relay._inflight_sem.acquire(timeout=5.0):
-                    self._send_json_error(
-                        429,
-                        "Too many concurrent worker relay requests.",
-                        "rate_limit_error",
-                    )
-                    return
-                conn = http.client.HTTPConnection(
-                    relay.upstream_host,
-                    relay.upstream_port,
-                    timeout=relay.upstream_timeout_seconds,
-                )
-                headers_sent = False
-                try:
-                    up_headers: dict[str, str] = {
-                        "Authorization": f"Bearer {relay._upstream_session_token}",
-                        "Accept": self.headers.get("Accept", "application/json"),
-                        "Connection": "close",
-                    }
-                    if body is not None:
-                        up_headers["Content-Type"] = "application/json"
-                        up_headers["Content-Length"] = str(len(body))
-                    conn.request(method, path, body=body, headers=up_headers)
-                    resp = conn.getresponse()
-                    content_type = resp.getheader("Content-Type", "application/json")
-                    is_sse = "text/event-stream" in content_type.lower()
-
-                    self.send_response(resp.status)
-                    headers_sent = True
-                    self.send_header("Content-Type", content_type)
-                    for pass_hdr in ("Retry-After", "x-request-id"):
-                        hdr_val = resp.getheader(pass_hdr)
-                        if hdr_val is not None:
-                            self.send_header(pass_hdr, hdr_val)
-                    if not is_sse:
-                        up_cl = resp.getheader("Content-Length")
-                        if up_cl is not None:
-                            self.send_header("Content-Length", up_cl)
-                    else:
-                        self.send_header("Cache-Control", "no-cache")
-                    self.send_header("Connection", "close")
-                    self.end_headers()
-
-                    total_read = 0
-                    read_fn = getattr(resp, "read1", None)
-                    while True:
-                        chunk = read_fn(4096) if callable(read_fn) else resp.read(4096)
-                        if not chunk:
-                            break
-                        total_read += len(chunk)
-                        if total_read > relay.max_response_bytes:
-                            if is_sse:
-                                self.wfile.write(
-                                    b'\ndata: {"error":{"message":"Response exceeded max_response_bytes","type":"response_truncated"}}\n\n'
-                                )
-                                self.wfile.flush()
-                            break
-                        self.wfile.write(chunk)
-                        self.wfile.flush()
-                except (BrokenPipeError, ConnectionResetError):
-                    self.close_connection = True
-                except Exception as exc:
-                    self.close_connection = True
-                    if not headers_sent:
-                        try:
-                            self._send_json_error(
-                                502,
-                                f"Upstream proxy error: {exc}",
-                                "upstream_error",
-                            )
-                        except Exception:
-                            pass
-                finally:
-                    relay._inflight_sem.release()
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
-
-        self._httpd = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
-        self._httpd.daemon_threads = True
-        self._thread = threading.Thread(
-            target=self._httpd.serve_forever,
-            name="worker-token-relay",
-            daemon=True,
-        )
-        self._thread.start()
-        return self
-
-    def close(self) -> None:
-        if self._httpd is not None:
-            try:
-                self._httpd.shutdown()
-            except Exception:
-                pass
-            try:
-                self._httpd.server_close()
-            except Exception:
-                pass
-            self._httpd = None
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
-            self._thread = None
 
 
 def check_pid_identity_state(pid: Any, expected_lstart: Any) -> str:
@@ -3706,9 +4346,11 @@ def teardown_worker_home(
     remove_home: bool = True,
     reap_processes: bool = True,
     group_clean: bool = True,
+    service_clean: bool = True,
     owned_pgid: int | None = None,
 ) -> dict[str, Any]:
     effective_group_clean = bool(group_clean)
+    effective_service_clean = bool(service_clean)
     if not effective_group_clean:
         _write_unconfirmed_group_marker(isolated_home, owned_pgid)
     elif isolated_home.exists() and not isolated_home.is_symlink():
@@ -3716,6 +4358,22 @@ def teardown_worker_home(
             effective_group_clean = _clear_unconfirmed_group_marker(isolated_home)
         else:
             effective_group_clean = _check_persisted_unconfirmed_group(isolated_home)
+
+    if reap_processes and isolated_home.exists():
+        if isolated_home.is_symlink():
+            effective_service_clean = False
+        elif isolated_home.is_dir():
+            from .launch import _cleanup_scope_opencode_service
+
+            if not _cleanup_scope_opencode_service(
+                isolated_home,
+                state_svc_rel=Path(".local") / "state" / "opencode" / "service.json",
+                sidecar_name=".service-identity.json",
+                cfg_svc_rel=Path(".config") / "opencode" / "service.json",
+                scope_id=worker_id,
+                grace_seconds=1.0,
+            ):
+                effective_service_clean = False
 
     reaped_pids: list[int] = []
     reaper_clean = True
@@ -3725,7 +4383,11 @@ def teardown_worker_home(
             isolated_home=isolated_home,
         )
 
-    effective_reaper_clean = (reaper_clean if reap_processes else True) and effective_group_clean
+    effective_reaper_clean = (
+        (reaper_clean if reap_processes else True)
+        and effective_group_clean
+        and effective_service_clean
+    )
 
     harvested_dir: Path | None = None
     if harvest_logs and worker_id and isolated_home.exists():
@@ -3744,15 +4406,16 @@ def teardown_worker_home(
         elif effective_reaper_clean:
             removed = _safe_rmtree_nofollow(isolated_home)
         else:
-            # Preserve isolated_home on disk when process observation/reaping or owned
-            # process-group termination is incomplete so subsequent sweeps retain recovery
-            # evidence (F6/F7, R2-F3, P2-PLAN-MAJOR-1, P3-PLAN-MINOR-1).
+            # Preserve isolated_home on disk when process observation/reaping, bound service
+            # cleanup, or owned process-group termination is incomplete so subsequent sweeps
+            # retain recovery evidence (F6/F7, R2-F3, P2-PLAN-MAJOR-1, P3-PLAN-MINOR-1, ISO-P2).
             removed = False
 
     clean = effective_reaper_clean and (removed if remove_home else True)
     return {
         "reaped_pids": reaped_pids,
         "group_clean": effective_group_clean,
+        "service_clean": effective_service_clean,
         "reaper_clean": effective_reaper_clean,
         "harvested_dir": harvested_dir,
         "removed": removed,
@@ -3842,7 +4505,8 @@ def run_worker_sandbox_lifecycle(
     relay: _WorkerTokenRelay | None = None,
     grace_seconds: float = 2.0,
     popen_factory: Any = None,
-    pre_teardown_hook: Callable[[], None] | None = None,
+    poll_hook: Callable[[], None] | None = None,
+    pre_teardown_hook: Callable[[], bool | None] | None = None,
     teardown_fn: Callable[[bool, int | None], dict[str, Any]] | None = None,
 ) -> tuple[int, dict[str, Any]]:
     actual_popen = popen_factory if popen_factory is not None else subprocess.Popen
@@ -3911,12 +4575,22 @@ def run_worker_sandbox_lifecycle(
                     exit_code = 128 + int(cancel_state["signum"])
                 else:
                     while True:
+                        if poll_hook is not None:
+                            try:
+                                poll_hook()
+                            except Exception:
+                                pass
                         if cancel_state["signum"] is not None:
                             group_clean = _terminate_process_group(proc, grace_seconds=grace_seconds)
                             exit_code = 128 + int(cancel_state["signum"])
                             break
                         rc = proc.poll()
                         if rc is not None:
+                            if poll_hook is not None:
+                                try:
+                                    poll_hook()
+                                except Exception:
+                                    pass
                             if cancel_state["signum"] is not None:
                                 group_clean = _terminate_process_group(
                                     proc, grace_seconds=grace_seconds
@@ -3933,15 +4607,18 @@ def run_worker_sandbox_lifecycle(
                 group_clean = _terminate_process_group(
                     proc_ref, grace_seconds=grace_seconds
                 ) and group_clean
+            service_clean = True
             if pre_teardown_hook is not None:
                 try:
-                    pre_teardown_hook()
+                    hook_res = pre_teardown_hook()
+                    if hook_res is False:
+                        service_clean = False
                 except Exception:
-                    pass
+                    service_clean = False
             if relay is not None:
                 relay.close()
             if teardown_fn is not None:
-                teardown_res = teardown_fn(group_clean, owned_pgid)
+                teardown_res = teardown_fn(group_clean and service_clean, owned_pgid)
             else:
                 if not remove_home and worker_id:
                     try:
@@ -3957,6 +4634,7 @@ def run_worker_sandbox_lifecycle(
                     remove_home=remove_home,
                     reap_processes=reap_processes,
                     group_clean=group_clean,
+                    service_clean=service_clean,
                     owned_pgid=owned_pgid,
                 )
             if cancel_state["signum"] is not None and exit_code == 0:

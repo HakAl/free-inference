@@ -8,7 +8,7 @@ import stat
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any
+from typing import AbstractSet, Any
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -19,7 +19,7 @@ TEST_BINARY_PATH = BIN_DIR / "se-key-proxy-test"
 LEGACY_BINARY_PATH = BIN_DIR / ".se-key-proxy-legacy"
 STAMP_PATH = BIN_DIR / ".se-key-proxy.stamp"
 
-EXPECTED_SWIFT_SOURCE_SHA256 = "f467d1e7e6c256d03c858fb26d2a8f239ab49b4ba7a05bd5387763cc8859b128"
+EXPECTED_SWIFT_SOURCE_SHA256 = "39a4d0897d48f2c3656e1e3a1ef7a01bd221fc9cba345363aa800761f35c7196"
 EXPECTED_LEGACY_BINARY_SHA256 = "012f4414ad3c9889915aaf9318e77d28d145b3a973ecf190fe7b017342fe04c2"
 DEFAULT_ENVELOPE_ACCOUNT = "free-inference"
 SKIP_EXIT_CODE = 77
@@ -34,7 +34,141 @@ DEFAULT_REDACT_TEXT_FILENAMES = frozenset({
 DEFAULT_EXCLUDED_DIR_NAMES = frozenset({
     "huggingface",
     ".npm",
+    "go-build",
 })
+PROTECTED_REPO_HOME_DIR_NAMES = DEFAULT_EXCLUDED_DIR_NAMES | frozenset({
+    "opencode-private-attested",
+    "opencode-private-local",
+    ".promptfoo",
+    "workers",
+    "dogfood",
+})
+_SYSTEM_ROOT_SYMLINKS = frozenset({Path("/var"), Path("/tmp"), Path("/etc")})
+
+
+def _anchor_without_lexical_collapse(path: Path) -> Path:
+    if ".." in path.parts:
+        raise ValueError(f"Scan root '{path}' must not contain parent traversal ('..') components")
+    return path if path.is_absolute() else (Path.cwd() / path)
+
+
+def _path_has_user_symlink_component(cand_anchored: Path, *, root_abs: Path | None = None) -> bool:
+    cur = cand_anchored
+    while cur != cur.parent and cur not in _SYSTEM_ROOT_SYMLINKS:
+        if root_abs is not None and cur == root_abs:
+            break
+        if os.path.islink(cur):
+            return True
+        cur = cur.parent
+    return False
+
+
+def validate_non_symlink_scan_root(
+    candidate: Path,
+    *,
+    root_dir: Path,
+    must_exist: bool = False,
+) -> Path:
+    """Validate that candidate contains no '..' or symlink components and (if present) is a directory."""
+    root_anchored = _anchor_without_lexical_collapse(root_dir)
+    cand_anchored = _anchor_without_lexical_collapse(candidate)
+    if _path_has_user_symlink_component(cand_anchored, root_abs=root_anchored):
+        raise ValueError(f"Required scan root '{candidate}' must not be or traverse a symlink")
+    try:
+        target_real = cand_anchored.resolve()
+    except RuntimeError as exc:
+        raise ValueError(f"Scan root '{candidate}' could not be resolved: {exc}") from exc
+    if must_exist and not target_real.is_dir():
+        raise ValueError(f"Required scan root '{candidate}' does not exist or is not a directory")
+    if not must_exist and target_real.exists() and not target_real.is_dir():
+        raise ValueError(f"Scan root '{candidate}' exists and is not a directory")
+    return cand_anchored
+
+
+def resolve_authorized_scan_root(
+    candidate: Path,
+    *,
+    root_dir: Path,
+    forbidden_home_subdirs: AbstractSet[str] = PROTECTED_REPO_HOME_DIR_NAMES,
+    allow_symlink_alias: bool = True,
+) -> Path:
+    """Validate a required scan root against protected .home boundaries and return its scan Path.
+
+    Refuses parent ('..') components before any normalization, symlinked repository .home roots,
+    protected .home subtrees (including top-level symlink targets under .home), symlinked roots
+    when allow_symlink_alias=False, and dangling or non-directory symlink targets when
+    allow_symlink_alias=True.
+    """
+    root_anchored = _anchor_without_lexical_collapse(root_dir)
+    repo_home = root_anchored / ".home"
+    if _path_has_user_symlink_component(repo_home, root_abs=root_anchored):
+        raise ValueError(f"Repository .home path '{repo_home}' must not be or traverse a symlink")
+    try:
+        repo_home_real = repo_home.resolve()
+    except RuntimeError as exc:
+        raise ValueError(f"Repository .home path '{repo_home}' could not be resolved: {exc}") from exc
+    if repo_home_real.exists() and not repo_home_real.is_dir():
+        raise ValueError(f"Repository .home path '{repo_home}' is not a directory")
+
+    cand_anchored = _anchor_without_lexical_collapse(candidate)
+    has_symlink_alias = _path_has_user_symlink_component(cand_anchored, root_abs=root_anchored)
+    if not allow_symlink_alias and has_symlink_alias:
+        raise ValueError(f"Required scan root '{candidate}' must not be or traverse a symlink")
+
+    forbidden_reals: list[Path] = []
+    for dname in sorted(forbidden_home_subdirs):
+        forbidden_reals.append(repo_home_real / dname)
+        cand_sub = repo_home / dname
+        try:
+            st = os.lstat(cand_sub)
+            if stat.S_ISLNK(st.st_mode):
+                forbidden_reals.append(cand_sub.resolve())
+        except (OSError, RuntimeError):
+            pass
+
+    try:
+        target_real = cand_anchored.resolve()
+    except RuntimeError as exc:
+        raise ValueError(f"Scan root '{candidate}' could not be resolved: {exc}") from exc
+
+    if target_real == repo_home_real or repo_home_real.is_relative_to(target_real):
+        raise ValueError(
+            f"Forbidden scan root '{candidate}' overlaps repository .home boundary"
+        )
+    for f_real in forbidden_reals:
+        if (
+            target_real == f_real
+            or target_real.is_relative_to(f_real)
+            or f_real.is_relative_to(target_real)
+        ):
+            raise ValueError(
+                f"Forbidden scan root '{candidate}' overlaps protected directory '{f_real}'"
+            )
+
+    if has_symlink_alias:
+        if not target_real.is_dir():
+            raise ValueError(
+                f"Symlink scan root '{candidate}' must resolve to an existing directory, got '{target_real}'"
+            )
+        return target_real
+    if target_real.exists() and not target_real.is_dir():
+        raise ValueError(f"Scan root '{candidate}' exists and is not a directory")
+
+    return cand_anchored
+
+
+def count_exact_session_token(text: str, active_session_token: str | None) -> int:
+    """Count exact full-token matches of active_session_token in text."""
+    if active_session_token is None:
+        return 0
+    if (
+        not isinstance(active_session_token, str)
+        or SESSION_TOKEN_REDACT_RE.fullmatch(active_session_token) is None
+    ):
+        raise ValueError("active_session_token must match se-session-[A-Za-z0-9_-]{16,}")
+    return sum(
+        1 for m in SESSION_TOKEN_REDACT_RE.finditer(text) if m.group(0) == active_session_token
+    )
 
 
 def redact_and_count_session_tokens(text: str) -> tuple[str, int]:
@@ -48,13 +182,22 @@ def redact_session_tokens(text: str) -> str:
     return scrubbed
 
 
-def _stream_count_token_matches(fpath: Path, chunk_size: int = 1048576, overlap: int = 256) -> tuple[int, int]:
+def _stream_count_token_matches(
+    fpath: Path,
+    chunk_size: int = 1048576,
+    overlap: int = 256,
+    active_token_bytes: bytes | None = None,
+) -> tuple[int, int, int]:
     """Stream a file in chunks to count se-session-* matches without loading it whole into memory.
 
-    Returns (bytes_scanned, match_count).
+    Returns (bytes_scanned, match_count, active_match_count).
     """
+    effective_overlap = max(
+        overlap,
+        (len(active_token_bytes) + 64) if active_token_bytes is not None else 0,
+    )
     bytes_scanned = 0
-    matched_spans: set[tuple[int, int]] = set()
+    matched_spans: set[tuple[int, int, bool]] = set()
     tail = b""
     tail_offset = 0
     with fpath.open("rb") as fh:
@@ -68,27 +211,29 @@ def _stream_count_token_matches(fpath: Path, chunk_size: int = 1048576, overlap:
             for m in SESSION_TOKEN_BYTES_RE.finditer(buf):
                 abs_start = buf_start + m.start()
                 abs_end = buf_start + m.end()
-                # If a match reaches the very end of buf and chunk was full, it might continue in next chunk;
-                # overlapping by 256 bytes will see the full token on the next iteration starting at abs_start.
-                matched_spans.add((abs_start, abs_end))
-            if len(buf) > overlap:
-                tail = buf[-overlap:]
-                tail_offset = bytes_scanned - overlap
+                is_active = active_token_bytes is not None and m.group(0) == active_token_bytes
+                matched_spans.add((abs_start, abs_end, is_active))
+            if len(buf) > effective_overlap:
+                tail = buf[-effective_overlap:]
+                tail_offset = bytes_scanned - effective_overlap
             else:
                 tail = buf
                 tail_offset = buf_start
     # Deduplicate prefix matches that were extended across a chunk boundary
-    final_starts: dict[int, int] = {}
-    for s, e in matched_spans:
-        if s not in final_starts or e > final_starts[s]:
-            final_starts[s] = e
-    return bytes_scanned, len(final_starts)
+    final_starts: dict[int, tuple[int, bool]] = {}
+    for s, e, is_active in matched_spans:
+        prev = final_starts.get(s)
+        if prev is None or e > prev[0]:
+            final_starts[s] = (e, is_active)
+    active_count = sum(1 for _, is_active in final_starts.values() if is_active)
+    return bytes_scanned, len(final_starts), active_count
 
 
 def scan_and_redact_directory_tokens(
     roots: list[Path],
     redact_filenames: set[str] | frozenset[str] = DEFAULT_REDACT_TEXT_FILENAMES,
     excluded_dir_names: set[str] | frozenset[str] = DEFAULT_EXCLUDED_DIR_NAMES,
+    active_session_token: str | None = None,
 ) -> dict[str, Any]:
     """Scan all regular files under roots for se-session-* tokens.
 
@@ -96,15 +241,26 @@ def scan_and_redact_directory_tokens(
     SQLite databases or other files in-place. Returns a manifest dict suitable for
     metrics.json / summary.json.
     """
+    active_token_bytes: bytes | None = None
+    if active_session_token is not None:
+        if (
+            not isinstance(active_session_token, str)
+            or SESSION_TOKEN_REDACT_RE.fullmatch(active_session_token) is None
+        ):
+            raise ValueError("active_session_token must match se-session-[A-Za-z0-9_-]{16,}")
+        active_token_bytes = active_session_token.encode("utf-8")
+
     files_scanned = 0
     bytes_scanned = 0
     redactions_applied = 0
     matches_found = 0
+    active_matches_found = 0
     remaining_matches = 0
     files_skipped: list[dict[str, str]] = []
     excluded_dirs: list[dict[str, str]] = []
     matched_files: list[str] = []
     missing_roots: list[str] = []
+    skipped_roots: list[dict[str, str]] = []
 
     unique_roots: list[Path] = []
     seen_root_strs: set[str] = set()
@@ -114,9 +270,23 @@ def scan_and_redact_directory_tokens(
             seen_root_strs.add(rs)
             unique_roots.append(r)
 
+    seen_dir_realpaths: set[Path] = set()
+
     for root in unique_roots:
-        if not root.exists():
+        try:
+            root_st = os.lstat(root)
+        except OSError:
             missing_roots.append(str(root))
+            continue
+        if stat.S_ISLNK(root_st.st_mode):
+            skipped_roots.append({"path": str(root), "reason": "symlink_root"})
+            excluded_dirs.append({"path": str(root), "reason": "symlink_dir"})
+            continue
+        if not stat.S_ISDIR(root_st.st_mode):
+            skipped_roots.append({"path": str(root), "reason": "non_directory_root"})
+            files_skipped.append({"path": str(root), "reason": "non_directory_root"})
+            continue
+        if root.resolve() in seen_dir_realpaths:
             continue
 
         def _on_walk_error(exc: OSError) -> None:
@@ -124,6 +294,12 @@ def scan_and_redact_directory_tokens(
             files_skipped.append({"path": str(bad_path), "reason": f"walk_error: {exc}"})
 
         for dirpath, dirnames, filenames in os.walk(root, followlinks=False, onerror=_on_walk_error):
+            dir_real = Path(dirpath).resolve()
+            if dir_real in seen_dir_realpaths:
+                dirnames[:] = []
+                continue
+            seen_dir_realpaths.add(dir_real)
+
             dirnames.sort()
             is_top_home_root = Path(dirpath) == root and root.name == ".home"
             kept_dirs: list[str] = []
@@ -139,6 +315,8 @@ def scan_and_redact_directory_tokens(
                     continue
                 if stat.S_ISLNK(dst.st_mode):
                     excluded_dirs.append({"path": str(dpath), "reason": "symlink_dir"})
+                    continue
+                if dpath.resolve() in seen_dir_realpaths:
                     continue
                 kept_dirs.append(dname)
             dirnames[:] = kept_dirs
@@ -162,10 +340,15 @@ def scan_and_redact_directory_tokens(
                         continue
                     files_scanned += 1
                     bytes_scanned += len(raw)
-                    raw_matches = len(SESSION_TOKEN_BYTES_RE.findall(raw))
+                    all_tokens = SESSION_TOKEN_BYTES_RE.findall(raw)
+                    raw_matches = len(all_tokens)
                     if raw_matches == 0:
                         continue
                     matches_found += raw_matches
+                    if active_token_bytes is not None:
+                        active_matches_found += sum(
+                            1 for tok in all_tokens if tok == active_token_bytes
+                        )
                     matched_files.append(str(fpath))
                     try:
                         decoded = raw.decode("utf-8")
@@ -184,7 +367,10 @@ def scan_and_redact_directory_tokens(
                     remaining_matches += rem
                 else:
                     try:
-                        file_bytes, raw_matches = _stream_count_token_matches(fpath)
+                        file_bytes, raw_matches, raw_active = _stream_count_token_matches(
+                            fpath,
+                            active_token_bytes=active_token_bytes,
+                        )
                     except OSError as exc:
                         files_skipped.append({"path": str(fpath), "reason": f"read_error: {exc}"})
                         continue
@@ -192,12 +378,14 @@ def scan_and_redact_directory_tokens(
                     bytes_scanned += file_bytes
                     if raw_matches > 0:
                         matches_found += raw_matches
+                        active_matches_found += raw_active
                         remaining_matches += raw_matches
                         matched_files.append(str(fpath))
 
     return {
         "roots": [str(r) for r in unique_roots],
         "missing_roots": missing_roots,
+        "skipped_roots": skipped_roots,
         "excluded_dirs": excluded_dirs,
         "files_scanned": files_scanned,
         "bytes_scanned": bytes_scanned,
@@ -205,6 +393,8 @@ def scan_and_redact_directory_tokens(
         "matches_found": matches_found,
         "redactions_applied": redactions_applied,
         "remaining_unredacted_matches": remaining_matches,
+        "active_token_checked": active_token_bytes is not None,
+        "active_token_matches_found": active_matches_found,
         "matched_files": matched_files,
     }
 

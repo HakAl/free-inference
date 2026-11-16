@@ -4,6 +4,7 @@
   "snapshot": false,
   "lsp": false,
   "formatter": false,
+  "plugins": __PLUGINS_JSON__,
   "enabled_providers": [
     "private-attested"
   ],
@@ -50,7 +51,7 @@
         ],
         "cwd": "__LAB_ROOT__",
         "environment": {
-          "LOCAL_ASSIST_BASE_URL": "http://127.0.0.1:8080/v1",
+          "LOCAL_ASSIST_BASE_URL": "__LOCAL_ASSIST_BASE_URL__",
           "LOCAL_ASSIST_WORKSPACE_ROOT": "__WORKSPACE_DIR__"
         },
         "disabled": false,
@@ -92,7 +93,7 @@
     "patch": "__EDIT_PERMISSION__",
     "task": "__SUBAGENT_PERMISSION__",
     "subagent": "__SUBAGENT_PERMISSION__",
-    "bash": "ask",
+    "bash": "__BASH_PERMISSION__",
     "external_directory": "ask",
     "doom_loop": "ask",
     "webfetch": "deny",

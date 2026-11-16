@@ -39,7 +39,7 @@ Read these documents before making changes:
   - `./scripts/sync-model-catalog --check`
   - `./scripts/sync-model-catalog --apply`
 - Launch Rung 1 local coding session (from target project directory): `/path/to/free-inference/scripts/opencode-local` (pass `--refresh-session` to restart the server)
-- Launch Rung 3 attested enclave coding session (from target project directory): `/path/to/free-inference/scripts/opencode-attested` (pass `--refresh-session` to renew the 12h Touch ID proxy session, `--thinking` to enable reasoning traces, `--allow-subagents` to opt into OpenCode subagents, or `--port <port>` to pin a custom port)
+- Launch Rung 3 attested enclave coding session (from target project directory): `/path/to/free-inference/scripts/opencode-attested` (2h default; use `scripts/session status|renew|stop` for explicit controls, `--refresh-session` to restart with fresh caps, `--thinking` for reasoning traces, `--allow-subagents` to opt into OpenCode subagents, or `--port <port>` to pin a custom port)
 - Launch unattended sandboxed worker (Rung 1 or Rung 3):
   - `/path/to/free-inference/scripts/opencode-local --unattended-worker -- run --format json "<prompt>"`
   - `/path/to/free-inference/scripts/opencode-attested --security-profile <profile.yaml> --max-session-usd 0.50 -- run --format json "<prompt>"`
@@ -49,6 +49,11 @@ Read these documents before making changes:
   - `./scripts/verify-served-model <model-id> --wait 60`
   - `./scripts/eval <sanity|v1|tools> <model-id>`
   - `./scripts/stop-model <model-id>`
+
+## Branch and Worktree Isolation
+
+- Always develop and test changes on a dedicated feature or fix branch inside an isolated `git worktree` (for example `git worktree add ../worktrees/<topic> -b <branch>`) rather than directly on `main`.
+- Treat the primary `main` checkout, its `.home/` and `runs/` directories, and any active served ports (`8080`, `8081`, `8082`) as potentially in active daily use; never edit `main` in place, stop active operator sessions, or merge into `main` without explicit operator approval.
 
 ## Required Checks Before Submitting Changes
 

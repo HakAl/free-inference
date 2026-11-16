@@ -354,6 +354,7 @@ models:
     routing:
       private_local: blocked
       private_attested: cleared
+      default_private_attested: true
     eval_evidence_artifact: docs/evals/tinfoil-deepseek-v4-1-flash.json
     remote_trust:
       tier: enclave_runtime_attested
@@ -664,3 +665,266 @@ models:
       Kept at status: candidate under the strict 10/10 automated v1 gate. Zero retries
       used across all suites; zero session token leaks across all runs.
     eval_summary: "2026-11-07 via tinfoil-proxy v0.2.9 + se-key-proxy (chat_template_kwargs.thinking=false, include_reasoning=false): sanity 1/1 (runs/2026-11-07-052113-sanity-tinfoil-kimi-k3-1-pro-549f5f54-MOpRpj, text TTFT 0.3096s, 155 tokens total); automated v1 9/10 in 31s (runs/2026-11-07-052129-v1-tinfoil-kimi-k3-1-pro-549f5f54-Os9S4D, text TTFT 0.2933s, 25644 tokens); tools 4/4 in 3s (runs/2026-11-07-052218-tools-tinfoil-kimi-k3-1-pro-549f5f54-iNm1IJ, text TTFT 0.2955s, buffered tool-call TTFT 0.5529s, tool_call_chunks=1, 1680 tokens); opencode-smoke PASS in 2.5669s (runs/2026-11-07-052238-opencode-smoke-tinfoil-kimi-k3-1-pro-549f5f54-9quqmsay, 1903 tokens)."
+
+  - id: privatemode-glm-5-3-flash
+    status: active
+    repo: glm-5.3-flash
+    upstream: nvidia/GLM-5.3-Flash-NVFP4
+    converter: edgelesssys
+    conversion_runtime_version: vllm
+    runtime: proxy
+    serve_command: ./bin/privatemode-proxy --listen-address {host} --port {port} --api-key-fallback=never --manifest-path config/privatemode-manifest-v1.63.0.json --workspace .home/privatemode-proxy --disable-prompt-cache=false --prompt-cache-salt=random --nvidia-ocsp-allow-unknown=false --nvidia-ocsp-revoked-grace-period=0
+    enclave_repo: edgelesssys/privatemode-public
+    enclave_tag: v1.63.0
+    promptfoo_provider:
+      id: openai:chat:glm-5.3-flash
+      apiBaseUrl: http://127.0.0.1:8082/v1
+      apiKeyKeychainService: free-inference.privatemode
+      config:
+        showThinking: false
+        passthrough:
+          include_reasoning: false
+          chat_template_kwargs:
+            enable_thinking: false
+    capabilities:
+      tool_calling: true
+    routing:
+      private_local: blocked
+      private_attested: cleared
+    eval_evidence_artifact: docs/evals/privatemode-glm-5-3-flash.json
+    remote_trust:
+      tier: enclave_runtime_attested
+      attestation_method: privatemode-proxy-contrast
+      weights_hash: null
+      weights_source: null
+      provider_manifest_weights_hash: dmverity:sha256:c5dcd713fffc38c956bbd41fb299c360ed07d60de61938a6ff2729f6c3acd245
+      provider_manifest_weights_source: nvidia/GLM-5.3-Flash-NVFP4@da920bb0b9f4a06727223a349e55468e38352348
+      usage_policy: provider_terms_apply
+      jurisdiction: DE/EU
+      pricing_per_m_tokens:
+        input: 0.22
+        output: 0.72
+        cached_input: 0.06
+    license: mit
+    release_date: null
+    verified_date: "2026-11-13"
+    params_total: null
+    params_active: null
+    quantization:
+      bits: 4
+      group_size: null
+      tool: nvfp4
+      tool_version: null
+    disk_gb_estimate: 206.1
+    ram_gb_estimate: null
+    context_window: 1048576
+    modalities:
+      - text
+      - image
+    chat_template:
+      source: glm47
+      roles_supported:
+        - system
+        - user
+        - assistant
+        - tool
+    source_links:
+      - https://github.com/edgelesssys/privatemode-public
+      - https://huggingface.co/nvidia/GLM-5.3-Flash-NVFP4
+      - https://huggingface.co/zai-org/GLM-5.3-Flash
+    fit_notes: |
+      GLM 5.3 Flash NVFP4 served inside Privatemode's Contrast Confidential Containers
+      (Intel TDX + NVIDIA B200/B300 CC, workload-glm-5-3-flash Kata initdata policy
+      abb78b0c3985a8eeb63c86f9ec9b544abeddadaa2868737379e18c531d906360) with vLLM v0.31.0,
+      --tool-call-parser glm47, --reasoning-parser glm47, 1M context window, and end-to-end
+      ML-KEM-768+X25519 HPKE request encryption terminating inside the Contrast mesh.
+      Published EUR pricing verified on 2026-11-13: EUR 0.20/1M input (EUR 0.05 cached) and
+      EUR 0.65/1M output, converted to USD using the ECB reference rate 1.1081 (2026-11-12).
+    review_notes: |
+      Attested and evaluated on 2026-11-13 via privatemode-proxy v1.63.0 + se-key-proxy
+      with pinned Contrast manifest config/privatemode-manifest-v1.63.0.json and strict
+      NVIDIA OCSP (see docs/attestations/2026-11-13-privatemode-rung3-trial.md). Passed
+      Phase 1 fail-closed tampered-manifest negative test, cold/warm unauthenticated
+      credential-isolation checks (--api-key-fallback=never), and live libproc PCB
+      verification. Passed sanity (1/1 in 0s, text TTFT 0.2251s) and tools (4/4 in 3s,
+      including parallel-tool-calls-diff-check, incremental tool-call TTFT 0.4016s,
+      tool_call_chunks=5), and scored 9/10 on automated v1 in 39s (text TTFT 0.2343s),
+      missing only the diff --git header on a valid POSIX unified diff in
+      patch-like-edit-gitignore. Passed opencode-smoke in 2.2788s
+      (runs/2026-11-13-200441-opencode-smoke-privatemode-glm-5-3-flash-a319fedd-p1s_92n2,
+      summary.passed=true, smoke_seatbelt_enforced=true, only_read_tool_called=true,
+      token_verified=true, non_localhost_sockets=0, matches_found=0,
+      active_token_checked=true, active_token_matches_found=0; pre-fix run
+      runs/2026-11-13-171420-opencode-smoke-privatemode-glm-5-3-flash-a319fedd-vd1kskax
+      retained). Cleared for private-attested routing by explicit operator decision on
+      2026-11-14 under the 9/10 patch-like-edit-gitignore POSIX unified diff exception
+      (outperforming full privatemode-glm-5-3 at 8/10 on v1).
+    eval_summary: "2026-11-13 via privatemode-proxy v1.63.0 + se-key-proxy (chat_template_kwargs.enable_thinking=false, include_reasoning=false): sanity 1/1 (runs/2026-11-13-171255-sanity-privatemode-glm-5-3-flash-a319fedd-2HvmJs, text TTFT 0.2251s, 91 tokens total); automated v1 9/10 in 39s (runs/2026-11-13-171312-v1-privatemode-glm-5-3-flash-a319fedd-uzCxB4, text TTFT 0.2343s, 26166 tokens); tools 4/4 in 3s (runs/2026-11-13-171404-tools-privatemode-glm-5-3-flash-a319fedd-jDaSTE, text TTFT 0.2420s, incremental tool-call TTFT 0.4016s, tool_call_chunks=5, 1872 tokens); opencode-smoke PASS in 2.2788s (runs/2026-11-13-200441-opencode-smoke-privatemode-glm-5-3-flash-a319fedd-p1s_92n2, smoke_seatbelt_enforced=true, matches_found=0, active_token_matches_found=0, 2218 tokens; pre-fix run runs/2026-11-13-171420-opencode-smoke-privatemode-glm-5-3-flash-a319fedd-vd1kskax retained)."
+
+  - id: privatemode-glm-5-3
+    status: candidate
+    repo: glm-5.3
+    upstream: nvidia/GLM-5.3-NVFP4
+    converter: edgelesssys
+    conversion_runtime_version: vllm
+    runtime: proxy
+    serve_command: ./bin/privatemode-proxy --listen-address {host} --port {port} --api-key-fallback=never --manifest-path config/privatemode-manifest-v1.63.0.json --workspace .home/privatemode-proxy --disable-prompt-cache=false --prompt-cache-salt=random --nvidia-ocsp-allow-unknown=false --nvidia-ocsp-revoked-grace-period=0
+    enclave_repo: edgelesssys/privatemode-public
+    enclave_tag: v1.63.0
+    promptfoo_provider:
+      id: openai:chat:glm-5.3
+      apiBaseUrl: http://127.0.0.1:8082/v1
+      apiKeyKeychainService: free-inference.privatemode
+      config:
+        showThinking: false
+        passthrough:
+          include_reasoning: false
+          chat_template_kwargs:
+            enable_thinking: false
+    capabilities:
+      tool_calling: true
+    routing:
+      private_local: blocked
+      private_attested: blocked
+    remote_trust:
+      tier: enclave_runtime_attested
+      attestation_method: privatemode-proxy-contrast
+      weights_hash: null
+      weights_source: null
+      provider_manifest_weights_hash: dmverity:sha256:df66c4cfc7f34c4f7aefd710795a511cde8384677cd041220a04b55541a07d75
+      provider_manifest_weights_source: nvidia/GLM-5.3-NVFP4@e3b8f9f2fad29727dfa95e766c5cac18ea1414bf
+      usage_policy: provider_terms_apply
+      jurisdiction: DE/EU
+      pricing_per_m_tokens:
+        input: 1.72
+        output: 6.36
+        cached_input: 0.17
+    license: mit
+    release_date: null
+    verified_date: "2026-11-13"
+    params_total: null
+    params_active: null
+    quantization:
+      bits: 4
+      group_size: null
+      tool: nvfp4
+      tool_version: null
+    disk_gb_estimate: 467.8
+    ram_gb_estimate: null
+    context_window: 1048576
+    modalities:
+      - text
+    chat_template:
+      source: glm47
+      roles_supported:
+        - system
+        - user
+        - assistant
+        - tool
+    source_links:
+      - https://github.com/edgelesssys/privatemode-public
+      - https://huggingface.co/nvidia/GLM-5.3-NVFP4
+    fit_notes: |
+      GLM 5.3 NVFP4 served inside Privatemode's Contrast Confidential Containers
+      (Intel TDX + NVIDIA B200/B300 CC, workload-glm-5-3 Kata initdata policy
+      8db3cfedc949f9a1e0702f5ca19ac96eb935fd1ff9cff6a0b2a94d1ceff9575d) with vLLM v0.31.0,
+      --tool-call-parser glm47, --reasoning-parser glm47, 1M context window, and end-to-end
+      ML-KEM-768+X25519 HPKE request encryption terminating inside the Contrast mesh.
+      Published EUR pricing verified on 2026-11-13: EUR 1.55/1M input (EUR 0.15 cached) and
+      EUR 5.74/1M output, converted to USD using the ECB reference rate 1.1081 (2026-11-12).
+    review_notes: |
+      Attested and evaluated on 2026-11-13 via privatemode-proxy v1.63.0 + se-key-proxy
+      with pinned Contrast manifest config/privatemode-manifest-v1.63.0.json and strict
+      NVIDIA OCSP (see docs/attestations/2026-11-13-privatemode-rung3-trial.md). Passed
+      sanity (1/1 in 1s, text TTFT 0.5997s) and tools (4/4 in 7s, including
+      parallel-tool-calls-diff-check, incremental tool-call TTFT 0.6897s, tool_call_chunks=5),
+      and scored 8/10 on automated v1 in 54s (text TTFT 0.6009s), reproducing the same two
+      assertion misses seen on tinfoil-glm-5-3: (1) shell-tool-reasoning-safe-commands,
+      where the safety note "Deliberately excluded: kill, rm, git checkout --, git reset..."
+      tripped the negative regex /checkout\s+--/i, and (2) patch-like-edit-gitignore, where
+      it emitted a valid POSIX unified diff (--- a/.gitignore / +++ b/.gitignore) without a
+      diff --git header. Passed opencode-smoke in 2.9737s
+      (runs/2026-11-13-200529-opencode-smoke-privatemode-glm-5-3-31376576-mgx3psmr,
+      summary.passed=true, smoke_seatbelt_enforced=true, only_read_tool_called=true,
+      token_verified=true, non_localhost_sockets=0, matches_found=0,
+      active_token_checked=true, active_token_matches_found=0; pre-fix run
+      runs/2026-11-13-172349-opencode-smoke-privatemode-glm-5-3-31376576-u_himc0z
+      retained). Kept at status: candidate and routing.private_attested: blocked under the
+      strict 10/10 automated v1 gate.
+    eval_summary: "2026-11-13 via privatemode-proxy v1.63.0 + se-key-proxy (chat_template_kwargs.enable_thinking=false, include_reasoning=false): sanity 1/1 (runs/2026-11-13-172123-sanity-privatemode-glm-5-3-31376576-TqkdeO, text TTFT 0.5997s, 96 tokens total); automated v1 8/10 in 54s (runs/2026-11-13-172140-v1-privatemode-glm-5-3-31376576-ELK0vn, text TTFT 0.6009s, 26216 tokens); tools 4/4 in 7s (runs/2026-11-13-172313-tools-privatemode-glm-5-3-31376576-ejZxER, text TTFT 0.5257s, incremental tool-call TTFT 0.6897s, tool_call_chunks=5, 1851 tokens); opencode-smoke PASS in 2.9737s (runs/2026-11-13-200529-opencode-smoke-privatemode-glm-5-3-31376576-mgx3psmr, smoke_seatbelt_enforced=true, matches_found=0, active_token_matches_found=0, 2207 tokens; pre-fix run runs/2026-11-13-172349-opencode-smoke-privatemode-glm-5-3-31376576-u_himc0z retained)."
+
+  - id: privatemode-gpt-oss-120b
+    status: candidate
+    repo: openai/gpt-oss-120b
+    upstream: openai/gpt-oss-120b
+    converter: edgelesssys
+    conversion_runtime_version: vllm
+    runtime: proxy
+    serve_command: ./bin/privatemode-proxy --listen-address {host} --port {port} --api-key-fallback=never --manifest-path config/privatemode-manifest-v1.63.0.json --workspace .home/privatemode-proxy --disable-prompt-cache=false --prompt-cache-salt=random --nvidia-ocsp-allow-unknown=false --nvidia-ocsp-revoked-grace-period=0
+    enclave_repo: edgelesssys/privatemode-public
+    enclave_tag: v1.63.0
+    promptfoo_provider:
+      id: openai:chat:openai/gpt-oss-120b
+      apiBaseUrl: http://127.0.0.1:8082/v1
+      apiKeyKeychainService: free-inference.privatemode
+      config:
+        showThinking: false
+        passthrough:
+          include_reasoning: false
+          reasoning_effort: low
+    capabilities:
+      tool_calling: true
+    routing:
+      private_local: blocked
+      private_attested: blocked
+    remote_trust:
+      tier: enclave_runtime_attested
+      attestation_method: privatemode-proxy-contrast
+      weights_hash: null
+      weights_source: null
+      provider_manifest_weights_hash: dmverity:sha256:a19e31d4c7da198b4905539ac00e55b93f377ecc4048e287810b2cf3a197cb29
+      provider_manifest_weights_source: openai/gpt-oss-120b@b5c939de8f754692c1647ca79fbf85e8c1e70f8a
+      usage_policy: provider_terms_apply
+      jurisdiction: DE/EU
+      pricing_per_m_tokens:
+        input: 0.22
+        output: 0.72
+        cached_input: 0.04
+    license: apache-2.0
+    release_date: null
+    verified_date: "2026-11-13"
+    params_total: "120B"
+    params_active: 5.1B
+    quantization:
+      bits: 4
+      group_size: null
+      tool: mxfp4
+      tool_version: null
+    disk_gb_estimate: 65.8
+    ram_gb_estimate: null
+    context_window: 131072
+    modalities:
+      - text
+    chat_template:
+      source: harmony
+      roles_supported:
+        - system
+        - user
+        - assistant
+        - tool
+    source_links:
+      - https://github.com/edgelesssys/privatemode-public
+      - https://huggingface.co/openai/gpt-oss-120b
+    fit_notes: |
+      OpenAI gpt-oss-120b served inside Privatemode's Contrast Confidential Containers
+      (AMD SEV-SNP Genoa + NVIDIA GPU CC, workload-gpt-oss-120b Kata initdata policy
+      67cb2afc964dee742d9ee007824a989906d52a55b6d7a39c67f929f5e45fdb0d) with vLLM v0.31.0,
+      131k context window, and end-to-end ML-KEM-768+X25519 HPKE request encryption.
+      Published EUR pricing verified on 2026-11-13: EUR 0.20/1M input (EUR 0.04 cached) and
+      EUR 0.65/1M output, converted to USD using the ECB reference rate 1.1081 (2026-11-12).
+    review_notes: |
+      Registered as candidate on 2026-11-13 after live /v1/models and Phase 1 fail-closed
+      manifest verification via privatemode-proxy v1.63.0 + se-key-proxy with strict OCSP
+      (see docs/attestations/2026-11-13-privatemode-rung3-trial.md). Kept at status: candidate
+      and routing.private_attested: blocked (same upstream model scored 8/10 on v1 and 3/4 on
+      tools in the 2026-10-31 Tinfoil Rung 3 trial).

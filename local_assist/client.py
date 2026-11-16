@@ -25,6 +25,8 @@ from .registry import (
     canonical_endpoint_key,
     find_model_by_id_or_repo,
     load_models,
+    pid_matches_record,
+    read_pid_record_for_model,
     resolve_endpoint,
 )
 from .routing import MODEL_TO_REGISTRY_ID
@@ -33,6 +35,7 @@ from .routing import MODEL_TO_REGISTRY_ID
 DEFAULT_BASE_URL = "http://127.0.0.1:8080/v1"
 DEFAULT_API_KEY = "none"
 DEFAULT_TIMEOUT_SECONDS = 120
+_RESERVED_NON_LOCAL_PORTS = frozenset({80, 443, 8081, 8082, 9081, 9082, 9181, 9182, 49374})
 
 EOS_RE = re.compile(r"(<\|im_end\|>|<\|eot_id\|>|</s>)\s*$")
 THINK_RE = re.compile(r"<think>[\s\S]*?</think>\s*")
@@ -70,7 +73,7 @@ def _lookup_registry_entry(
     return find_model_by_id_or_repo(registry_id) or find_model_by_id_or_repo(model)
 
 
-def check_private_coding_admission(endpoint: EndpointConfig) -> None:
+def check_port_trust_admission(endpoint: EndpointConfig) -> None:
     if not endpoint.is_local_host:
         raise LocalAssistError(
             "trust_tier_blocked",
@@ -99,6 +102,20 @@ def check_private_coding_admission(endpoint: EndpointConfig) -> None:
                     "weights_hash": endpoint.weights_hash,
                 },
             )
+        return
+    raise LocalAssistError(
+        "trust_tier_blocked",
+        f"Refusing to send private workspace context to model '{endpoint.model_id}' with trust_tier='{endpoint.trust_tier}'. Only 'local' (or 'enclave_weights_attested'/'enclave_runtime_attested' via localhost proxy with LOCAL_ASSIST_ALLOW_ATTESTED_TEE=1) is permitted.",
+        details={
+            "model_id": endpoint.model_id,
+            "trust_tier": endpoint.trust_tier,
+        },
+    )
+
+
+def check_private_coding_admission(endpoint: EndpointConfig) -> None:
+    check_port_trust_admission(endpoint)
+    if endpoint.trust_tier in ATTESTED_ENCLAVE_TIERS:
         if (
             endpoint.routing_private_attested != "cleared"
             and os.environ.get("LOCAL_ASSIST_ALLOW_UNCLEARED_TEE") != "1"
@@ -115,20 +132,48 @@ def check_private_coding_admission(endpoint: EndpointConfig) -> None:
                     "routing_private_attested": endpoint.routing_private_attested,
                 },
             )
-        return
-    raise LocalAssistError(
-        "trust_tier_blocked",
-        f"Refusing to send private workspace context to model '{endpoint.model_id}' with trust_tier='{endpoint.trust_tier}'. Only 'local' (or 'enclave_weights_attested'/'enclave_runtime_attested' via localhost proxy with LOCAL_ASSIST_ALLOW_ATTESTED_TEE=1) is permitted.",
-        details={
-            "model_id": endpoint.model_id,
-            "trust_tier": endpoint.trust_tier,
-        },
-    )
 
 
 def _model_matches_entry(model: str, entry: dict[str, Any]) -> bool:
     registry_id = MODEL_TO_REGISTRY_ID.get(model, model)
     return entry.get("id") in (model, registry_id) or entry.get("repo") in (model, registry_id)
+
+
+def _resolve_verified_local_endpoint(
+    selected_entry: dict[str, Any], base_ep: EndpointConfig
+) -> EndpointConfig | None:
+    if base_ep.trust_tier != "local" or base_ep.routing_private_local != "cleared":
+        return None
+    real_id = str(selected_entry.get("id") or "")
+    if not real_id:
+        return None
+    pid_rec = read_pid_record_for_model(real_id)
+    if (
+        not isinstance(pid_rec, dict)
+        or pid_rec.get("status") != "ready"
+        or pid_rec.get("hf_offline") is not True
+    ):
+        return None
+    rec_port = pid_rec.get("port")
+    if (
+        isinstance(rec_port, bool)
+        or not isinstance(rec_port, int)
+        or not (1024 <= rec_port <= 65535)
+        or rec_port in _RESERVED_NON_LOCAL_PORTS
+    ):
+        return None
+    try:
+        cand_ep = resolve_endpoint(selected_entry, pid_record=pid_rec, require_api_key=False)
+    except RegistryError:
+        return None
+    if pid_matches_record(pid_rec.get("pid"), pid_rec.get("pid_lstart"), require_lstart=True):
+        return cand_ep
+    if os.environ.get("LOCAL_ASSIST_WORKER_SANDBOX") == "1":
+        from .lifecycle import _verify_worker_sandbox_handoff
+
+        if _verify_worker_sandbox_handoff(real_id, cand_ep):
+            return cand_ep
+    return None
 
 
 def _resolve_effective_connection(model: str | None = None) -> tuple[str, str]:
@@ -143,6 +188,7 @@ def _resolve_effective_connection(model: str | None = None) -> tuple[str, str]:
 
     selected_entry = _lookup_registry_entry(model, all_models)
     selected_ep: EndpointConfig | None = None
+    verified_local_ep: EndpointConfig | None = None
     if selected_entry is not None:
         try:
             selected_ep = resolve_endpoint(selected_entry, require_api_key=False)
@@ -153,6 +199,7 @@ def _resolve_effective_connection(model: str | None = None) -> tuple[str, str]:
                 details={"model": model},
             ) from exc
         check_private_coding_admission(selected_ep)
+        verified_local_ep = _resolve_verified_local_endpoint(selected_entry, selected_ep)
 
     env_url = os.environ.get("LOCAL_ASSIST_BASE_URL")
     if env_url is not None and env_url.strip() != "":
@@ -171,6 +218,9 @@ def _resolve_effective_connection(model: str | None = None) -> tuple[str, str]:
                 f"LOCAL_ASSIST_BASE_URL must be an http(s) localhost URL without credentials, got '{effective_url}'.",
                 details={"api_base_url": effective_url},
             )
+    elif verified_local_ep is not None:
+        effective_url = verified_local_ep.api_base_url
+        selected_ep = verified_local_ep
     elif selected_ep is not None:
         effective_url = selected_ep.api_base_url
     else:
@@ -198,16 +248,32 @@ def _resolve_effective_connection(model: str | None = None) -> tuple[str, str]:
                 str(exc),
                 details={"api_base_url": effective_url, "entry_id": entry.get("id")},
             ) from exc
-        check_private_coding_admission(dest_ep)
-        dest_endpoints_all.append(dest_ep)
-        if model and _model_matches_entry(model, entry):
-            dest_endpoints_for_model.append(dest_ep)
+        check_port_trust_admission(dest_ep)
+        if model:
+            if _model_matches_entry(model, entry):
+                check_private_coding_admission(dest_ep)
+                dest_endpoints_for_model.append(dest_ep)
+                dest_endpoints_all.append(dest_ep)
+            elif (
+                dest_ep.trust_tier == "local"
+                or dest_ep.routing_private_attested == "cleared"
+                or os.environ.get("LOCAL_ASSIST_ALLOW_UNCLEARED_TEE") == "1"
+            ):
+                dest_endpoints_all.append(dest_ep)
+        else:
+            check_private_coding_admission(dest_ep)
+            dest_endpoints_all.append(dest_ep)
 
     effective_ep = selected_ep
     if env_url is not None and env_url.strip() != "":
         if selected_ep is not None:
             if canonical_endpoint_key(selected_ep.api_base_url) != target_key:
-                if not dest_endpoints_for_model:
+                if (
+                    verified_local_ep is not None
+                    and canonical_endpoint_key(verified_local_ep.api_base_url) == target_key
+                ):
+                    effective_ep = verified_local_ep
+                elif not dest_endpoints_for_model:
                     ipv6_hint = (
                         " (note: local servers bind IPv4 127.0.0.1; use 127.0.0.1 instead of [::1])"
                         if target_key[1] == "::1"
@@ -222,7 +288,8 @@ def _resolve_effective_connection(model: str | None = None) -> tuple[str, str]:
                             "override_api_base_url": effective_url,
                         },
                     )
-                effective_ep = dest_endpoints_for_model[0]
+                else:
+                    effective_ep = dest_endpoints_for_model[0]
         else:
             # Model was not found in models.yaml (or model is None):
             # Only allow the fixed trusted local default (http://127.0.0.1:8080/v1)

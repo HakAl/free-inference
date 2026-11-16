@@ -4,6 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 SETUP_MODE="full"
+WITH_PRIVATEMODE=0
 for arg in "$@"; do
   case "$arg" in
     --launcher-only|--proxy-only)
@@ -12,18 +13,23 @@ for arg in "$@"; do
     --local-only)
       SETUP_MODE="local-only"
       ;;
+    --with-privatemode)
+      WITH_PRIVATEMODE=1
+      ;;
     -h|--help)
       cat <<'EOF'
-Usage: ./scripts/setup [--launcher-only | --proxy-only | --local-only]
+Usage: ./scripts/setup [--launcher-only | --proxy-only | --local-only] [--with-privatemode]
 
 Modes:
-  (default)        Full evaluation workbench: Python .venv (requirements.txt, 71 packages),
-                   Node promptfoo (npm ci), bin/se-key-proxy, and bin/tinfoil-proxy.
-  --launcher-only  Minimal Rung 3 attested-proxy launcher setup: stdlib Python >= 3.11,
-  (--proxy-only)   bin/se-key-proxy, and bin/tinfoil-proxy. Zero Python or Node packages.
-  --local-only     Rung 1 local MLX + Rung 3 attested-proxy setup: Python .venv
-                   (requirements-local.txt, 35 packages), bin/se-key-proxy, and
-                   bin/tinfoil-proxy. Skips Node/npm and multimodal/vision packages.
+  (default)           Full evaluation workbench: Python .venv (requirements.txt, 71 packages),
+                      Node promptfoo (npm ci), bin/se-key-proxy, and bin/tinfoil-proxy.
+  --launcher-only     Minimal Rung 3 attested-proxy launcher setup: stdlib Python >= 3.11,
+  (--proxy-only)      bin/se-key-proxy, and bin/tinfoil-proxy. Zero Python or Node packages.
+  --local-only        Rung 1 local MLX + Rung 3 attested-proxy setup: Python .venv
+                      (requirements-local.txt, 35 packages), bin/se-key-proxy, and
+                      bin/tinfoil-proxy. Skips Node/npm and multimodal/vision packages.
+  --with-privatemode  Also build and verify bin/privatemode-proxy from pinned source
+                      (requires git and go >= 1.25 on PATH).
 EOF
       exit 0
       ;;
@@ -49,6 +55,9 @@ if [ "$SETUP_MODE" = "local-only" ]; then
   BASE_TOOLS+=(uv)
 elif [ "$SETUP_MODE" = "full" ]; then
   BASE_TOOLS+=(uv node npm)
+fi
+if [ "$WITH_PRIVATEMODE" = "1" ]; then
+  BASE_TOOLS+=(git go)
 fi
 
 for req_tool in "${BASE_TOOLS[@]}"; do
@@ -156,14 +165,25 @@ else
   mv "$tmp_dir/tinfoil-proxy-darwin-arm64" "bin/tinfoil-proxy"
 fi
 
+if [ "$WITH_PRIVATEMODE" = "1" ]; then
+  echo "Building and verifying privatemode-proxy..."
+  ./scripts/build-privatemode-proxy
+fi
+
 echo
 echo "Setup complete."
 echo "Next steps:"
 if [ "$SETUP_MODE" = "launcher-only" ]; then
   echo "  1. Seal Tinfoil API key in Secure Enclave:     ./scripts/se-key store free-inference.tinfoil"
   echo "  2. Rung 3 (attested enclave on 127.0.0.1:8081): ./scripts/opencode-attested"
+  if [ "$WITH_PRIVATEMODE" = "1" ]; then
+    echo "  3. Optional Privatemode API key in Enclave:    ./scripts/se-key store free-inference.privatemode"
+  fi
 else
   echo "  1. Rung 1 (local MLX on 127.0.0.1:8080):       ./scripts/opencode-local"
   echo "  2. Seal Tinfoil API key in Secure Enclave:     ./scripts/se-key store free-inference.tinfoil"
   echo "  3. Rung 3 (attested enclave on 127.0.0.1:8081): ./scripts/opencode-attested"
+  if [ "$WITH_PRIVATEMODE" = "1" ]; then
+    echo "  4. Optional Privatemode API key in Enclave:    ./scripts/se-key store free-inference.privatemode"
+  fi
 fi
