@@ -5303,6 +5303,208 @@ class Phase2LookoutRemediationTests(unittest.TestCase):
             self.assertIn('(remote ip "localhost:8123")', sb_custom)
             self.assertIn('(remote ip "localhost:9123")', sb_custom)
 
+    def test_worker_ttl_inherits_longer_session_and_honors_explicit_ttl_cap(self) -> None:
+        import importlib.machinery
+        import importlib.util
+        import io
+        from contextlib import redirect_stderr
+        from unittest.mock import patch
+        from local_assist.registry import (
+            get_process_lstart,
+            pid_file_for_model,
+            read_pid_record_for_model as _real_read_pid_rec,
+        )
+
+        script_path = ROOT / "scripts" / "opencode-attested"
+        loader = importlib.machinery.SourceFileLoader("oc_att_worker_ttl_021", str(script_path))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        assert spec is not None and spec.loader is not None
+        oc_att = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(oc_att)
+
+        def _fake_verify_ok(cmd: list[str], **_kw: object) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="deepseek-v4-1-flash\n", stderr="")
+
+        my_lstart = get_process_lstart(os.getpid())
+        with tempfile.TemporaryDirectory() as td:
+            runs_dir = Path(td) / "runs"
+            runs_dir.mkdir()
+            tok_file = runs_dir / ".se-session-tinfoil-deepseek-v4-1-flash.token"
+            tok_file.write_text("se-session-" + ("a" * 64) + "\n", encoding="utf-8")
+            tok_file.chmod(0o600)
+            pid_path = pid_file_for_model("tinfoil-deepseek-v4-1-flash", runs_dir)
+
+            def _write_rec(ttl_val: int) -> dict[str, Any]:
+                rec = {
+                    "model_id": "tinfoil-deepseek-v4-1-flash",
+                    "repo": "deepseek-v4-1-flash",
+                    "port": 8081,
+                    "upstream_port": 9081,
+                    "pid": os.getpid(),
+                    "pid_lstart": my_lstart,
+                    "status": "ready",
+                    "session_token_file": str(tok_file),
+                    "max_chat_requests": 25,
+                    "max_tokens_cap": 2048,
+                    "max_request_bytes": 131072,
+                    "ttl_seconds": ttl_val,
+                }
+                pid_path.write_text(json.dumps(rec), encoding="utf-8")
+                return rec
+
+            # 1. Omitted --ttl-seconds on a valid 14400s (4h) session (remaining=10800s):
+            #    worker attaches cleanly and inherits 10800s (never clamped to 7200s cold-start default)
+            _write_rec(14400)
+            captured_relays: list[Any] = []
+
+            def _capture_worker_exec(**kwargs: Any) -> int:
+                rf = kwargs["relay_factory"]
+                relay = rf()
+                captured_relays.append(relay)
+                return 0
+
+            orig_ensure = oc_att.ensure_model_served
+
+            def _ensure_in_temp_runs(*a: Any, **kw: Any) -> Any:
+                kw["runs_dir"] = runs_dir
+                kw["run_cmd"] = _fake_verify_ok
+                return orig_ensure(*a, **kw)
+
+            def _read_rec_in_temp_runs(mid: str, rdir: Path = runs_dir) -> Any:
+                return _real_read_pid_rec(mid, runs_dir)
+
+            err_1 = io.StringIO()
+            with (
+                patch.dict(os.environ, {"FREE_INFERENCE_RUNS_DIR": str(runs_dir)}),
+                patch.object(oc_att, "read_pid_record_for_model", side_effect=_read_rec_in_temp_runs),
+                patch.object(oc_att, "ensure_model_served", side_effect=_ensure_in_temp_runs),
+                patch.object(oc_att, "execute_worker_profile_session", side_effect=_capture_worker_exec),
+                patch.object(oc_att, "shutil") as mock_shutil,
+                patch(
+                    "local_assist.session.status_for_record",
+                    return_value={"state": "ON", "remaining_seconds": 10800, "window_seconds": 14400, "requests_remaining": 25, "request_limit": 25},
+                ),
+                patch("local_assist.session.SessionLeaseSupplier", return_value=lambda: None),
+                redirect_stderr(err_1),
+            ):
+                mock_shutil.which.return_value = "/usr/bin/true"
+                with patch.object(oc_att, "validate_worker_binary_and_args", return_value=(True, ["run", "hi"], None)):
+                    rc1 = oc_att.main(
+                        [
+                            str(script_path),
+                            "--unattended-worker",
+                            "--max-session-usd",
+                            "2.00",
+                            "--max-chat-requests",
+                            "25",
+                            "--max-tokens-cap",
+                            "2048",
+                            "--max-request-bytes",
+                            "131072",
+                            "--",
+                            "run",
+                            "hi",
+                        ]
+                    )
+            self.assertEqual(rc1, 0, err_1.getvalue())
+            self.assertEqual(len(captured_relays), 1)
+            self.assertEqual(captured_relays[0].ttl_seconds, 10800.0)
+
+            # 2. Explicit --ttl-seconds bounds worker_ttl by eff_ttl when eff_ttl < remaining_seconds
+            captured_relays.clear()
+            err_2 = io.StringIO()
+            with (
+                patch.dict(os.environ, {"FREE_INFERENCE_RUNS_DIR": str(runs_dir)}),
+                patch.object(oc_att, "read_pid_record_for_model", side_effect=_read_rec_in_temp_runs),
+                patch.object(
+                    oc_att,
+                    "ensure_model_served",
+                    return_value=(
+                        True,
+                        None,
+                        {
+                            "session_token": "se-session-" + ("a" * 64),
+                            "attached": True,
+                            "max_chat_requests": 25,
+                            "max_tokens_cap": 2048,
+                            "max_request_bytes": 131072,
+                            "ttl_seconds": 7200,
+                            "input_price_per_m": 0.60,
+                            "output_price_per_m": 1.45,
+                            "worst_total_usd": 0.50,
+                        },
+                    ),
+                ),
+                patch.object(oc_att, "execute_worker_profile_session", side_effect=_capture_worker_exec),
+                patch.object(oc_att, "shutil") as mock_shutil,
+                patch(
+                    "local_assist.session.status_for_record",
+                    return_value={"state": "ON", "remaining_seconds": 6000, "window_seconds": 7200, "requests_remaining": 25, "request_limit": 25},
+                ),
+                patch("local_assist.session.SessionLeaseSupplier", return_value=lambda: None),
+                redirect_stderr(err_2),
+            ):
+                mock_shutil.which.return_value = "/usr/bin/true"
+                with patch.object(oc_att, "validate_worker_binary_and_args", return_value=(True, ["run", "hi"], None)):
+                    rc2 = oc_att.main(
+                        [
+                            str(script_path),
+                            "--unattended-worker",
+                            "--max-session-usd",
+                            "2.00",
+                            "--ttl-seconds",
+                            "1800",
+                            "--",
+                            "run",
+                            "hi",
+                        ]
+                    )
+            self.assertEqual(rc2, 0, err_2.getvalue())
+            self.assertEqual(len(captured_relays), 1)
+            self.assertEqual(captured_relays[0].ttl_seconds, 1800.0)
+
+            # 3. Shorter remaining_seconds on live_status still wins over a larger explicit --ttl-seconds
+            _write_rec(3600)
+            captured_relays.clear()
+            err_3 = io.StringIO()
+            with (
+                patch.dict(os.environ, {"FREE_INFERENCE_RUNS_DIR": str(runs_dir)}),
+                patch.object(oc_att, "read_pid_record_for_model", side_effect=_read_rec_in_temp_runs),
+                patch.object(oc_att, "ensure_model_served", side_effect=_ensure_in_temp_runs),
+                patch.object(oc_att, "execute_worker_profile_session", side_effect=_capture_worker_exec),
+                patch.object(oc_att, "shutil") as mock_shutil,
+                patch(
+                    "local_assist.session.status_for_record",
+                    return_value={"state": "ON", "remaining_seconds": 600, "window_seconds": 3600, "requests_remaining": 25, "request_limit": 25},
+                ),
+                patch("local_assist.session.SessionLeaseSupplier", return_value=lambda: None),
+                redirect_stderr(err_3),
+            ):
+                mock_shutil.which.return_value = "/usr/bin/true"
+                with patch.object(oc_att, "validate_worker_binary_and_args", return_value=(True, ["run", "hi"], None)):
+                    rc3 = oc_att.main(
+                        [
+                            str(script_path),
+                            "--unattended-worker",
+                            "--max-session-usd",
+                            "2.00",
+                            "--max-chat-requests",
+                            "25",
+                            "--max-tokens-cap",
+                            "2048",
+                            "--max-request-bytes",
+                            "131072",
+                            "--ttl-seconds",
+                            "3600",
+                            "--",
+                            "run",
+                            "hi",
+                        ]
+                    )
+            self.assertEqual(rc3, 0, err_3.getvalue())
+            self.assertEqual(len(captured_relays), 1)
+            self.assertEqual(captured_relays[0].ttl_seconds, 600.0)
+
 
 if __name__ == "__main__":
     unittest.main()

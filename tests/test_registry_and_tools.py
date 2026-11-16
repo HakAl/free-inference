@@ -3878,10 +3878,10 @@ class RegistryAndToolsTests(unittest.TestCase):
         from local_assist.server import SERVER_INFO
 
         # 1. Version parity across __init__.py, server.py, package.json, and scripts/models --version (A4)
-        self.assertEqual(local_assist.__version__, "0.2.0")
-        self.assertEqual(SERVER_INFO["version"], "0.2.0")
+        self.assertEqual(local_assist.__version__, "0.2.1")
+        self.assertEqual(SERVER_INFO["version"], "0.2.1")
         pkg_json = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))
-        self.assertEqual(pkg_json["version"], "0.2.0")
+        self.assertEqual(pkg_json["version"], "0.2.1")
 
         # 1b. Anchored release-hygiene.json scan.allow rule for Swift parameter label (Minor 4);
         # release-hygiene.json is private-only and absent in exported public clones / CI.
@@ -4056,7 +4056,7 @@ class RegistryAndToolsTests(unittest.TestCase):
                 text=True,
                 check=True,
             )
-            self.assertEqual(models_ver_clean.stdout.strip(), "free-inference-lab 0.2.0")
+            self.assertEqual(models_ver_clean.stdout.strip(), "free-inference-lab 0.2.1")
 
             for launcher_rel in ("opencode-local", "opencode-attested"):
                 hlp = subprocess.run(
@@ -6083,152 +6083,169 @@ class RegistryAndToolsTests(unittest.TestCase):
                 encoding="utf-8",
             )
             good_bin.chmod(0o755)
-            good_receipt = builder_mod.run_strict_ocsp_config_check(
-                good_bin,
-                manifest_path=manifest_path,
-                timeout_seconds=3.0,
-            )
-            self.assertIsInstance(good_receipt, dict)
-            self.assertTrue(good_receipt["passed"])
-            self.assertEqual(
-                good_receipt["outbound_network_enforcement"],
-                "seatbelt_deny_network_outbound",
-            )
-            self.assertEqual(
-                good_receipt["listener_inspection"],
-                "lsof_pid_tcp_table",
-            )
-            self.assertEqual(
-                good_receipt["observed_tcp_sockets"],
-                [f"127.0.0.1:{good_receipt['port']} (LISTEN)"],
-            )
-            self.assertFalse(good_receipt["sigkill_escalated"])
-            self.assertIn(good_receipt["sigterm_exit_code"], (0, -15))
-
-            bad_bin = tmp_path / "bad-proxy"
-            bad_bin.write_text(
-                f"#!{sys.executable}\n"
-                "import sys\n"
-                "sys.stderr.write('unknown OCSP statuses are disallowed, but revoked statuses are allowed\\n')\n"
-                "sys.exit(1)\n",
-                encoding="utf-8",
-            )
-            bad_bin.chmod(0o755)
-            with self.assertRaises(RuntimeError) as ctx_ocsp:
-                builder_mod.run_strict_ocsp_config_check(
-                    bad_bin,
+            if sys.platform != "darwin":
+                with self.assertRaises(RuntimeError) as ctx_non_darwin:
+                    builder_mod.run_strict_ocsp_config_check(
+                        good_bin,
+                        manifest_path=manifest_path,
+                        timeout_seconds=3.0,
+                    )
+                self.assertIn("/usr/bin/sandbox-exec is required on macOS", str(ctx_non_darwin.exception))
+            else:
+                with patch("os.path.isfile", return_value=False):
+                    with self.assertRaises(RuntimeError) as ctx_no_sb:
+                        builder_mod.run_strict_ocsp_config_check(
+                            good_bin,
+                            manifest_path=manifest_path,
+                            timeout_seconds=3.0,
+                        )
+                    self.assertIn("/usr/bin/sandbox-exec is required on macOS", str(ctx_no_sb.exception))
+                good_receipt = builder_mod.run_strict_ocsp_config_check(
+                    good_bin,
                     manifest_path=manifest_path,
                     timeout_seconds=3.0,
                 )
-            self.assertIn("revoked statuses are allowed", str(ctx_ocsp.exception))
-
-            # PM-W1 negative (a): listener ignores SIGTERM and requires SIGKILL escalation
-            ignore_sigterm_bin = tmp_path / "ignore-sigterm-proxy"
-            ignore_sigterm_bin.write_text(
-                f"#!{sys.executable}\n"
-                "import signal, socket, sys, time\n"
-                "args = sys.argv[1:]\n"
-                "port = int(args[args.index('--port') + 1])\n"
-                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
-                "sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
-                "sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
-                "sock.bind(('127.0.0.1', port))\n"
-                "sock.listen(1)\n"
-                "time.sleep(10)\n",
-                encoding="utf-8",
-            )
-            ignore_sigterm_bin.chmod(0o755)
-            with self.assertRaises(RuntimeError) as ctx_ign:
-                builder_mod.run_strict_ocsp_config_check(
-                    ignore_sigterm_bin,
-                    manifest_path=manifest_path,
-                    timeout_seconds=3.0,
-                    sigterm_timeout_seconds=0.4,
+                self.assertIsInstance(good_receipt, dict)
+                self.assertTrue(good_receipt["passed"])
+                self.assertEqual(
+                    good_receipt["outbound_network_enforcement"],
+                    "seatbelt_deny_network_outbound",
                 )
-            self.assertIn("SIGKILL", str(ctx_ign.exception))
-
-            # PM-W1 negative (b): listener traps SIGTERM and exits with non-zero error status
-            bad_sigterm_bin = tmp_path / "bad-sigterm-proxy"
-            bad_sigterm_bin.write_text(
-                f"#!{sys.executable}\n"
-                "import signal, socket, sys, time\n"
-                "args = sys.argv[1:]\n"
-                "port = int(args[args.index('--port') + 1])\n"
-                "signal.signal(signal.SIGTERM, lambda *_: sys.exit(2))\n"
-                "sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
-                "sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
-                "sock.bind(('127.0.0.1', port))\n"
-                "sock.listen(1)\n"
-                "time.sleep(10)\n",
-                encoding="utf-8",
-            )
-            bad_sigterm_bin.chmod(0o755)
-            with self.assertRaises(RuntimeError) as ctx_bad_term:
-                builder_mod.run_strict_ocsp_config_check(
-                    bad_sigterm_bin,
-                    manifest_path=manifest_path,
-                    timeout_seconds=3.0,
+                self.assertEqual(
+                    good_receipt["listener_inspection"],
+                    "lsof_pid_tcp_table",
                 )
-            self.assertIn("exit status", str(ctx_bad_term.exception))
-
-            # PM-W2 negative (c): wildcard listener (0.0.0.0:<port>) is rejected by lsof inspection
-            wildcard_bin = tmp_path / "wildcard-proxy"
-            wildcard_bin.write_text(
-                f"#!{sys.executable}\n"
-                "import signal, socket, sys, time\n"
-                "args = sys.argv[1:]\n"
-                "port = int(args[args.index('--port') + 1])\n"
-                "signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))\n"
-                "sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
-                "sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
-                "sock.bind(('0.0.0.0', port))\n"
-                "sock.listen(1)\n"
-                "time.sleep(10)\n",
-                encoding="utf-8",
-            )
-            wildcard_bin.chmod(0o755)
-            with self.assertRaises(RuntimeError) as ctx_wild:
-                builder_mod.run_strict_ocsp_config_check(
-                    wildcard_bin,
-                    manifest_path=manifest_path,
-                    timeout_seconds=3.0,
+                self.assertEqual(
+                    good_receipt["observed_tcp_sockets"],
+                    [f"127.0.0.1:{good_receipt['port']} (LISTEN)"],
                 )
-            self.assertIn("non-loopback or unexpected TCP socket", str(ctx_wild.exception))
+                self.assertFalse(good_receipt["sigkill_escalated"])
+                self.assertIn(good_receipt["sigterm_exit_code"], (0, -15))
 
-            # PM-W2 negative (d): forbidden outbound connection attempt is blocked by Seatbelt
-            import select as _select
-            import socket as _host_sock
+                bad_bin = tmp_path / "bad-proxy"
+                bad_bin.write_text(
+                    f"#!{sys.executable}\n"
+                    "import sys\n"
+                    "sys.stderr.write('unknown OCSP statuses are disallowed, but revoked statuses are allowed\\n')\n"
+                    "sys.exit(1)\n",
+                    encoding="utf-8",
+                )
+                bad_bin.chmod(0o755)
+                with self.assertRaises(RuntimeError) as ctx_ocsp:
+                    builder_mod.run_strict_ocsp_config_check(
+                        bad_bin,
+                        manifest_path=manifest_path,
+                        timeout_seconds=3.0,
+                    )
+                self.assertIn("revoked statuses are allowed", str(ctx_ocsp.exception))
 
-            with _host_sock.socket(_host_sock.AF_INET, _host_sock.SOCK_STREAM) as aux_srv:
-                aux_srv.bind(("127.0.0.1", 0))
-                aux_srv.listen(1)
-                aux_port = int(aux_srv.getsockname()[1])
-                outbound_bin = tmp_path / "outbound-proxy"
-                outbound_bin.write_text(
+                # PM-W1 negative (a): listener ignores SIGTERM and requires SIGKILL escalation
+                ignore_sigterm_bin = tmp_path / "ignore-sigterm-proxy"
+                ignore_sigterm_bin.write_text(
                     f"#!{sys.executable}\n"
                     "import signal, socket, sys, time\n"
                     "args = sys.argv[1:]\n"
                     "port = int(args[args.index('--port') + 1])\n"
-                    "c = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
-                    "c.settimeout(1.0)\n"
-                    f"c.connect(('127.0.0.1', {aux_port}))\n"
+                    "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
                     "sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+                    "sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
                     "sock.bind(('127.0.0.1', port))\n"
                     "sock.listen(1)\n"
-                    "signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))\n"
                     "time.sleep(10)\n",
                     encoding="utf-8",
                 )
-                outbound_bin.chmod(0o755)
-                with self.assertRaises(RuntimeError) as ctx_out:
+                ignore_sigterm_bin.chmod(0o755)
+                with self.assertRaises(RuntimeError) as ctx_ign:
                     builder_mod.run_strict_ocsp_config_check(
-                        outbound_bin,
+                        ignore_sigterm_bin,
+                        manifest_path=manifest_path,
+                        timeout_seconds=3.0,
+                        sigterm_timeout_seconds=0.4,
+                    )
+                self.assertIn("SIGKILL", str(ctx_ign.exception))
+
+                # PM-W1 negative (b): listener traps SIGTERM and exits with non-zero error status
+                bad_sigterm_bin = tmp_path / "bad-sigterm-proxy"
+                bad_sigterm_bin.write_text(
+                    f"#!{sys.executable}\n"
+                    "import signal, socket, sys, time\n"
+                    "args = sys.argv[1:]\n"
+                    "port = int(args[args.index('--port') + 1])\n"
+                    "signal.signal(signal.SIGTERM, lambda *_: sys.exit(2))\n"
+                    "sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+                    "sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+                    "sock.bind(('127.0.0.1', port))\n"
+                    "sock.listen(1)\n"
+                    "time.sleep(10)\n",
+                    encoding="utf-8",
+                )
+                bad_sigterm_bin.chmod(0o755)
+                with self.assertRaises(RuntimeError) as ctx_bad_term:
+                    builder_mod.run_strict_ocsp_config_check(
+                        bad_sigterm_bin,
                         manifest_path=manifest_path,
                         timeout_seconds=3.0,
                     )
-                self.assertIn("Operation not permitted", str(ctx_out.exception))
-                readable, _, _ = _select.select([aux_srv], [], [], 0.05)
-                self.assertEqual(readable, [])
+                self.assertIn("exit status", str(ctx_bad_term.exception))
+
+                # PM-W2 negative (c): wildcard listener (0.0.0.0:<port>) is rejected by lsof inspection
+                wildcard_bin = tmp_path / "wildcard-proxy"
+                wildcard_bin.write_text(
+                    f"#!{sys.executable}\n"
+                    "import signal, socket, sys, time\n"
+                    "args = sys.argv[1:]\n"
+                    "port = int(args[args.index('--port') + 1])\n"
+                    "signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))\n"
+                    "sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+                    "sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n"
+                    "sock.bind(('0.0.0.0', port))\n"
+                    "sock.listen(1)\n"
+                    "time.sleep(10)\n",
+                    encoding="utf-8",
+                )
+                wildcard_bin.chmod(0o755)
+                with self.assertRaises(RuntimeError) as ctx_wild:
+                    builder_mod.run_strict_ocsp_config_check(
+                        wildcard_bin,
+                        manifest_path=manifest_path,
+                        timeout_seconds=3.0,
+                    )
+                self.assertIn("non-loopback or unexpected TCP socket", str(ctx_wild.exception))
+
+                # PM-W2 negative (d): forbidden outbound connection attempt is blocked by Seatbelt
+                import select as _select
+                import socket as _host_sock
+
+                with _host_sock.socket(_host_sock.AF_INET, _host_sock.SOCK_STREAM) as aux_srv:
+                    aux_srv.bind(("127.0.0.1", 0))
+                    aux_srv.listen(1)
+                    aux_port = int(aux_srv.getsockname()[1])
+                    outbound_bin = tmp_path / "outbound-proxy"
+                    outbound_bin.write_text(
+                        f"#!{sys.executable}\n"
+                        "import signal, socket, sys, time\n"
+                        "args = sys.argv[1:]\n"
+                        "port = int(args[args.index('--port') + 1])\n"
+                        "c = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+                        "c.settimeout(1.0)\n"
+                        f"c.connect(('127.0.0.1', {aux_port}))\n"
+                        "sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)\n"
+                        "sock.bind(('127.0.0.1', port))\n"
+                        "sock.listen(1)\n"
+                        "signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))\n"
+                        "time.sleep(10)\n",
+                        encoding="utf-8",
+                    )
+                    outbound_bin.chmod(0o755)
+                    with self.assertRaises(RuntimeError) as ctx_out:
+                        builder_mod.run_strict_ocsp_config_check(
+                            outbound_bin,
+                            manifest_path=manifest_path,
+                            timeout_seconds=3.0,
+                        )
+                    self.assertIn("Operation not permitted", str(ctx_out.exception))
+                    readable, _, _ = _select.select([aux_srv], [], [], 0.05)
+                    self.assertEqual(readable, [])
 
         # 6. scripts/setup --help advertises --with-privatemode while preserving default modes
         setup_help = subprocess.run(
@@ -7004,6 +7021,121 @@ class RegistryAndToolsTests(unittest.TestCase):
                     ),
                     "privatemode-glm-5-3-flash",
                 )
+
+    def test_opencode_attested_attach_ttl_ceiling_vs_cold_start_default(self) -> None:
+        import io
+        from contextlib import redirect_stderr
+        from local_assist.registry import load_model, pid_file_for_model, resolve_endpoint
+
+        oc_att = _load_script_module("oc_att_ttl_021", ROOT / "scripts" / "opencode-attested")
+        ds_model = load_model("tinfoil-deepseek-v4-1-flash")
+        ep_ds = resolve_endpoint(ds_model, require_api_key=False)
+
+        def _fake_verify_ok(cmd: list[str], **_kw: object) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="deepseek-v4-1-flash\n", stderr="")
+
+        with tempfile.TemporaryDirectory() as td:
+            runs_dir = Path(td) / "runs"
+            runs_dir.mkdir()
+            pid_path = pid_file_for_model("tinfoil-deepseek-v4-1-flash", runs_dir)
+
+            def _write_rec(ttl_val: int) -> None:
+                pid_path.write_text(
+                    json.dumps(
+                        {
+                            "model_id": "tinfoil-deepseek-v4-1-flash",
+                            "repo": "deepseek-v4-1-flash",
+                            "port": 8081,
+                            "pid": os.getpid(),
+                            "status": "ready",
+                            "max_chat_requests": 1000,
+                            "max_tokens_cap": 16384,
+                            "max_request_bytes": 8388608,
+                            "ttl_seconds": ttl_val,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            # 1. Omitted --ttl-seconds attaches cleanly to 4h (14400s) and 24h (86400s) active sessions
+            for ok_ttl in (14400, 86400):
+                _write_rec(ok_ttl)
+                ok_att, err_att, meta_att = oc_att.ensure_model_served(
+                    ep_ds,
+                    no_serve=True,
+                    ttl_seconds=oc_att.DEFAULT_TTL_SECONDS,
+                    explicit_cap_flags=frozenset(),
+                    runs_dir=runs_dir,
+                    run_cmd=_fake_verify_ok,
+                )
+                self.assertTrue(ok_att, msg=err_att)
+                assert meta_att is not None
+                self.assertTrue(meta_att["attached"])
+                self.assertEqual(meta_att["ttl_seconds"], ok_ttl)
+
+            # 2. Explicit --ttl-seconds 7200 rejects a 4h (14400s) active session
+            _write_rec(14400)
+            ok_exp, err_exp, _ = oc_att.ensure_model_served(
+                ep_ds,
+                no_serve=True,
+                ttl_seconds=7200,
+                explicit_cap_flags=frozenset({"ttl_seconds"}),
+                runs_dir=runs_dir,
+                run_cmd=_fake_verify_ok,
+            )
+            self.assertFalse(ok_exp)
+            self.assertIn("ttl_seconds=7200", str(err_exp))
+
+            # 3. Over-24h record (90000s) is rejected both with omitted TTL and with explicit ttl_seconds=90000 (Major 1)
+            _write_rec(90000)
+            for exp_flags, ttl_arg in (
+                (frozenset(), oc_att.DEFAULT_TTL_SECONDS),
+                (frozenset({"ttl_seconds"}), 90000),
+            ):
+                ok_over, err_over, _ = oc_att.ensure_model_served(
+                    ep_ds,
+                    no_serve=True,
+                    ttl_seconds=ttl_arg,
+                    explicit_cap_flags=exp_flags,
+                    runs_dir=runs_dir,
+                    run_cmd=_fake_verify_ok,
+                )
+                self.assertFalse(ok_over)
+                self.assertIn("ttl_seconds=86400", str(err_over))
+
+            # 4. CLI main() rejects --ttl-seconds > 86400 up front before probing (Major 1)
+            err_buf = io.StringIO()
+            with redirect_stderr(err_buf):
+                rc_cli = oc_att.main(["scripts/opencode-attested", "--ttl-seconds", "90000", "--print-config"])
+            self.assertEqual(rc_cli, 1)
+            self.assertIn("86400", err_buf.getvalue())
+
+            # 5. Cold start with omitted --ttl-seconds still passes DEFAULT_TTL_SECONDS (7200) to serve-model
+            pid_path.unlink(missing_ok=True)
+            cold_cmds: list[list[str]] = []
+
+            def _fake_cold_cmd(cmd: list[str], **_kw: object) -> subprocess.CompletedProcess[str]:
+                cold_cmds.append(list(cmd))
+                if len(cold_cmds) == 1:
+                    return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="down")
+                if len(cold_cmds) == 2:
+                    _write_rec(7200)
+                    return subprocess.CompletedProcess(cmd, 0, stdout="started", stderr="")
+                return subprocess.CompletedProcess(cmd, 0, stdout="deepseek-v4-1-flash\n", stderr="")
+
+            ok_cold, err_cold, meta_cold = oc_att.ensure_model_served(
+                ep_ds,
+                no_serve=False,
+                ttl_seconds=oc_att.DEFAULT_TTL_SECONDS,
+                explicit_cap_flags=frozenset(),
+                runs_dir=runs_dir,
+                run_cmd=_fake_cold_cmd,
+            )
+            self.assertTrue(ok_cold, msg=err_cold)
+            assert meta_cold is not None
+            self.assertEqual(meta_cold["ttl_seconds"], 7200)
+            serve_cmd = cold_cmds[1]
+            self.assertEqual(serve_cmd[serve_cmd.index("--ttl-seconds") + 1], "7200")
 
 
 if __name__ == "__main__":

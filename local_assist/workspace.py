@@ -75,19 +75,28 @@ def is_restricted_secret_filename(name: str) -> bool:
 
 
 def _descriptor_within_workspace(fd: int, ws_root: Path) -> bool:
-    if sys.platform != "darwin":
-        return True
-    f_getpath = getattr(fcntl, "F_GETPATH", 50)
-    try:
-        raw_buf = fcntl.fcntl(fd, f_getpath, b"\x00" * 1024)
-        nul_idx = raw_buf.find(b"\x00")
-        raw_str = (raw_buf[:nul_idx] if nul_idx >= 0 else raw_buf).decode("utf-8")
-        if not raw_str:
+    if sys.platform == "darwin":
+        f_getpath = getattr(fcntl, "F_GETPATH", 50)
+        try:
+            raw_buf = fcntl.fcntl(fd, f_getpath, b"\x00" * 1024)
+            nul_idx = raw_buf.find(b"\x00")
+            raw_str = (raw_buf[:nul_idx] if nul_idx >= 0 else raw_buf).decode("utf-8")
+            if not raw_str:
+                return False
+            resolved_fd_path = Path(raw_str).resolve()
+            return resolved_fd_path.is_relative_to(ws_root)
+        except OSError:
             return False
-        resolved_fd_path = Path(raw_str).resolve()
-        return resolved_fd_path.is_relative_to(ws_root)
-    except OSError:
-        return False
+    if sys.platform.startswith("linux"):
+        try:
+            raw_str = os.readlink(f"/proc/self/fd/{fd}")
+            if not raw_str or raw_str.endswith(" (deleted)"):
+                return False
+            resolved_fd_path = Path(raw_str).resolve()
+            return resolved_fd_path.is_relative_to(ws_root)
+        except OSError:
+            return False
+    return True
 
 
 def read_confined_workspace_file(

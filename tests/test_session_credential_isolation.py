@@ -6191,6 +6191,67 @@ console.log(JSON.stringify({{
             self.assertEqual(open_fds_after, open_fds_before, "File descriptor leaked on FIFO rejection!")
             log_file.unlink()
 
+    def test_lsof_linux_usr_bin_fallback_and_transient_holder_retry(self) -> None:
+        cont_mod = _load_script_module("containment_lsof_021", ROOT / "scripts" / "check-credential-containment")
+
+        # 1. _resolve_default_lsof_bin selects /usr/bin/lsof when /usr/sbin/lsof is absent (Linux CI)
+        with (
+            mock.patch.dict(os.environ, {}, clear=False),
+            mock.patch(
+                "os.path.isfile",
+                side_effect=lambda p: str(p) == "/usr/bin/lsof",
+            ),
+            mock.patch(
+                "os.access",
+                side_effect=lambda p, m: str(p) == "/usr/bin/lsof",
+            ),
+        ):
+            os.environ.pop("FREE_INFERENCE_LSOF_BIN", None)
+            resolved_lsof = cont_mod._resolve_default_lsof_bin()
+            self.assertEqual(resolved_lsof, Path("/usr/bin/lsof"))
+
+        # 2. _inspect_opencode_holders retries transient non-zero lsof exit once and succeeds,
+        #    while failing closed if all 3 attempts fail.
+        with tempfile.TemporaryDirectory() as td:
+            home_dir = Path(td) / "home"
+            (home_dir / ".local" / "share" / "opencode").mkdir(parents=True)
+            fake_lsof = Path(td) / "fake_lsof"
+            fake_lsof.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            fake_lsof.chmod(0o755)
+
+            attempts = {"count": 0}
+
+            def _transient_lsof(cmd: list[str], **_kw: object) -> subprocess.CompletedProcess[str]:
+                attempts["count"] += 1
+                if attempts["count"] == 1:
+                    return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="transient reap")
+                return subprocess.CompletedProcess(cmd, 0, stdout="p123\nn/tmp/unrelated\n", stderr="")
+
+            with (
+                mock.patch.object(cont_mod.subprocess, "run", side_effect=_transient_lsof),
+                mock.patch.object(cont_mod.time, "sleep"),
+            ):
+                ok_retry, holders_retry = cont_mod._inspect_opencode_holders(
+                    home_dir, [], lsof_bin=fake_lsof
+                )
+            self.assertIs(ok_retry, True)
+            self.assertEqual(holders_retry, set())
+            self.assertEqual(attempts["count"], 2)
+
+            with (
+                mock.patch.object(
+                    cont_mod.subprocess,
+                    "run",
+                    return_value=subprocess.CompletedProcess(["lsof"], 1, stdout="", stderr="always fail"),
+                ) as mock_fail_run,
+                mock.patch.object(cont_mod.time, "sleep"),
+            ):
+                ok_fail, _ = cont_mod._inspect_opencode_holders(
+                    home_dir, [], lsof_bin=fake_lsof
+                )
+            self.assertIs(ok_fail, False)
+            self.assertEqual(mock_fail_run.call_count, 3)
+
 
 if __name__ == "__main__":
     unittest.main()

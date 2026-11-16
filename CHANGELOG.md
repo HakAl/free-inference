@@ -2,6 +2,13 @@
 
 All notable changes to `free-inference` are documented in this file.
 
+## [0.2.1] - 2026-11-16
+
+### Session Attach Ergonomics, Containment Reliability, and Linux CI Portability
+- **Separate cold-start default TTL from session attach ceiling (`scripts/opencode-attested`, `tests/test_registry_and_tools.py`, `tests/test_security_profile.py`)**: Kept `DEFAULT_TTL_SECONDS = 7200` (`2h`) for cold-starting a new session while allowing `opencode-attested` (interactive and unattended worker modes) to attach cleanly to any active session window up to `MAX_WINDOW_SECONDS = 86400` (`24h`) when `--ttl-seconds` is omitted, honoring explicit `--ttl-seconds` caps and rejecting `--ttl-seconds > 86400` up front.
+- **Linux `lsof` fallback and transient post-stop `lsof` retry (`scripts/check-credential-containment`, `tests/test_session_credential_isolation.py`)**: Resolved `lsof` across `("/usr/sbin/lsof", "/usr/bin/lsof")` (fixing `EnvelopeContainmentTests` on Linux where `lsof` is `/usr/bin/lsof`) and added a bounded 3-attempt retry (`0.1`s backoff) in `_inspect_opencode_holders` so dying `opencode serve --service` child processes on macOS do not cause a transient first-pass `lsof` exit `1`.
+- **Linux `/proc/self/fd` descriptor confinement and portable test fixes (`local_assist/workspace.py`, `tests/test_local_assist_dogfood_fixes.py`, `tests/test_registry_and_tools.py`, `tests/test_session_window.py`)**: Enforced `os.readlink(f"/proc/self/fd/{fd}")` post-open directory descriptor confinement on Linux in `_descriptor_within_workspace` (rejecting outside-workspace and `" (deleted)"` dentries), gated Darwin `/usr/bin/sandbox-exec` smoke execution in `test_privatemode_phase0_registry_client_timeout_and_manifest` with non-Darwin fail-closed verification, and fell back from `/private/tmp` to `/tmp` on Linux in `test_stop_cli_targets_the_explicit_runs_store`.
+
 ## [0.2.0] - 2026-11-15
 
 ### Explicit Attested Session Windows

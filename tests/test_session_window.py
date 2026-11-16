@@ -128,7 +128,8 @@ class SessionPolicyTests(unittest.TestCase):
         import tempfile, subprocess, os
         from local_assist.registry import pid_file_for_model, session_token_file_for_model, get_process_lstart
         model = 'tinfoil-deepseek-v4-1-flash'
-        with tempfile.TemporaryDirectory(prefix='sw-stop-', dir='/private/tmp') as tmp:
+        tmp_base = '/private/tmp' if os.path.isdir('/private/tmp') else '/tmp'
+        with tempfile.TemporaryDirectory(prefix='sw-stop-', dir=tmp_base) as tmp:
             store = Path(tmp)
             proc = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])
             try:

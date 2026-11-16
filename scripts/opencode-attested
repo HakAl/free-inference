@@ -112,6 +112,7 @@ from local_assist.registry import (
 )
 from local_assist.relay import SessionAuthRelay, _WorkerTokenRelay
 from local_assist.se_key import DEFAULT_ENVELOPE_ACCOUNT
+from local_assist.session import MAX_WINDOW_SECONDS
 from local_assist.security_profile import (
     SecurityProfileError,
     WorkerSecurityProfile,
@@ -1028,7 +1029,13 @@ def ensure_model_served(
     serve_reqs = max_chat_requests
     serve_tokens = max_tokens_cap
     serve_bytes = max_request_bytes
-    serve_ttl = ttl_seconds
+    serve_ttl = min(ttl_seconds, MAX_WINDOW_SECONDS)
+    has_explicit_ttl = ("ttl_seconds" in (explicit_cap_flags or ())) or (
+        ttl_seconds != DEFAULT_TTL_SECONDS
+    )
+    attach_ttl_ceiling = (
+        min(ttl_seconds, MAX_WINDOW_SECONDS) if has_explicit_ttl else MAX_WINDOW_SECONDS
+    )
 
     initial_verify_cmd = [verify_script, endpoint.model_id]
     if target_port is not None:
@@ -1060,7 +1067,7 @@ def ensure_model_served(
                 rec_max_reqs > max_chat_requests
                 or rec_max_tokens > max_tokens_cap
                 or rec_max_bytes > max_request_bytes
-                or rec_ttl > ttl_seconds
+                or rec_ttl > attach_ttl_ceiling
             ):
                 raise LocalAssistError(
                     "spend_ceiling_exceeded",
@@ -1069,7 +1076,7 @@ def ensure_model_served(
                     f"max_tokens_cap={rec_max_tokens}, max_request_bytes={rec_max_bytes}, "
                     f"ttl_seconds={rec_ttl}) exceed the launcher's ceiling "
                     f"(max_chat_requests={max_chat_requests}, max_tokens_cap={max_tokens_cap}, "
-                    f"max_request_bytes={max_request_bytes}, ttl_seconds={ttl_seconds}). "
+                    f"max_request_bytes={max_request_bytes}, ttl_seconds={attach_ttl_ceiling}). "
                     f"Run './scripts/stop-model {endpoint.model_id}' and relaunch.",
                     details={
                         "model_id": endpoint.model_id,
@@ -1515,6 +1522,12 @@ def main(argv: list[str]) -> int:
             file=sys.stderr,
         )
         return 1
+    if eff_ttl > MAX_WINDOW_SECONDS:
+        print(
+            f"--ttl-seconds must not exceed {MAX_WINDOW_SECONDS} seconds (24h).",
+            file=sys.stderr,
+        )
+        return 1
 
     effective_no_serve = True if active_profile is not None else args.no_serve
 
@@ -1691,8 +1704,14 @@ def main(argv: list[str]) -> int:
             session_default_chat_params = dict(raw_pt)
 
     if active_profile is not None:
-        worker_ttl = min(session_meta['ttl_seconds'], session_meta.get('live_status', {}).get(
-            'remaining_seconds', session_meta['ttl_seconds']))
+        worker_ttl = min(
+            session_meta["ttl_seconds"],
+            session_meta.get("live_status", {}).get(
+                "remaining_seconds", session_meta["ttl_seconds"]
+            ),
+        )
+        if "ttl_seconds" in args.explicit_cap_flags:
+            worker_ttl = min(worker_ttl, eff_ttl)
         def _build_att_base_cfg(relay: _WorkerTokenRelay | None) -> dict[str, Any]:
             assert relay is not None
             base_config_text = render_private_attested_config(

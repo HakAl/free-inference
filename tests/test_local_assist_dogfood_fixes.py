@@ -847,6 +847,33 @@ tool_timeout_sec = 60
             self.assertEqual(content, "INSIDE_SAFE_TEXT")
             self.assertNotIn("OUTSIDE_SENTINEL_TEXT", content)
 
+            # Simulated Linux /proc/self/fd/<fd> confinement checks
+            from local_assist import workspace as ws_mod
+
+            with (
+                patch.object(ws_mod.sys, "platform", "linux"),
+                patch.object(ws_mod.os, "readlink", return_value=str(sub)),
+            ):
+                self.assertTrue(ws_mod._descriptor_within_workspace(42, ws))
+
+            with (
+                patch.object(ws_mod.sys, "platform", "linux"),
+                patch.object(ws_mod.os, "readlink", return_value=str(outside)),
+            ):
+                self.assertFalse(ws_mod._descriptor_within_workspace(42, ws))
+
+            with (
+                patch.object(ws_mod.sys, "platform", "linux"),
+                patch.object(ws_mod.os, "readlink", return_value=str(sub) + " (deleted)"),
+            ):
+                self.assertFalse(ws_mod._descriptor_within_workspace(42, ws))
+
+            with (
+                patch.object(ws_mod.sys, "platform", "linux"),
+                patch.object(ws_mod.os, "readlink", side_effect=OSError("procfs unavailable")),
+            ):
+                self.assertFalse(ws_mod._descriptor_within_workspace(42, ws))
+
     def test_assertion_executor_enforces_seatbelt_on_ordinary_node_and_inherited_policy(self) -> None:
         from local_assist.launch import _locate_host_node_binary, _provision_dedicated_local_assist_python
         from local_assist.security_profile import compile_interactive_seatbelt_profile
