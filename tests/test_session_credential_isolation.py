@@ -122,13 +122,25 @@ int main(int argc, char **argv) {
 
 def _planner_server(handler):
     # Launcher --port reserves room for an upstream port at +1000. macOS's
-    # ephemeral range can hand out ports beyond that accepted ceiling.
-    for _ in range(50):
+    # sequential ephemeral port counter can sit in 64536..65535 across many
+    # consecutive port=0 binds, so fall back to a single-wrap scan of 49152..64535.
+    import random
+
+    for _ in range(16):
         server = ThreadingHTTPServer(('127.0.0.1', 0), handler)
         if server.server_address[1] <= 64535:
             return server
         server.server_close()
-    raise RuntimeError('Could not allocate a bounded planner port.')
+    lo, hi = 49152, 64535
+    span = hi - lo + 1
+    offset = random.randrange(span)
+    for i in range(span):
+        cand = lo + ((offset + i) % span)
+        try:
+            return ThreadingHTTPServer(('127.0.0.1', cand), handler)
+        except OSError:
+            continue
+    raise RuntimeError('Could not allocate a bounded planner port in 49152..64535.')
 
 
 def _load_script_module(name: str, rel_path: str) -> ModuleType:

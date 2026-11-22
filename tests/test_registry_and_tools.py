@@ -2476,7 +2476,7 @@ class RegistryAndToolsTests(unittest.TestCase):
         uncleared_ep = resolve_endpoint(
             load_model("tinfoil-kimi-k3-1-pro"), require_api_key=False
         )
-        deprecated_ep = resolve_endpoint(
+        archived_catalog_ep = resolve_endpoint(
             load_model("tinfoil-kimi-k3"), require_api_key=False
         )
         cleared_ep = resolve_endpoint(
@@ -2534,7 +2534,8 @@ class RegistryAndToolsTests(unittest.TestCase):
         )
         self.assertIn("WARNING: Running private-attested with uncleared candidate", warn_buf.getvalue())
 
-        # Deprecated model (tinfoil-kimi-k3) is refused unless --allow-deprecated-model is also passed (A4)
+        # Deprecated candidate model is refused unless --allow-deprecated-model is also passed (A4)
+        deprecated_ep = replace(uncleared_ep, deprecated=True, deprecation_date="2026-11-12")
         with self.assertRaises(LocalAssistError) as ctx_dep:
             oc_attested.validate_private_attested_endpoint(
                 deprecated_ep, allow_uncleared_model=True
@@ -2551,15 +2552,16 @@ class RegistryAndToolsTests(unittest.TestCase):
         )
         self.assertIn("WARNING: Running with deprecated model", dep_warn_buf.getvalue())
 
-        # Archived models are unconditionally refused by both launchers even with overrides
-        archived_att_ep = replace(uncleared_ep, status="archived")
-        with self.assertRaises(LocalAssistError) as ctx_arch_att:
-            oc_attested.validate_private_attested_endpoint(
-                archived_att_ep,
-                allow_uncleared_model=True,
-                allow_deprecated_model=True,
-            )
-        self.assertEqual(ctx_arch_att.exception.code, "model_archived")
+        # Archived models (both live catalog tinfoil-kimi-k3 and synthetic) are unconditionally refused even with overrides
+        self.assertEqual(archived_catalog_ep.status, "archived")
+        for archived_att_ep in (archived_catalog_ep, replace(uncleared_ep, status="archived")):
+            with self.assertRaises(LocalAssistError) as ctx_arch_att:
+                oc_attested.validate_private_attested_endpoint(
+                    archived_att_ep,
+                    allow_uncleared_model=True,
+                    allow_deprecated_model=True,
+                )
+            self.assertEqual(ctx_arch_att.exception.code, "model_archived")
 
         local_ep = resolve_endpoint(load_model("qwen3-30b-a3b-2507-mlx-4bit"), require_api_key=False)
         archived_loc_ep = replace(local_ep, status="archived")
@@ -3878,10 +3880,10 @@ class RegistryAndToolsTests(unittest.TestCase):
         from local_assist.server import SERVER_INFO
 
         # 1. Version parity across __init__.py, server.py, package.json, and scripts/models --version (A4)
-        self.assertEqual(local_assist.__version__, "0.2.1")
-        self.assertEqual(SERVER_INFO["version"], "0.2.1")
+        self.assertEqual(local_assist.__version__, "0.3.1")
+        self.assertEqual(SERVER_INFO["version"], "0.3.1")
         pkg_json = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))
-        self.assertEqual(pkg_json["version"], "0.2.1")
+        self.assertEqual(pkg_json["version"], "0.3.1")
 
         # 1b. Anchored release-hygiene.json scan.allow rule for Swift parameter label (Minor 4);
         # release-hygiene.json is private-only and absent in exported public clones / CI.
@@ -4056,7 +4058,7 @@ class RegistryAndToolsTests(unittest.TestCase):
                 text=True,
                 check=True,
             )
-            self.assertEqual(models_ver_clean.stdout.strip(), "free-inference-lab 0.2.1")
+            self.assertEqual(models_ver_clean.stdout.strip(), "free-inference-lab 0.3.1")
 
             for launcher_rel in ("opencode-local", "opencode-attested"):
                 hlp = subprocess.run(

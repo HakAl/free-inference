@@ -1,64 +1,115 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import os
+import sys
+
+sys.dont_write_bytecode = True
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+
 import argparse
 from collections.abc import Sequence
 import json
-import os
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
+_HAS_SITE_FLAG = any(
+    tok == "--launcher-site-packages" or tok.startswith("--launcher-site-packages=")
+    for tok in sys.argv[1:]
+)
+_IS_RO_EXPORT = not (ROOT / ".git").exists() and not os.access(ROOT, os.W_OK)
+_WAS_VENV_REEXEC = os.environ.pop("_LOCAL_ASSIST_VENV_REEXEC", None) == "1"
+_USE_VENV = (
+    not sys.flags.isolated
+    and not _HAS_SITE_FLAG
+    and not _IS_RO_EXPORT
+    and os.environ.get("LOCAL_ASSIST_WORKER_SANDBOX") != "1"
+    and not _WAS_VENV_REEXEC
+    and VENV_PYTHON.exists()
+    and os.access(VENV_PYTHON, os.X_OK)
+    and (ROOT / ".venv" / "pyvenv.cfg").is_file()
+    and Path(sys.prefix).resolve() != (ROOT / ".venv").resolve()
+)
 if __name__ == "__main__":
     _SENSITIVE_LAUNCH_ENV_KEYS = (
         "LOCAL_ASSIST_SESSION_TOKEN",
         "OPENCODE_PASSWORD",
         "OPENCODE_SERVER_PASSWORD",
         "_FREE_INFERENCE_TOKEN_FD",
+        "_FREE_INFERENCE_TOKEN_OVERSIZE",
     )
     if any(_k in os.environ for _k in _SENSITIVE_LAUNCH_ENV_KEYS):
         _clean_env = dict(os.environ)
         for _k in _SENSITIVE_LAUNCH_ENV_KEYS:
             _clean_env.pop(_k, None)
-        _target_py = str(VENV_PYTHON) if VENV_PYTHON.exists() else sys.executable
+        if _USE_VENV:
+            _clean_env["_LOCAL_ASSIST_VENV_REEXEC"] = "1"
+            _target_py = str(VENV_PYTHON)
+            _reexec_flags = ["-B"]
+        else:
+            _target_py = sys.executable
+            _reexec_flags = ["-I", "-B"] if sys.flags.isolated else ["-B"]
         os.execve(
             _target_py,
-            [_target_py, str(Path(__file__).resolve()), *sys.argv[1:]],
+            [_target_py, *_reexec_flags, str(Path(__file__).resolve()), *sys.argv[1:]],
             _clean_env,
         )
-    if VENV_PYTHON.exists() and Path(sys.executable) != VENV_PYTHON:
-        os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), __file__, *sys.argv[1:]])
+    if _USE_VENV and Path(sys.executable) != VENV_PYTHON:
+        os.environ["_LOCAL_ASSIST_VENV_REEXEC"] = "1"
+        os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), "-B", __file__, *sys.argv[1:]])
 
 sys.path.insert(0, str(ROOT))
+if __name__ == "__main__":
+    from local_assist.custody import bootstrap_entrypoint
+
+    bootstrap_entrypoint(ROOT, sys.argv, exit_on_error=False)
 
 from local_assist.client import check_private_coding_admission
+from local_assist.custody import (
+    PINNED_RUNS_STAT_ENV_VAR,
+    ensure_creatable_runs_dir,
+    format_pinned_runs_stat,
+    get_active_bootstrap_state,
+    inspect_existing_runs_dir,
+    is_custody_tree,
+    set_cli_runs_dir_override,
+    validate_creatable_runs_dir,
+)
 from local_assist.errors import LocalAssistError
 from local_assist.launch import (
     EXIT_MODEL_MISMATCH,
     SAFE_ENV_ALLOWLIST,
+    PreparedWorkerIdentity,
     add_common_launcher_arguments,
     allocate_side_by_side_port,
+    apply_inprocess_runs_dir_arg,
     build_isolated_opencode_env,
     check_endpoint_lifecycle_status,
     check_uncontained_legacy_home,
+    cleanup_prepared_worker_identity,
     execute_worker_profile_session,
     is_port_owned_by_different_active_model,
     json_escape as _json_escape,
+    normalize_non_session_exit_code,
     pid_record_is_live_or_starting,
+    prepare_early_worker_manifest_from_argv,
     publish_and_run_opencode,
     resolve_active_security_profile as _resolve_active_security_profile,
+    resolve_opencode_binary,
     split_launcher_argv,
     sync_and_run_opencode,
     validate_common_worker_flags,
     validate_worker_binary_and_args,
 )
+from local_assist.proc_identity import reap_worker_from_manifest
 from local_assist.registry import (
     EndpointConfig,
     RegistryError,
+    _effective_runs_dir,
     load_model,
     read_pid_record_for_model,
     resolve_endpoint,
@@ -218,6 +269,7 @@ def build_private_local_env(
         "OPENCODE_PASSWORD",
         "OPENCODE_SERVER_PASSWORD",
         "_FREE_INFERENCE_TOKEN_FD",
+        "_FREE_INFERENCE_TOKEN_OVERSIZE",
     ):
         env.pop(secret_key, None)
     return env
@@ -231,8 +283,11 @@ def ensure_model_served(
     wait_seconds: float = DEFAULT_WAIT_SECONDS,
     explicit_port: int | None = None,
     runs_dir: Path | None = None,
-    run_cmd: Any = subprocess.run,
+    publish_pointer: bool | None = None,
+    run_cmd: Any = None,
 ) -> tuple[bool, str | None]:
+    use_default_runner = run_cmd is None
+    actual_run_cmd = subprocess.run if use_default_runner else run_cmd
     if refresh_session and no_serve:
         return (
             False,
@@ -243,7 +298,49 @@ def ensure_model_served(
     serve_script = str(ROOT / "scripts" / "serve-model")
     stop_script = str(ROOT / "scripts" / "stop-model")
 
-    pre_refresh_rec = read_pid_record_for_model(endpoint.model_id, runs_dir)
+    try:
+        eff_runs_dir = _effective_runs_dir(runs_dir)
+    except RegistryError as exc:
+        return False, str(exc)
+    st_boot = get_active_bootstrap_state()
+    in_custody = (st_boot is not None and st_boot.custody_mode) or is_custody_tree(ROOT)
+    pinned_stat: tuple[int, int] | None = None
+    if use_default_runner and not in_custody:
+        if st_boot is not None and st_boot.cli_runs_dir is not None:
+            ex_init, ex_err = inspect_existing_runs_dir(
+                eff_runs_dir,
+                expected_stat=st_boot.cli_runs_stat,
+                label="--runs-dir",
+            )
+            if ex_err is not None or ex_init is None or ex_init.stat_id is None:
+                return False, ex_err or "Invalid --runs-dir."
+            eff_runs_dir = ex_init.path
+            pinned_stat = ex_init.stat_id
+        else:
+            v_init, v_err = validate_creatable_runs_dir(
+                eff_runs_dir,
+                label="FREE_INFERENCE_RUNS_DIR",
+            )
+            if v_err is not None or v_init is None:
+                return False, v_err or "Invalid session store directory."
+            eff_runs_dir = v_init.path
+            pinned_stat = v_init.stat_id
+    should_publish_pointer = (
+        (not in_custody and bool(publish_pointer))
+        if publish_pointer is not None
+        else (
+            not in_custody
+            and (st_boot is None or st_boot.cli_runs_dir is None)
+            and runs_dir is None
+            and (
+                True
+                if (st_boot is not None and st_boot.worker_or_reap_cli)
+                else not bool(os.environ.get("FREE_INFERENCE_RUNS_DIR", "").strip())
+            )
+        )
+    )
+
+    pre_refresh_rec = read_pid_record_for_model(endpoint.model_id, eff_runs_dir)
     rec_port_val = (pre_refresh_rec or {}).get("port")
     if explicit_port is not None:
         target_port: int | None = explicit_port
@@ -252,16 +349,52 @@ def ensure_model_served(
     else:
         target_port = endpoint.port
 
+    def _is_python_entrypoint(script_path: str) -> bool:
+        try:
+            with open(script_path, "rb") as fh:
+                head = fh.readline(128)
+            return head.startswith(b"#!") and b"python" in head
+        except OSError:
+            return True
+
+    def _invoke_verify_local(raw_verify_args: list[str]) -> Any:
+        if not use_default_runner:
+            return actual_run_cmd(
+                raw_verify_args,
+                cwd=str(ROOT),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        extra: list[str] = []
+        if st_boot is not None and st_boot.launcher_site_packages is not None:
+            extra.extend(["--launcher-site-packages", str(st_boot.launcher_site_packages)])
+        if not in_custody:
+            extra.extend(["--runs-dir", str(eff_runs_dir)])
+            if pinned_stat is None:
+                extra.append("--allow-absent-runs-dir")
+        if _is_python_entrypoint(raw_verify_args[0]):
+            eff_v_args = [sys.executable, "-B", raw_verify_args[0], *extra, *raw_verify_args[1:]]
+        else:
+            eff_v_args = [raw_verify_args[0], *extra, *raw_verify_args[1:]]
+        verify_env = dict(os.environ)
+        if not in_custody and pinned_stat is not None:
+            verify_env[PINNED_RUNS_STAT_ENV_VAR] = format_pinned_runs_stat(pinned_stat)
+        else:
+            verify_env.pop(PINNED_RUNS_STAT_ENV_VAR, None)
+        return actual_run_cmd(
+            eff_v_args,
+            cwd=str(ROOT),
+            env=verify_env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
     initial_verify_cmd = [verify_script, endpoint.model_id, "--require-offline"]
     if target_port is not None:
         initial_verify_cmd.extend(["--port", str(target_port)])
-    initial = run_cmd(
-        initial_verify_cmd,
-        cwd=str(ROOT),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    initial = _invoke_verify_local(initial_verify_cmd)
     if initial.returncode == 0 and not refresh_session:
         return True, None
 
@@ -271,14 +404,14 @@ def ensure_model_served(
         owned_by_other, owner_mid = is_port_owned_by_different_active_model(
             endpoint.model_id,
             check_port,
-            runs_dir=runs_dir,
+            runs_dir=eff_runs_dir,
         )
         if owned_by_other and not no_serve and explicit_port is None:
             try:
                 target_port = allocate_side_by_side_port(
                     check_port,
                     uses_upstream_port=False,
-                    runs_dir=runs_dir,
+                    runs_dir=eff_runs_dir,
                 )
             except LocalAssistError as exc:
                 return False, str(exc)
@@ -306,14 +439,38 @@ def ensure_model_served(
     if refresh_session and (
         initial.returncode == 0
         or pre_refresh_rec is not None
-        or read_pid_record_for_model(endpoint.model_id, runs_dir) is not None
+        or read_pid_record_for_model(endpoint.model_id, eff_runs_dir) is not None
     ):
-        stop_res = run_cmd(
-            [stop_script, endpoint.model_id],
+        stop_cmd = [stop_script, endpoint.model_id]
+        stop_extra_kw: dict[str, Any] = {}
+        if not in_custody:
+            if use_default_runner:
+                if (st_boot is not None and st_boot.cli_runs_dir is not None) or pinned_stat is not None:
+                    ex_stop, stop_v_err = inspect_existing_runs_dir(
+                        eff_runs_dir,
+                        expected_stat=pinned_stat,
+                        label="--runs-dir",
+                    )
+                else:
+                    ex_stop, stop_v_err = ensure_creatable_runs_dir(
+                        eff_runs_dir,
+                        label="--runs-dir",
+                    )
+                if stop_v_err is not None or ex_stop is None or ex_stop.stat_id is None:
+                    return False, stop_v_err or "Cannot validate session store directory."
+                eff_runs_dir = ex_stop.path
+                pinned_stat = ex_stop.stat_id
+                stop_env = dict(os.environ)
+                stop_env[PINNED_RUNS_STAT_ENV_VAR] = format_pinned_runs_stat(pinned_stat)
+                stop_extra_kw["env"] = stop_env
+            stop_cmd.extend(["--runs-dir", str(eff_runs_dir)])
+        stop_res = actual_run_cmd(
+            stop_cmd,
             cwd=str(ROOT),
             capture_output=True,
             text=True,
             check=False,
+            **stop_extra_kw,
         )
         if stop_res.returncode != 0:
             stop_err = (stop_res.stderr or stop_res.stdout or "").strip()
@@ -334,16 +491,45 @@ def ensure_model_served(
         serve_cmd.extend(["--port", str(target_port)])
     if refresh_session:
         serve_cmd.append("--refresh-session")
-    serve_res = run_cmd(
+    serve_extra_kw: dict[str, Any] = {}
+    if not in_custody:
+        if use_default_runner:
+            if st_boot is not None and st_boot.cli_runs_dir is not None:
+                srv_res, srv_v_err = inspect_existing_runs_dir(
+                    eff_runs_dir,
+                    expected_stat=pinned_stat,
+                    label="--runs-dir",
+                )
+            else:
+                srv_res, srv_v_err = ensure_creatable_runs_dir(
+                    eff_runs_dir,
+                    expected_stat=pinned_stat,
+                    label="--runs-dir",
+                )
+            if srv_v_err is not None or srv_res is None or srv_res.stat_id is None:
+                return False, srv_v_err or "Cannot prepare session store directory."
+            eff_runs_dir = srv_res.path
+            pinned_stat = srv_res.stat_id
+            serve_env = dict(os.environ)
+            serve_env[PINNED_RUNS_STAT_ENV_VAR] = format_pinned_runs_stat(pinned_stat)
+            serve_extra_kw["env"] = serve_env
+        serve_cmd.extend(["--runs-dir", str(eff_runs_dir)])
+        if should_publish_pointer:
+            serve_cmd.append("--publish-active-runs")
+    serve_res = actual_run_cmd(
         serve_cmd,
         cwd=str(ROOT),
         capture_output=True,
         text=True,
         check=False,
+        **serve_extra_kw,
     )
     if serve_res.returncode != 0:
         serve_err = (serve_res.stderr or serve_res.stdout or "").strip()
         return False, f"Failed to start model '{endpoint.model_id}': {serve_err}"
+    for warn_line in (serve_res.stderr or "").splitlines():
+        if warn_line.lstrip().startswith("WARNING:"):
+            print(warn_line, file=sys.stderr)
 
     wait_verify_cmd = [
         verify_script,
@@ -354,13 +540,7 @@ def ensure_model_served(
     ]
     if target_port is not None:
         wait_verify_cmd.extend(["--port", str(target_port)])
-    wait_res = run_cmd(
-        wait_verify_cmd,
-        cwd=str(ROOT),
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    wait_res = _invoke_verify_local(wait_verify_cmd)
     if wait_res.returncode == 0:
         return True, None
 
@@ -379,6 +559,7 @@ def ensure_model_served(
 
 def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     parser = argparse.ArgumentParser(
+        allow_abbrev=False,
         description=(
             "Launch opencode against the Rung 1 private-local MLX server with "
             "isolated state, project-config lockdown, and local-assist MCP."
@@ -426,12 +607,72 @@ def main(argv: list[str]) -> int:
         "OPENCODE_PASSWORD",
         "OPENCODE_SERVER_PASSWORD",
         "_FREE_INFERENCE_TOKEN_FD",
+        "_FREE_INFERENCE_TOKEN_OVERSIZE",
     ):
         os.environ.pop(secret_key, None)
 
-    caller_cwd = Path.cwd()
-    args, opencode_args = parse_args(argv)
+    prep_ok, prepared_identity, prep_err = prepare_early_worker_manifest_from_argv(argv)
+    if not prep_ok:
+        print(prep_err or "Failed to prepare worker manifest.", file=sys.stderr)
+        return 1
 
+    ownership_transferred = {"v": False}
+    prev_boot = get_active_bootstrap_state()
+    inproc_runs_set = False
+    try:
+        if prev_boot is not None and prev_boot.bootstrap_error is not None:
+            print(prev_boot.bootstrap_error, file=sys.stderr)
+            return 1
+
+        caller_cwd = Path.cwd()
+        try:
+            args, opencode_args = parse_args(argv)
+        except SystemExit as exc:
+            code = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
+            return normalize_non_session_exit_code(code)
+
+        if getattr(args, "reap_worker", None):
+            return normalize_non_session_exit_code(
+                reap_worker_from_manifest(
+                    args.reap_worker,
+                    reap_timeout_sec=float(getattr(args, "reap_timeout", 10.0)),
+                )
+            )
+
+        if getattr(args, "runs_dir", None) is not None:
+            runs_err = apply_inprocess_runs_dir_arg(args)
+            if runs_err is not None:
+                print(runs_err, file=sys.stderr)
+                return 1
+            inproc_runs_set = True
+
+        return normalize_non_session_exit_code(
+            _main_inner_local(
+                args,
+                opencode_args,
+                caller_cwd,
+                prepared_identity=prepared_identity,
+                ownership_callback=lambda: ownership_transferred.__setitem__("v", True),
+            )
+        )
+    finally:
+        if inproc_runs_set:
+            set_cli_runs_dir_override(
+                prev_boot.cli_runs_dir if prev_boot is not None else None,
+                runs_stat=prev_boot.cli_runs_stat if prev_boot is not None else None,
+            )
+        if not ownership_transferred["v"]:
+            cleanup_prepared_worker_identity(prepared_identity)
+
+
+def _main_inner_local(
+    args: argparse.Namespace,
+    opencode_args: list[str],
+    caller_cwd: Path,
+    *,
+    prepared_identity: PreparedWorkerIdentity | None = None,
+    ownership_callback: Any = None,
+) -> int:
     if args.context_limit <= 0 or args.output_limit <= 0 or args.wait < 0:
         print("--context-limit and --output-limit must be > 0 and --wait must be >= 0", file=sys.stderr)
         return 1
@@ -464,9 +705,31 @@ def main(argv: list[str]) -> int:
             print(legacy_err, file=sys.stderr)
             return 1
 
+    st_main = get_active_bootstrap_state()
+    in_custody_main = (st_main is not None and st_main.custody_mode) or is_custody_tree(ROOT)
+    launcher_should_publish_pointer = (
+        not in_custody_main
+        and (st_main is None or st_main.cli_runs_dir is None)
+        and getattr(args, "runs_dir", None) is None
+        and (
+            True
+            if (st_main is not None and st_main.worker_or_reap_cli)
+            else not bool(os.environ.get("FREE_INFERENCE_RUNS_DIR", "").strip())
+        )
+    )
     try:
+        session_runs = _effective_runs_dir()
+        if not in_custody_main and getattr(args, "runs_dir", None) is None:
+            v_sr, sr_err = validate_creatable_runs_dir(
+                session_runs,
+                label="FREE_INFERENCE_RUNS_DIR",
+            )
+            if sr_err is not None or v_sr is None:
+                print(sr_err or "Invalid session store directory.", file=sys.stderr)
+                return 1
+            session_runs = v_sr.path
         model = load_model(args.model)
-        pid_record = read_pid_record_for_model(args.model)
+        pid_record = read_pid_record_for_model(args.model, session_runs)
         if explicit_port is not None and isinstance(pid_record, dict):
             init_active, init_unavail = pid_record_is_live_or_starting(pid_record)
             rec_port = pid_record.get("port")
@@ -500,7 +763,10 @@ def main(argv: list[str]) -> int:
         print(str(exc), file=sys.stderr)
         return 1
 
-    opencode_bin: str | None = shutil.which("opencode")
+    opencode_bin, oc_bin_err = resolve_opencode_binary(args)
+    if oc_bin_err is not None:
+        print(oc_bin_err, file=sys.stderr)
+        return 1
     if not args.print_config and not opencode_bin:
         print("opencode binary not found on PATH", file=sys.stderr)
         return 1
@@ -523,6 +789,8 @@ def main(argv: list[str]) -> int:
         "no_serve": args.no_serve,
         "refresh_session": refresh_session,
         "wait_seconds": args.wait,
+        "runs_dir": session_runs,
+        "publish_pointer": launcher_should_publish_pointer,
     }
     if explicit_port is not None:
         ensure_kwargs["explicit_port"] = explicit_port
@@ -534,7 +802,7 @@ def main(argv: list[str]) -> int:
         print(err_msg or "Failed to verify served model", file=sys.stderr)
         return 1
 
-    active_pid_record = read_pid_record_for_model(args.model)
+    active_pid_record = read_pid_record_for_model(args.model, session_runs)
     try:
         endpoint = resolve_endpoint(
             model,
@@ -582,6 +850,8 @@ def main(argv: list[str]) -> int:
             endpoint_port=endpoint.port,
             local_assist_port=int(endpoint.port or 8080),
             allocate_worker_home_fn=allocate_worker_home,
+            prepared_identity=prepared_identity,
+            ownership_callback=ownership_callback,
         )
 
     isolated_home = (

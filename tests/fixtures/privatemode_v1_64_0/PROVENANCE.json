@@ -1,0 +1,17 @@
+{
+  "repo": "edgelesssys/privatemode-public",
+  "tag": "v1.64.0",
+  "commit_sha": "3c98e0abf3219a6ebcc29112867a5f004605041b",
+  "files": {
+    "models.yaml": {
+      "sha256": "908a9b1668a716652d04064d0b83d925b5344005d8b97e548d0f0e64254564b6",
+      "bytes": 6517,
+      "url": "https://raw.githubusercontent.com/edgelesssys/privatemode-public/3c98e0abf3219a6ebcc29112867a5f004605041b/models.yaml"
+    },
+    "deployment.yaml": {
+      "sha256": "7c079fcb25b2441d983dbb6506d3fa3aefca639eb42df914aa784d2c2bb3be95",
+      "bytes": 206023,
+      "url": "https://raw.githubusercontent.com/edgelesssys/privatemode-public/3c98e0abf3219a6ebcc29112867a5f004605041b/deployment.yaml"
+    }
+  }
+}

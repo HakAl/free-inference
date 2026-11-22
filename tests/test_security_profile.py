@@ -3407,6 +3407,7 @@ class Phase2LookoutRemediationTests(unittest.TestCase):
                 pid_rec_stub = {
                     "status": "ready",
                     "pid": os.getpid(),
+                    "pid_lstart": get_process_lstart(os.getpid()),
                     "session_token_file": str(tok_file),
                     "max_chat_requests": 25,
                     "max_tokens_cap": 2048,
@@ -3806,6 +3807,7 @@ class Phase2LookoutRemediationTests(unittest.TestCase):
                                 pid_rec_stub = {
                                     "status": "ready",
                                     "pid": os.getpid(),
+                                    "pid_lstart": get_process_lstart(os.getpid()),
                                     "session_token_file": str(tok_file_f6),
                                     "max_chat_requests": 25,
                                     "max_tokens_cap": 2048,
@@ -4115,6 +4117,7 @@ class Phase2LookoutRemediationTests(unittest.TestCase):
                 pid_rec_stub = {
                     "status": "ready",
                     "pid": os.getpid(),
+                    "pid_lstart": get_process_lstart(os.getpid()),
                     "session_token_file": str(tok_file_f11),
                     "max_chat_requests": 25,
                     "max_tokens_cap": 2048,

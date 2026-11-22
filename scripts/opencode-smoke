@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import http.server
 import json
@@ -61,6 +62,180 @@ HOST_STATE_CHECK_SCOPE = (
     "~/Library/Application Support/opencode"
 )
 SAFE_ENV_ALLOWLIST = tuple(sorted(BASE_SAFE_ENV_ALLOWLIST))
+
+
+def _stat_binary_identity(path: str) -> tuple[int, int, int, int] | None:
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    if not stat.S_ISREG(st.st_mode):
+        return None
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+def resolve_opencode_binary(opencode_bin: str) -> tuple[str, tuple[int, int, int, int] | None]:
+    resolved = os.path.realpath(str(opencode_bin))
+    return resolved, _stat_binary_identity(resolved)
+
+
+@contextlib.contextmanager
+def pinned_opencode_binary(opencode_bin: str):
+    """Pin an immutable private clone/copy of the resolved opencode binary for help, run, and --version."""
+    src_real = os.path.realpath(str(opencode_bin))
+    pin_dir: Path | None = None
+    pinned_path: Path | None = None
+    pinned_identity: tuple[int, int, int, int] | None = None
+    try:
+        src_fd = os.open(src_real, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            st_src = os.fstat(src_fd)
+            if stat.S_ISREG(st_src.st_mode):
+                src_id = (st_src.st_dev, st_src.st_ino, st_src.st_size, st_src.st_mtime_ns)
+                pin_dir = Path(tempfile.mkdtemp(prefix="oc-smoke-bin-"))
+                os.chmod(pin_dir, 0o700)
+                candidate = pin_dir / "opencode"
+
+                cloned = False
+                if sys.platform == "darwin" and Path("/bin/cp").is_file():
+                    cp_res = subprocess.run(
+                        ["/bin/cp", "-c", src_real, str(candidate)],
+                        capture_output=True,
+                        timeout=10,
+                        check=False,
+                    )
+                    if cp_res.returncode == 0 and _stat_binary_identity(src_real) == src_id:
+                        cloned = True
+                    elif candidate.exists():
+                        try:
+                            candidate.unlink()
+                        except OSError:
+                            pass
+
+                if not cloned:
+                    os.lseek(src_fd, 0, os.SEEK_SET)
+                    dst_fd = os.open(
+                        str(candidate),
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                        0o700,
+                    )
+                    try:
+                        while True:
+                            chunk = os.read(src_fd, 1024 * 1024)
+                            if not chunk:
+                                break
+                            view = memoryview(chunk)
+                            written = 0
+                            while written < len(chunk):
+                                n = os.write(dst_fd, view[written:])
+                                if n <= 0:
+                                    raise OSError("short write pinning opencode binary")
+                                written += n
+                    finally:
+                        os.close(dst_fd)
+
+                os.chmod(candidate, 0o500)
+                os.chmod(pin_dir, 0o500)
+                pinned_identity = _stat_binary_identity(str(candidate))
+                if pinned_identity is not None:
+                    pinned_path = candidate
+        finally:
+            os.close(src_fd)
+    except (OSError, subprocess.SubprocessError):
+        pinned_path = None
+        pinned_identity = None
+
+    try:
+        if pinned_path is not None and pinned_identity is not None:
+            yield str(pinned_path), pinned_identity
+        else:
+            yield src_real, None
+    finally:
+        if pin_dir is not None:
+            try:
+                os.chmod(pin_dir, 0o700)
+            except OSError:
+                pass
+            shutil.rmtree(pin_dir, ignore_errors=True)
+
+
+def run_identity_checked_command(
+    opencode_bin: str,
+    expected_identity: tuple[int, int, int, int] | None,
+    run_fn: Any,
+) -> tuple[Any, bool]:
+    """Verify pinned opencode_bin identity before and after a sampled invocation."""
+    if expected_identity is None:
+        return run_fn(), False
+    before_ok = _stat_binary_identity(opencode_bin) == expected_identity
+    result = run_fn()
+    after_ok = _stat_binary_identity(opencode_bin) == expected_identity
+    return result, bool(before_ok and after_ok)
+
+
+def resolve_smoke_observed_version(
+    opencode_bin: str,
+    expected_identity: tuple[int, int, int, int] | None,
+    *,
+    identity_intact: bool,
+) -> str:
+    if expected_identity is None or not identity_intact:
+        return "unknown"
+    return detect_opencode_version(opencode_bin, expected_identity=expected_identity)
+
+
+def detect_opencode_version(
+    opencode_bin: str,
+    *,
+    expected_identity: tuple[int, int, int, int] | None = None,
+) -> str:
+    resolved, before_identity = resolve_opencode_binary(opencode_bin)
+    if before_identity is None:
+        return "unknown"
+    if expected_identity is not None and before_identity != expected_identity:
+        return "unknown"
+    try:
+        with tempfile.TemporaryDirectory(prefix="oc-smoke-ver-") as tmp_home:
+            ver_env = {
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "HOME": tmp_home,
+                "OPENCODE_TEST_HOME": tmp_home,
+                "XDG_CONFIG_HOME": f"{tmp_home}/.config",
+                "XDG_DATA_HOME": f"{tmp_home}/.local/share",
+                "XDG_STATE_HOME": f"{tmp_home}/.local/state",
+                "XDG_CACHE_HOME": f"{tmp_home}/.cache",
+                "TMPDIR": tmp_home,
+            }
+            proc = subprocess.run(
+                [resolved, "--version"],
+                env=ver_env,
+                capture_output=True,
+                timeout=5,
+                check=False,
+            )
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    _, after_identity = resolve_opencode_binary(resolved)
+    if after_identity != before_identity:
+        return "unknown"
+    if expected_identity is not None and after_identity != expected_identity:
+        return "unknown"
+    if proc.returncode != 0:
+        return "unknown"
+    raw_out = proc.stdout if proc.stdout else proc.stderr
+    if not raw_out:
+        return "unknown"
+    try:
+        out = raw_out.decode("utf-8", errors="strict").strip()
+    except UnicodeDecodeError:
+        return "unknown"
+    if not out:
+        return "unknown"
+    first_line = out.splitlines()[0].strip()
+    match = re.search(r"(\d+\.\d+\.\d+(?:[-+][A-Za-z0-9_.-]+)?)", first_line)
+    if not match:
+        return "unknown"
+    return f"v{match.group(1)}"
 SMOKE_EXCLUDED_REPO_HOME_DIRS = frozenset({
     "opencode-private-attested",
     "opencode-private-local",
@@ -1081,9 +1256,13 @@ def main(argv: list[str]) -> int:
         return 2
 
     model_id = argv[1]
-    opencode_bin = shutil.which("opencode")
-    if not opencode_bin:
+    opencode_which = shutil.which("opencode")
+    if not opencode_which:
         print("opencode binary not found on PATH", file=sys.stderr)
+        return 1
+    opencode_bin, opencode_identity = resolve_opencode_binary(opencode_which)
+    if opencode_identity is None:
+        print(f"opencode binary is not a regular file: {opencode_which}", file=sys.stderr)
         return 1
 
     lsof_bin = shutil.which("lsof")
@@ -1137,136 +1316,154 @@ def main(argv: list[str]) -> int:
         return 1
 
     seatbelt_profile = build_smoke_seatbelt_profile(ROOT)
-    help_cmd_wrapped, seatbelt_ok, seatbelt_err = wrap_command_with_smoke_seatbelt(
-        [opencode_bin, "run", "--help"],
-        seatbelt_profile,
-    )
-    if not seatbelt_ok:
-        summary = {
-            "model_id": model_id,
-            "repo": endpoint.served_model_id,
-            "passed": False,
-            "smoke_seatbelt_enforced": False,
-            "reason": seatbelt_err or "Seatbelt enforcement unavailable",
-            "out_dir": str(out_dir.relative_to(ROOT)),
-        }
-        (out_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
-        print(json.dumps(summary, indent=2))
-        return 1
-
-    smoke_seatbelt_enforced = bool(sys.platform == "darwin" and seatbelt_ok)
-    repo_home_isolation_method = (
-        "darwin_seatbelt_subpath_read_write_deny on <repo>/.home and top-level symlink targets "
-        "for the smoke opencode process tree; pre-existing serve-model/proxy daemon is outside "
-        "this child sandbox (se-key-proxy terminates Bearer se-session-* locally and non-excluded "
-        "proxy state under <repo>/.home plus out_dir are scanned)"
-        if smoke_seatbelt_enforced
-        else "non_darwin_process_env_only (no kernel sandbox-exec write denial)"
-    )
-
     workspace_dir = out_dir / "workspace"
     workspace_dir.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(TEMPLATE_TARGET, workspace_dir / "target.txt")
     subprocess.run(["git", "init", "-q"], cwd=str(workspace_dir), check=True)
 
-    forwarder = MeteringForwarder(
-        endpoint.api_base_url,
-        max_chat_requests=MAX_SMOKE_CHAT_REQUESTS,
-        max_tokens_per_request=MAX_SMOKE_TOKENS_PER_REQUEST,
-    )
-    forwarder.start()
-    try:
-        forwarder_bound_localhost = forwarder.bound_host == "127.0.0.1" and forwarder.port > 0
-        config_text = render_opencode_config(
-            endpoint,
-            api_base_url_override=forwarder.base_url,
+    with pinned_opencode_binary(opencode_bin) as (exec_opencode_bin, pinned_identity):
+        help_cmd_wrapped, seatbelt_ok, seatbelt_err = wrap_command_with_smoke_seatbelt(
+            [exec_opencode_bin, "run", "--help"],
+            seatbelt_profile,
         )
-        opencode_config_path = out_dir / "opencode.json"
-        opencode_config_path.write_text(config_text)
-
-        real_home = Path.home()
-        before_snapshot = snapshot_host_opencode_dirs(real_home)
-        (out_dir / "host-state-before.txt").write_text(before_snapshot)
-
-        isolated_home = out_dir / ".home"
-        for subdir in (".config", ".local/share", ".cache", ".local/state"):
-            (isolated_home / subdir).mkdir(parents=True, exist_ok=True)
-
-        env = build_isolated_env(workspace_dir, isolated_home, opencode_config_path, endpoint)
-
-        network_samples: list[str] = []
-        non_localhost_lines: list[str] = []
-        unconnected_udp_lines: list[str] = []
-        observer_errors: list[str] = []
-        observer_warnings: list[str] = []
-        if not observer_available:
-            observer_errors.append("Required observer binary missing (lsof or pgrep not found on PATH)")
-
-        help_res = run_sampled_command(
-            help_cmd_wrapped,
-            cwd=workspace_dir,
-            env=env,
-            timeout_s=30,
-            label="help",
-            network_samples=network_samples,
-            non_localhost_lines=non_localhost_lines,
-            unconnected_udp_lines=unconnected_udp_lines,
-            observer_errors=observer_errors,
-            observer_warnings=observer_warnings,
-        )
-        help_text = help_res["stdout"] + help_res["stderr"]
-        (out_dir / "opencode-help.txt").write_text(help_text)
-
-        required_flags_present = all(
-            flag in help_text for flag in ("--standalone", "--format", "--model")
-        )
-        if not required_flags_present:
+        if not seatbelt_ok:
             summary = {
                 "model_id": model_id,
                 "repo": endpoint.served_model_id,
                 "passed": False,
-                "smoke_seatbelt_enforced": smoke_seatbelt_enforced,
-                "reason": "opencode run --help missing required flags (--standalone, --format, --model)",
+                "smoke_seatbelt_enforced": False,
+                "reason": seatbelt_err or "Seatbelt enforcement unavailable",
                 "out_dir": str(out_dir.relative_to(ROOT)),
             }
             (out_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
             print(json.dumps(summary, indent=2))
             return 1
 
-        prompt = (
-            "/no_think Use your read tool to read target.txt in the current directory "
-            "and reply with the exact token inside."
+        smoke_seatbelt_enforced = bool(sys.platform == "darwin" and seatbelt_ok)
+        repo_home_isolation_method = (
+            "darwin_seatbelt_subpath_read_write_deny on <repo>/.home and top-level symlink targets "
+            "for the smoke opencode process tree; pre-existing serve-model/proxy daemon is outside "
+            "this child sandbox (se-key-proxy terminates Bearer se-session-* locally and non-excluded "
+            "proxy state under <repo>/.home plus out_dir are scanned)"
+            if smoke_seatbelt_enforced
+            else "non_darwin_process_env_only (no kernel sandbox-exec write denial)"
         )
-        cmd = [
-            opencode_bin,
-            "run",
-            "--standalone",
-            "--format",
-            "json",
-            "-m",
-            "local_mlx/local_model",
-            prompt,
-        ]
-        run_cmd_wrapped, _, _ = wrap_command_with_smoke_seatbelt(cmd, seatbelt_profile)
 
-        serve_log_path = runs_dir / "serve.log"
-        serve_posts_before = _count_serve_log_chat_posts(serve_log_path)
-
-        run_res = run_sampled_command(
-            run_cmd_wrapped,
-            cwd=workspace_dir,
-            env=env,
-            timeout_s=180,
-            label="run",
-            network_samples=network_samples,
-            non_localhost_lines=non_localhost_lines,
-            unconnected_udp_lines=unconnected_udp_lines,
-            observer_errors=observer_errors,
-            observer_warnings=observer_warnings,
+        forwarder = MeteringForwarder(
+            endpoint.api_base_url,
+            max_chat_requests=MAX_SMOKE_CHAT_REQUESTS,
+            max_tokens_per_request=MAX_SMOKE_TOKENS_PER_REQUEST,
         )
-        serve_posts_after = _count_serve_log_chat_posts(serve_log_path)
-    finally:
-        forwarder.stop()
+        forwarder.start()
+        try:
+            forwarder_bound_localhost = forwarder.bound_host == "127.0.0.1" and forwarder.port > 0
+            config_text = render_opencode_config(
+                endpoint,
+                api_base_url_override=forwarder.base_url,
+            )
+            opencode_config_path = out_dir / "opencode.json"
+            opencode_config_path.write_text(config_text)
+
+            real_home = Path.home()
+            before_snapshot = snapshot_host_opencode_dirs(real_home)
+            (out_dir / "host-state-before.txt").write_text(before_snapshot)
+
+            isolated_home = out_dir / ".home"
+            for subdir in (".config", ".local/share", ".cache", ".local/state"):
+                (isolated_home / subdir).mkdir(parents=True, exist_ok=True)
+
+            env = build_isolated_env(workspace_dir, isolated_home, opencode_config_path, endpoint)
+
+            network_samples: list[str] = []
+            non_localhost_lines: list[str] = []
+            unconnected_udp_lines: list[str] = []
+            observer_errors: list[str] = []
+            observer_warnings: list[str] = []
+            if not observer_available:
+                observer_errors.append("Required observer binary missing (lsof or pgrep not found on PATH)")
+
+            opencode_identity_intact = pinned_identity is not None
+            help_res, help_id_ok = run_identity_checked_command(
+                exec_opencode_bin,
+                pinned_identity,
+                lambda: run_sampled_command(
+                    help_cmd_wrapped,
+                    cwd=workspace_dir,
+                    env=env,
+                    timeout_s=30,
+                    label="help",
+                    network_samples=network_samples,
+                    non_localhost_lines=non_localhost_lines,
+                    unconnected_udp_lines=unconnected_udp_lines,
+                    observer_errors=observer_errors,
+                    observer_warnings=observer_warnings,
+                ),
+            )
+            opencode_identity_intact = opencode_identity_intact and help_id_ok
+            help_text = help_res["stdout"] + help_res["stderr"]
+            (out_dir / "opencode-help.txt").write_text(help_text)
+
+            required_flags_present = all(
+                flag in help_text for flag in ("--standalone", "--format", "--model")
+            )
+            if not required_flags_present:
+                summary = {
+                    "model_id": model_id,
+                    "repo": endpoint.served_model_id,
+                    "passed": False,
+                    "smoke_seatbelt_enforced": smoke_seatbelt_enforced,
+                    "reason": "opencode run --help missing required flags (--standalone, --format, --model)",
+                    "out_dir": str(out_dir.relative_to(ROOT)),
+                }
+                (out_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
+                print(json.dumps(summary, indent=2))
+                return 1
+
+            prompt = (
+                "/no_think Use your read tool to read target.txt in the current directory "
+                "and reply with the exact token inside."
+            )
+            cmd = [
+                exec_opencode_bin,
+                "run",
+                "--standalone",
+                "--format",
+                "json",
+                "-m",
+                "local_mlx/local_model",
+                prompt,
+            ]
+            run_cmd_wrapped, _, _ = wrap_command_with_smoke_seatbelt(cmd, seatbelt_profile)
+
+            serve_log_path = runs_dir / "serve.log"
+            serve_posts_before = _count_serve_log_chat_posts(serve_log_path)
+
+            run_res, run_id_ok = run_identity_checked_command(
+                exec_opencode_bin,
+                pinned_identity,
+                lambda: run_sampled_command(
+                    run_cmd_wrapped,
+                    cwd=workspace_dir,
+                    env=env,
+                    timeout_s=180,
+                    label="run",
+                    network_samples=network_samples,
+                    non_localhost_lines=non_localhost_lines,
+                    unconnected_udp_lines=unconnected_udp_lines,
+                    observer_errors=observer_errors,
+                    observer_warnings=observer_warnings,
+                ),
+            )
+            opencode_identity_intact = opencode_identity_intact and run_id_ok
+            serve_posts_after = _count_serve_log_chat_posts(serve_log_path)
+        finally:
+            forwarder.stop()
+
+        observed_opencode_version = resolve_smoke_observed_version(
+            exec_opencode_bin,
+            pinned_identity,
+            identity_intact=opencode_identity_intact,
+        )
 
     serve_log_delta = (
         (serve_posts_after - serve_posts_before)
@@ -1369,7 +1566,7 @@ def main(argv: list[str]) -> int:
         "model_id": model_id,
         "repo": endpoint.served_model_id,
         "endpoint": endpoint.api_base_url,
-        "opencode_version": "v2.0.32",
+        "opencode_version": observed_opencode_version,
         "exit_code": run_res["returncode"],
         "elapsed_seconds": run_res["elapsed"],
         "smoke_seatbelt_enforced": smoke_seatbelt_enforced,

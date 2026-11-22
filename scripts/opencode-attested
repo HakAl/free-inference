@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import os
+import sys
+
+sys.dont_write_bytecode = True
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+
 import argparse
 from collections.abc import Mapping, Sequence
 import contextlib
@@ -8,7 +14,6 @@ from datetime import datetime
 import hashlib
 import json
 import math
-import os
 try:
     import pwd
 except ImportError:  # pragma: no cover
@@ -17,13 +22,29 @@ import shlex
 import shutil
 import stat
 import subprocess
-import sys
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
 ROOT = Path(__file__).resolve().parents[1]
 VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
+_HAS_SITE_FLAG = any(
+    tok == "--launcher-site-packages" or tok.startswith("--launcher-site-packages=")
+    for tok in sys.argv[1:]
+)
+_IS_RO_EXPORT = not (ROOT / ".git").exists() and not os.access(ROOT, os.W_OK)
+_WAS_VENV_REEXEC = os.environ.pop("_LOCAL_ASSIST_VENV_REEXEC", None) == "1"
+_USE_VENV = (
+    not sys.flags.isolated
+    and not _HAS_SITE_FLAG
+    and not _IS_RO_EXPORT
+    and os.environ.get("LOCAL_ASSIST_WORKER_SANDBOX") != "1"
+    and not _WAS_VENV_REEXEC
+    and VENV_PYTHON.exists()
+    and os.access(VENV_PYTHON, os.X_OK)
+    and (ROOT / ".venv" / "pyvenv.cfg").is_file()
+    and Path(sys.prefix).resolve() != (ROOT / ".venv").resolve()
+)
 if __name__ == "__main__":
     _SENSITIVE_LAUNCH_ENV_KEYS = (
         "LOCAL_ASSIST_SESSION_TOKEN",
@@ -38,64 +59,92 @@ if __name__ == "__main__":
         if isinstance(_raw_tok, str) and _raw_tok.strip():
             _tok_bytes = _raw_tok.strip().encode("utf-8")
             if len(_tok_bytes) > 512:
-                print(
-                    "Refusing LOCAL_ASSIST_SESSION_TOKEN exceeding 512 bytes.",
-                    file=sys.stderr,
-                )
-                raise SystemExit(1)
-            _rfd, _wfd = os.pipe()
-            try:
-                os.write(_wfd, _tok_bytes)
-            finally:
-                os.close(_wfd)
-            os.set_inheritable(_rfd, True)
-            _clean_env["_FREE_INFERENCE_TOKEN_FD"] = str(_rfd)
+                _clean_env.pop("_FREE_INFERENCE_TOKEN_FD", None)
+                _clean_env["_FREE_INFERENCE_TOKEN_OVERSIZE"] = "1"
+            else:
+                _rfd, _wfd = os.pipe()
+                try:
+                    os.write(_wfd, _tok_bytes)
+                finally:
+                    os.close(_wfd)
+                os.set_inheritable(_rfd, True)
+                _clean_env["_FREE_INFERENCE_TOKEN_FD"] = str(_rfd)
         elif "_FREE_INFERENCE_TOKEN_FD" in _clean_env:
             try:
                 os.set_inheritable(int(_clean_env["_FREE_INFERENCE_TOKEN_FD"]), True)
             except (OSError, ValueError):
                 pass
-        _target_py = str(VENV_PYTHON) if VENV_PYTHON.exists() else sys.executable
+        if _USE_VENV:
+            _clean_env["_LOCAL_ASSIST_VENV_REEXEC"] = "1"
+            _target_py = str(VENV_PYTHON)
+            _reexec_flags = ["-B"]
+        else:
+            _target_py = sys.executable
+            _reexec_flags = ["-I", "-B"] if sys.flags.isolated else ["-B"]
         os.execve(
             _target_py,
-            [_target_py, str(Path(__file__).resolve()), *sys.argv[1:]],
+            [_target_py, *_reexec_flags, str(Path(__file__).resolve()), *sys.argv[1:]],
             _clean_env,
         )
-    if VENV_PYTHON.exists() and Path(sys.executable) != VENV_PYTHON:
+    if _USE_VENV and Path(sys.executable) != VENV_PYTHON:
         if "_FREE_INFERENCE_TOKEN_FD" in os.environ:
             try:
                 os.set_inheritable(int(os.environ["_FREE_INFERENCE_TOKEN_FD"]), True)
             except (OSError, ValueError):
                 pass
-        os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), __file__, *sys.argv[1:]])
+        os.environ["_LOCAL_ASSIST_VENV_REEXEC"] = "1"
+        os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), "-B", __file__, *sys.argv[1:]])
 
 sys.path.insert(0, str(ROOT))
+if __name__ == "__main__":
+    from local_assist.custody import bootstrap_entrypoint
+
+    bootstrap_entrypoint(ROOT, sys.argv, exit_on_error=False)
 
 from local_assist.client import check_private_coding_admission
+from local_assist.custody import (
+    PINNED_RUNS_STAT_ENV_VAR,
+    ensure_creatable_runs_dir,
+    format_pinned_runs_stat,
+    get_active_bootstrap_state,
+    inspect_existing_runs_dir,
+    is_custody_tree,
+    set_cli_runs_dir_override,
+    validate_creatable_runs_dir,
+)
 from local_assist.errors import LocalAssistError
 from local_assist.launch import (
     EXIT_MODEL_MISMATCH,
+    EXIT_SESSION_BLOCKED,
     INTERACTIVE_MIN_CHAT_REQUESTS,
     INTERACTIVE_MIN_MAX_TOKENS,
     INTERACTIVE_MIN_REQUEST_BYTES,
     SAFE_ENV_ALLOWLIST,
+    PreparedWorkerIdentity,
     add_common_launcher_arguments,
     allocate_side_by_side_port,
+    apply_inprocess_runs_dir_arg,
     build_isolated_opencode_env,
     check_endpoint_lifecycle_status,
     check_uncontained_legacy_home,
     classify_pid_identity,
+    cleanup_prepared_worker_identity,
     execute_worker_profile_session,
     is_port_owned_by_different_active_model,
     json_escape as _json_escape,
+    normalize_non_session_exit_code,
     pid_record_is_live_or_starting,
+    prepare_early_worker_manifest_from_argv,
     publish_and_run_opencode,
     resolve_active_security_profile as _resolve_active_security_profile,
+    resolve_opencode_binary,
     split_launcher_argv,
     sync_and_run_opencode,
     validate_common_worker_flags,
     validate_worker_binary_and_args,
+    write_launcher_exit_diagnostic,
 )
+from local_assist.proc_identity import reap_worker_from_manifest
 from local_assist.registry import (
     ATTESTED_ENCLAVE_TIERS,
     DATA_CONTROL_RUNGS,
@@ -104,6 +153,7 @@ from local_assist.registry import (
     EndpointConfig,
     RegistryError,
     SESSION_TOKEN_ENV_VAR,
+    _effective_runs_dir,
     is_model_effectively_deprecated,
     load_model,
     load_models,
@@ -143,9 +193,18 @@ LOCAL_ASSIST_BASE_URL_ENV_VAR = "FREE_INFERENCE_LOCAL_ASSIST_BASE_URL"
 
 
 def _consume_handoff_token() -> tuple[bool, str | None, str | None]:
+    oversize_flag = os.environ.pop("_FREE_INFERENCE_TOKEN_OVERSIZE", None)
     raw_fd = os.environ.pop("_FREE_INFERENCE_TOKEN_FD", None)
     os.environ.pop("OPENCODE_PASSWORD", None)
     os.environ.pop("OPENCODE_SERVER_PASSWORD", None)
+    if oversize_flag == "1":
+        os.environ.pop("LOCAL_ASSIST_SESSION_TOKEN", None)
+        if raw_fd is not None:
+            try:
+                os.close(int(raw_fd))
+            except (OSError, ValueError):
+                pass
+        return False, None, "Refusing LOCAL_ASSIST_SESSION_TOKEN exceeding 512 bytes."
     if raw_fd is not None:
         os.environ.pop("LOCAL_ASSIST_SESSION_TOKEN", None)
         try:
@@ -174,6 +233,8 @@ def _consume_handoff_token() -> tuple[bool, str | None, str | None]:
 
     if "LOCAL_ASSIST_SESSION_TOKEN" in os.environ:
         inproc_tok = os.environ.pop("LOCAL_ASSIST_SESSION_TOKEN", "").strip()
+        if inproc_tok and len(inproc_tok.encode("utf-8")) > 512:
+            return False, None, "Refusing LOCAL_ASSIST_SESSION_TOKEN exceeding 512 bytes."
         return True, (inproc_tok or None), None
 
     return True, None, None
@@ -719,6 +780,8 @@ def check_session_spend_ceiling(
 def _extract_attached_session_caps(
     endpoint: EndpointConfig,
     active_rec: dict[str, Any] | None,
+    *,
+    runs_dir: Path | None = None,
 ) -> tuple[int, int, int, int]:
     if not isinstance(active_rec, dict):
         raise LocalAssistError(
@@ -733,8 +796,7 @@ def _extract_attached_session_caps(
     raw_ttl = active_rec.get("ttl_seconds")
     # A renewal changes the live window without rewriting the launch record.
     from local_assist.session import status_for_record
-    from local_assist.registry import _effective_runs_dir
-    live = (status_for_record(active_rec, _effective_runs_dir())
+    live = (status_for_record(active_rec, _effective_runs_dir(runs_dir))
             if active_rec.get('model_id') and active_rec.get('repo') else {'state': 'UNKNOWN'})
     if live['state'] == 'ON':
         raw_ttl = live['window_seconds']
@@ -931,6 +993,7 @@ def build_private_attested_env(
         "OPENCODE_PASSWORD",
         "OPENCODE_SERVER_PASSWORD",
         "_FREE_INFERENCE_TOKEN_FD",
+        "_FREE_INFERENCE_TOKEN_OVERSIZE",
         "LOCAL_ASSIST_ALLOW_ATTESTED_TEE",
         "LOCAL_ASSIST_ALLOW_UNCLEARED_TEE",
     ):
@@ -950,14 +1013,18 @@ def ensure_model_served(
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
     stream_timeout_seconds: int = DEFAULT_STREAM_TIMEOUT_SECONDS,
     max_session_usd: float | None = DEFAULT_MAX_SESSION_USD,
+    inherit_attached_session_caps: bool = False,
     explicit_port: int | None = None,
     explicit_cap_flags: Any = (),
     thinking: bool = False,
     explicit_thinking: bool = False,
     handoff_token: str | None = None,
     runs_dir: Path | None = None,
-    run_cmd: Any = subprocess.run,
+    publish_pointer: bool | None = None,
+    run_cmd: Any = None,
 ) -> tuple[bool, str | None, dict[str, Any] | None]:
+    use_default_runner = run_cmd is None
+    actual_run_cmd = subprocess.run if use_default_runner else run_cmd
     if refresh_session and no_serve:
         return (
             False,
@@ -982,42 +1049,118 @@ def ensure_model_served(
     serve_script = str(ROOT / "scripts" / "serve-model")
     stop_script = str(ROOT / "scripts" / "stop-model")
 
+    try:
+        eff_runs_dir = _effective_runs_dir(runs_dir)
+    except RegistryError as exc:
+        return False, str(exc), None
+    st_boot = get_active_bootstrap_state()
+    in_custody = (st_boot is not None and st_boot.custody_mode) or is_custody_tree(ROOT)
+    pinned_stat: tuple[int, int] | None = None
+    if use_default_runner and not in_custody:
+        if st_boot is not None and st_boot.cli_runs_dir is not None:
+            ex_init, ex_err = inspect_existing_runs_dir(
+                eff_runs_dir,
+                expected_stat=st_boot.cli_runs_stat,
+                label="--runs-dir",
+            )
+            if ex_err is not None or ex_init is None or ex_init.stat_id is None:
+                return False, ex_err or "Invalid --runs-dir.", None
+            eff_runs_dir = ex_init.path
+            pinned_stat = ex_init.stat_id
+        else:
+            v_init, v_err = validate_creatable_runs_dir(
+                eff_runs_dir,
+                label="FREE_INFERENCE_RUNS_DIR",
+            )
+            if v_err is not None or v_init is None:
+                return False, v_err or "Invalid session store directory.", None
+            eff_runs_dir = v_init.path
+            pinned_stat = v_init.stat_id
+    should_publish_pointer = (
+        (not in_custody and bool(publish_pointer))
+        if publish_pointer is not None
+        else (
+            not in_custody
+            and (st_boot is None or st_boot.cli_runs_dir is None)
+            and runs_dir is None
+            and (
+                True
+                if (st_boot is not None and st_boot.worker_or_reap_cli)
+                else not bool(os.environ.get("FREE_INFERENCE_RUNS_DIR", "").strip())
+            )
+        )
+    )
+
+    def _is_python_entrypoint(script_path: str) -> bool:
+        try:
+            with open(script_path, "rb") as fh:
+                head = fh.readline(128)
+            return head.startswith(b"#!") and b"python" in head
+        except OSError:
+            return True
+
     def _invoke_verify(verify_cmd_args: list[str]) -> Any:
-        if handoff_token and run_cmd is subprocess.run:
-            rfd, wfd = os.pipe()
-            try:
-                os.write(wfd, handoff_token.encode("utf-8"))
-            finally:
-                os.close(wfd)
-            try:
-                verify_env = dict(os.environ)
-                verify_env.pop(SESSION_TOKEN_ENV_VAR, None)
-                verify_env.pop("OPENCODE_PASSWORD", None)
-                verify_env.pop("OPENCODE_SERVER_PASSWORD", None)
-                verify_env["_FREE_INFERENCE_TOKEN_FD"] = str(rfd)
-                return run_cmd(
-                    verify_cmd_args,
-                    cwd=str(ROOT),
-                    env=verify_env,
-                    pass_fds=(rfd,),
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-            finally:
+        eff_verify_args = verify_cmd_args
+        if use_default_runner:
+            extra_v: list[str] = []
+            if st_boot is not None and st_boot.launcher_site_packages is not None:
+                extra_v.extend(["--launcher-site-packages", str(st_boot.launcher_site_packages)])
+            if not in_custody:
+                extra_v.extend(["--runs-dir", str(eff_runs_dir)])
+                if pinned_stat is None:
+                    extra_v.append("--allow-absent-runs-dir")
+            if _is_python_entrypoint(verify_cmd_args[0]):
+                eff_verify_args = [sys.executable, "-B", verify_cmd_args[0], *extra_v, *verify_cmd_args[1:]]
+            else:
+                eff_verify_args = [verify_cmd_args[0], *extra_v, *verify_cmd_args[1:]]
+            verify_env = dict(os.environ)
+            if not in_custody and pinned_stat is not None:
+                verify_env[PINNED_RUNS_STAT_ENV_VAR] = format_pinned_runs_stat(pinned_stat)
+            else:
+                verify_env.pop(PINNED_RUNS_STAT_ENV_VAR, None)
+            if handoff_token:
+                rfd, wfd = os.pipe()
                 try:
-                    os.close(rfd)
-                except OSError:
-                    pass
-        return run_cmd(
-            verify_cmd_args,
+                    os.write(wfd, handoff_token.encode("utf-8"))
+                finally:
+                    os.close(wfd)
+                try:
+                    verify_env.pop(SESSION_TOKEN_ENV_VAR, None)
+                    verify_env.pop("OPENCODE_PASSWORD", None)
+                    verify_env.pop("OPENCODE_SERVER_PASSWORD", None)
+                    verify_env.pop("_FREE_INFERENCE_TOKEN_OVERSIZE", None)
+                    verify_env["_FREE_INFERENCE_TOKEN_FD"] = str(rfd)
+                    return actual_run_cmd(
+                        eff_verify_args,
+                        cwd=str(ROOT),
+                        env=verify_env,
+                        pass_fds=(rfd,),
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                finally:
+                    try:
+                        os.close(rfd)
+                    except OSError:
+                        pass
+            return actual_run_cmd(
+                eff_verify_args,
+                cwd=str(ROOT),
+                env=verify_env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        return actual_run_cmd(
+            eff_verify_args,
             cwd=str(ROOT),
             capture_output=True,
             text=True,
             check=False,
         )
 
-    pre_refresh_rec = read_pid_record_for_model(endpoint.model_id, runs_dir)
+    pre_refresh_rec = read_pid_record_for_model(endpoint.model_id, eff_runs_dir)
     rec_port_val = (pre_refresh_rec or {}).get("port")
     if explicit_port is not None:
         target_port: int | None = explicit_port
@@ -1042,12 +1185,13 @@ def ensure_model_served(
         initial_verify_cmd.extend(["--port", str(target_port)])
     initial = _invoke_verify(initial_verify_cmd)
     if initial.returncode == 0 and not refresh_session:
-        active_rec = read_pid_record_for_model(endpoint.model_id, runs_dir)
+        active_rec = read_pid_record_for_model(endpoint.model_id, eff_runs_dir)
         try:
             rec_max_reqs, rec_max_bytes, rec_max_tokens, rec_ttl = (
                 _extract_attached_session_caps(
                     endpoint,
                     active_rec,
+                    runs_dir=eff_runs_dir,
                 )
             )
             if rec_max_bytes < MIN_ATTACHED_REQUEST_BYTES:
@@ -1063,10 +1207,14 @@ def ensure_model_served(
                         "max_request_bytes": rec_max_bytes,
                     },
                 )
+            exp_caps = explicit_cap_flags or ()
+            check_reqs = (not inherit_attached_session_caps) or ("max_chat_requests" in exp_caps)
+            check_toks = (not inherit_attached_session_caps) or ("max_tokens_cap" in exp_caps)
+            check_bytes = (not inherit_attached_session_caps) or ("max_request_bytes" in exp_caps)
             if (
-                rec_max_reqs > max_chat_requests
-                or rec_max_tokens > max_tokens_cap
-                or rec_max_bytes > max_request_bytes
+                (check_reqs and rec_max_reqs > max_chat_requests)
+                or (check_toks and rec_max_tokens > max_tokens_cap)
+                or (check_bytes and rec_max_bytes > max_request_bytes)
                 or rec_ttl > attach_ttl_ceiling
             ):
                 raise LocalAssistError(
@@ -1163,14 +1311,14 @@ def ensure_model_served(
         owned_by_other, owner_mid = is_port_owned_by_different_active_model(
             endpoint.model_id,
             check_port,
-            runs_dir=runs_dir,
+            runs_dir=eff_runs_dir,
         )
         if owned_by_other and not no_serve and explicit_port is None:
             try:
                 target_port = allocate_side_by_side_port(
                     check_port,
                     uses_upstream_port=True,
-                    runs_dir=runs_dir,
+                    runs_dir=eff_runs_dir,
                 )
             except LocalAssistError as exc:
                 return False, str(exc), None
@@ -1198,14 +1346,42 @@ def ensure_model_served(
     if refresh_session and (
         initial.returncode == 0
         or pre_refresh_rec is not None
-        or read_pid_record_for_model(endpoint.model_id, runs_dir) is not None
+        or read_pid_record_for_model(endpoint.model_id, eff_runs_dir) is not None
     ):
-        stop_res = run_cmd(
-            [stop_script, endpoint.model_id],
+        stop_cmd = [stop_script, endpoint.model_id]
+        stop_extra_kw: dict[str, Any] = {}
+        if not in_custody:
+            if use_default_runner:
+                if (st_boot is not None and st_boot.cli_runs_dir is not None) or pinned_stat is not None:
+                    ex_stop, stop_v_err = inspect_existing_runs_dir(
+                        eff_runs_dir,
+                        expected_stat=pinned_stat,
+                        label="--runs-dir",
+                    )
+                else:
+                    ex_stop, stop_v_err = ensure_creatable_runs_dir(
+                        eff_runs_dir,
+                        label="--runs-dir",
+                    )
+                if stop_v_err is not None or ex_stop is None or ex_stop.stat_id is None:
+                    return (
+                        False,
+                        stop_v_err or "Cannot validate session store directory.",
+                        None,
+                    )
+                eff_runs_dir = ex_stop.path
+                pinned_stat = ex_stop.stat_id
+                stop_env = dict(os.environ)
+                stop_env[PINNED_RUNS_STAT_ENV_VAR] = format_pinned_runs_stat(pinned_stat)
+                stop_extra_kw["env"] = stop_env
+            stop_cmd.extend(["--runs-dir", str(eff_runs_dir)])
+        stop_res = actual_run_cmd(
+            stop_cmd,
             cwd=str(ROOT),
             capture_output=True,
             text=True,
             check=False,
+            **stop_extra_kw,
         )
         if stop_res.returncode != 0:
             stop_err = (stop_res.stderr or stop_res.stdout or "").strip()
@@ -1243,29 +1419,59 @@ def ensure_model_served(
         serve_cmd.append("--thinking")
     if effective_refresh:
         serve_cmd.append("--refresh-session")
-    serve_res = run_cmd(
+    serve_extra_kw: dict[str, Any] = {}
+    if not in_custody:
+        if use_default_runner:
+            if st_boot is not None and st_boot.cli_runs_dir is not None:
+                srv_res, srv_v_err = inspect_existing_runs_dir(
+                    eff_runs_dir,
+                    expected_stat=pinned_stat,
+                    label="--runs-dir",
+                )
+            else:
+                srv_res, srv_v_err = ensure_creatable_runs_dir(
+                    eff_runs_dir,
+                    expected_stat=pinned_stat,
+                    label="--runs-dir",
+                )
+            if srv_v_err is not None or srv_res is None or srv_res.stat_id is None:
+                return False, srv_v_err or "Cannot prepare session store directory.", None
+            eff_runs_dir = srv_res.path
+            pinned_stat = srv_res.stat_id
+            serve_env = dict(os.environ)
+            serve_env[PINNED_RUNS_STAT_ENV_VAR] = format_pinned_runs_stat(pinned_stat)
+            serve_extra_kw["env"] = serve_env
+        serve_cmd.extend(["--runs-dir", str(eff_runs_dir)])
+        if should_publish_pointer:
+            serve_cmd.append("--publish-active-runs")
+    serve_res = actual_run_cmd(
         serve_cmd,
         cwd=str(ROOT),
         capture_output=True,
         text=True,
         check=False,
+        **serve_extra_kw,
     )
     if serve_res.returncode != 0:
         serve_err = (serve_res.stderr or serve_res.stdout or "").strip()
         return False, f"Failed to start model '{endpoint.model_id}': {serve_err}", None
+    for warn_line in (serve_res.stderr or "").splitlines():
+        if warn_line.lstrip().startswith("WARNING:"):
+            print(warn_line, file=sys.stderr)
 
     wait_verify_cmd = [verify_script, endpoint.model_id, "--wait", str(wait_seconds)]
     if target_port is not None:
         wait_verify_cmd.extend(["--port", str(target_port)])
     wait_res = _invoke_verify(wait_verify_cmd)
     if wait_res.returncode == 0:
-        active_rec = read_pid_record_for_model(endpoint.model_id, runs_dir)
+        active_rec = read_pid_record_for_model(endpoint.model_id, eff_runs_dir)
         if active_rec is not None:
             try:
                 rec_max_reqs, rec_max_bytes, rec_max_tokens, rec_ttl = (
                     _extract_attached_session_caps(
                         endpoint,
                         active_rec,
+                        runs_dir=eff_runs_dir,
                     )
                 )
             except LocalAssistError as exc:
@@ -1319,6 +1525,7 @@ def ensure_model_served(
 
 def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     parser = argparse.ArgumentParser(
+        allow_abbrev=False,
         description=(
             "Launch opencode against a Rung 2/3 private-attested enclave proxy "
             "(attesting proxy + se-key-proxy) with isolated state, project-config "
@@ -1397,6 +1604,12 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
         help="Optional maximum worst-case session spend in USD permitted before launch (when omitted, prints pricing and caps without blocking interactive launch).",
     )
     parser.add_argument(
+        "--inherit-session-caps",
+        action="store_true",
+        default=False,
+        help="Inherit finite request, token, byte, and window bounds from the attached se-key-proxy session in unattended worker mode without --max-session-usd.",
+    )
+    parser.add_argument(
         "--thinking",
         action="store_true",
         default=False,
@@ -1432,15 +1645,194 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     return args, opencode_args
 
 
-def main(argv: list[str]) -> int:
-    tok_ok, handoff_token, tok_err = _consume_handoff_token()
-    if not tok_ok:
-        print(tok_err or "Failed to consume handoff token.", file=sys.stderr)
+_write_launcher_exit_diagnostic = write_launcher_exit_diagnostic
+
+
+def _emit_session_blocked_exit(
+    args: argparse.Namespace,
+    reason: str,
+    message: str,
+) -> int:
+    print(message, file=sys.stderr)
+    raw_exit_file = getattr(args, "launcher_exit_file", None)
+    if raw_exit_file is not None:
+        raw_tok = getattr(args, "run_token", None) or ""
+        if not _write_launcher_exit_diagnostic(
+            raw_exit_file,
+            run_token=raw_tok,
+            reason=reason,
+        ):
+            print(
+                f"Failed to write atomic 0600 launcher diagnostic to '{raw_exit_file}'; failing closed with exit 1.",
+                file=sys.stderr,
+            )
+            return 1
+    return EXIT_SESSION_BLOCKED
+
+
+def _precheck_worker_attached_session(
+    *,
+    args: argparse.Namespace,
+    model_id: str,
+    endpoint_port: int | None,
+    inherit_caps: bool,
+    handoff_token: str | None,
+    runs_dir: Path | None = None,
+) -> int | None:
+    """Return None to continue, EXIT_SESSION_BLOCKED (4) on verified session failure, or 1 on unverified error."""
+    from local_assist.session import status_for_record
+
+    session_runs = _effective_runs_dir(runs_dir)
+    if endpoint_port is not None:
+        owned_by_other, _ = is_port_owned_by_different_active_model(
+            model_id,
+            int(endpoint_port),
+            runs_dir=session_runs,
+        )
+        if owned_by_other:
+            return None
+
+    rec = read_pid_record_for_model(model_id, session_runs)
+    if rec is None:
+        if handoff_token and not inherit_caps:
+            return None
+        return _emit_session_blocked_exit(
+            args,
+            "opencode_session_unavailable",
+            f"No active attested session record found for '{model_id}'.",
+        )
+
+    raw_pid = rec.get("pid")
+    has_pid = isinstance(raw_pid, int) and not isinstance(raw_pid, bool) and raw_pid > 0
+    pid_state = classify_pid_identity(raw_pid, rec.get("pid_lstart")) if has_pid else "none"
+    up_pid = rec.get("upstream_pid")
+    has_up = isinstance(up_pid, int) and not isinstance(up_pid, bool) and up_pid > 0
+    up_state = classify_pid_identity(up_pid, rec.get("upstream_pid_lstart")) if has_up else "none"
+
+    if rec.get("status") == "starting":
+        if (has_pid and pid_state in ("dead", "reused")) or (
+            has_up and up_state in ("dead", "reused")
+        ):
+            return _emit_session_blocked_exit(
+                args,
+                "opencode_session_unavailable",
+                f"Attested session process for '{model_id}' exited before becoming ready.",
+            )
+        print(
+            f"Attested session for '{model_id}' is still starting (status='starting'); refusing unattended attach.",
+            file=sys.stderr,
+        )
         return 1
 
-    caller_cwd = Path.cwd()
-    args, opencode_args = parse_args(argv)
+    if not has_pid:
+        print(f"Malformed session record for '{model_id}': missing pid.", file=sys.stderr)
+        return 1
+    if pid_state in ("dead", "reused") or (has_up and up_state in ("dead", "reused")):
+        return _emit_session_blocked_exit(
+            args,
+            "opencode_session_unavailable",
+            f"Attested session process for '{model_id}' is no longer running.",
+        )
+    if pid_state != "matched" or (has_up and up_state != "matched"):
+        print(
+            f"Attested session process identity for '{model_id}' is unverifiable; refusing attach.",
+            file=sys.stderr,
+        )
+        return 1
 
+    live_info = status_for_record(rec, session_runs)
+    state = live_info.get("state")
+    if state == "OFF" or (state == "ON" and int(live_info.get("remaining_seconds", 0)) <= 0):
+        return _emit_session_blocked_exit(
+            args,
+            "opencode_session_unavailable",
+            f"Attested session authorization window for '{model_id}' is OFF or expired.",
+        )
+    if state == "ON" and int(live_info.get("requests_remaining", 0)) <= 0:
+        return _emit_session_blocked_exit(
+            args,
+            "opencode_session_caps_exhausted",
+            f"Attested session chat request budget for '{model_id}' is exhausted (0 remaining).",
+        )
+    if inherit_caps and state != "ON" and not handoff_token:
+        print(
+            f"Attested session control state for '{model_id}' is '{state}' (verified ON lease required when inherit_attached_session_caps=true); refusing attach.",
+            file=sys.stderr,
+        )
+        return 1
+    return None
+
+
+def main(argv: list[str]) -> int:
+    prep_ok, prepared_identity, prep_err = prepare_early_worker_manifest_from_argv(argv)
+    if not prep_ok:
+        _consume_handoff_token()
+        print(prep_err or "Failed to prepare worker manifest.", file=sys.stderr)
+        return 1
+
+    ownership_transferred = {"v": False}
+    prev_boot = get_active_bootstrap_state()
+    inproc_runs_set = False
+    try:
+        if prev_boot is not None and prev_boot.bootstrap_error is not None:
+            _consume_handoff_token()
+            print(prev_boot.bootstrap_error, file=sys.stderr)
+            return 1
+
+        tok_ok, handoff_token, tok_err = _consume_handoff_token()
+        if not tok_ok:
+            print(tok_err or "Failed to consume handoff token.", file=sys.stderr)
+            return 1
+
+        caller_cwd = Path.cwd()
+        try:
+            args, opencode_args = parse_args(argv)
+        except SystemExit as exc:
+            code = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
+            return normalize_non_session_exit_code(code)
+
+        if getattr(args, "reap_worker", None):
+            return normalize_non_session_exit_code(
+                reap_worker_from_manifest(
+                    args.reap_worker,
+                    reap_timeout_sec=float(getattr(args, "reap_timeout", 10.0)),
+                )
+            )
+
+        if getattr(args, "runs_dir", None) is not None:
+            runs_err = apply_inprocess_runs_dir_arg(args)
+            if runs_err is not None:
+                print(runs_err, file=sys.stderr)
+                return 1
+            inproc_runs_set = True
+
+        return _main_inner_attested(
+            args,
+            opencode_args,
+            caller_cwd,
+            handoff_token,
+            prepared_identity=prepared_identity,
+            ownership_callback=lambda: ownership_transferred.__setitem__("v", True),
+        )
+    finally:
+        if inproc_runs_set:
+            set_cli_runs_dir_override(
+                prev_boot.cli_runs_dir if prev_boot is not None else None,
+                runs_stat=prev_boot.cli_runs_stat if prev_boot is not None else None,
+            )
+        if not ownership_transferred["v"]:
+            cleanup_prepared_worker_identity(prepared_identity)
+
+
+def _main_inner_attested(
+    args: argparse.Namespace,
+    opencode_args: list[str],
+    caller_cwd: Path,
+    handoff_token: str | None,
+    *,
+    prepared_identity: PreparedWorkerIdentity | None = None,
+    ownership_callback: Any = None,
+) -> int:
     try:
         active_profile = _resolve_active_security_profile(args)
     except SecurityProfileError as exc:
@@ -1457,21 +1849,27 @@ def main(argv: list[str]) -> int:
         if active_profile is not None
         else args.allow_uncleared_model
     )
+    inherit_caps = bool(
+        getattr(args, "inherit_session_caps", False)
+        or (active_profile is not None and active_profile.spend_inherit_attached_session_caps)
+    )
     effective_max_session_usd = (
         args.max_session_usd
         if args.max_session_usd is not None
         else (active_profile.spend_max_session_usd if active_profile is not None else None)
     )
-    if active_profile is not None and (
-        effective_max_session_usd is None
-        or isinstance(effective_max_session_usd, bool)
-        or not isinstance(effective_max_session_usd, (int, float))
-        or not math.isfinite(float(effective_max_session_usd))
-        or float(effective_max_session_usd) <= 0
-    ):
+    has_valid_usd_ceiling = (
+        effective_max_session_usd is not None
+        and not isinstance(effective_max_session_usd, bool)
+        and isinstance(effective_max_session_usd, (int, float))
+        and math.isfinite(float(effective_max_session_usd))
+        and float(effective_max_session_usd) > 0
+    )
+    if active_profile is not None and not has_valid_usd_ceiling and not inherit_caps:
         print(
-            "Unattended worker mode on private-attested requires an explicit spend ceiling (finite positive USD): "
-            "pass --max-session-usd <usd> or set spend.max_session_usd in the security profile.",
+            "Unattended worker mode on private-attested requires an explicit spend ceiling (finite positive USD) "
+            "or spend.inherit_attached_session_caps: true: pass --max-session-usd <usd>, set spend.max_session_usd, "
+            "or set spend.inherit_attached_session_caps: true in the security profile.",
             file=sys.stderr,
         )
         return 1
@@ -1539,11 +1937,33 @@ def main(argv: list[str]) -> int:
             print(legacy_err, file=sys.stderr)
             return 1
 
+    st_main = get_active_bootstrap_state()
+    in_custody_main = (st_main is not None and st_main.custody_mode) or is_custody_tree(ROOT)
+    launcher_should_publish_pointer = (
+        not in_custody_main
+        and (st_main is None or st_main.cli_runs_dir is None)
+        and getattr(args, "runs_dir", None) is None
+        and (
+            True
+            if (st_main is not None and st_main.worker_or_reap_cli)
+            else not bool(os.environ.get("FREE_INFERENCE_RUNS_DIR", "").strip())
+        )
+    )
     try:
+        session_runs = _effective_runs_dir()
+        if not in_custody_main and getattr(args, "runs_dir", None) is None:
+            v_sr, sr_err = validate_creatable_runs_dir(
+                session_runs,
+                label="FREE_INFERENCE_RUNS_DIR",
+            )
+            if sr_err is not None or v_sr is None:
+                print(sr_err or "Invalid session store directory.", file=sys.stderr)
+                return 1
+            session_runs = v_sr.path
         local_assist_base_url, local_assist_port = _resolve_local_assist_base_url()
-        model_id = args.model or resolve_default_attested_model_id()
+        model_id = args.model or resolve_default_attested_model_id(runs_dir=session_runs)
         model = load_model(model_id)
-        initial_pid_record = read_pid_record_for_model(model_id)
+        initial_pid_record = read_pid_record_for_model(model_id, session_runs)
         if args.port is not None and isinstance(initial_pid_record, dict):
             init_active, init_unavail = pid_record_is_live_or_starting(initial_pid_record)
             existing_port = initial_pid_record.get("port")
@@ -1575,7 +1995,10 @@ def main(argv: list[str]) -> int:
         print(str(exc), file=sys.stderr)
         return 1
 
-    opencode_bin: str | None = shutil.which("opencode")
+    opencode_bin, oc_bin_err = resolve_opencode_binary(args)
+    if oc_bin_err is not None:
+        print(oc_bin_err, file=sys.stderr)
+        return 1
     if not args.print_config and not opencode_bin:
         print("opencode binary not found on PATH", file=sys.stderr)
         return 1
@@ -1594,6 +2017,18 @@ def main(argv: list[str]) -> int:
         print(worker_err or "Worker preflight validation failed", file=sys.stderr)
         return 1
 
+    if active_profile is not None or getattr(args, "launcher_exit_file", None) is not None:
+        pre_rc = _precheck_worker_attached_session(
+            args=args,
+            model_id=model_id,
+            endpoint_port=endpoint_pre.port,
+            inherit_caps=inherit_caps,
+            handoff_token=handoff_token,
+            runs_dir=session_runs,
+        )
+        if pre_rc is not None:
+            return pre_rc
+
     ok, err_msg, session_meta = ensure_model_served(
         endpoint_pre,
         no_serve=effective_no_serve,
@@ -1605,11 +2040,14 @@ def main(argv: list[str]) -> int:
         ttl_seconds=eff_ttl,
         stream_timeout_seconds=args.stream_timeout_seconds,
         max_session_usd=effective_max_session_usd,
+        inherit_attached_session_caps=inherit_caps,
         explicit_port=args.port,
         explicit_cap_flags=getattr(args, "explicit_cap_flags", ()),
         thinking=bool(getattr(args, "thinking", False)),
         explicit_thinking=bool(getattr(args, "explicit_thinking", False)),
         handoff_token=handoff_token,
+        runs_dir=session_runs,
+        publish_pointer=launcher_should_publish_pointer,
     )
     if not ok or session_meta is None:
         print(err_msg or "Failed to verify served model", file=sys.stderr)
@@ -1618,7 +2056,7 @@ def main(argv: list[str]) -> int:
         return 1
 
     try:
-        active_pid_record = read_pid_record_for_model(model_id)
+        active_pid_record = read_pid_record_for_model(model_id, session_runs)
         post_port_override = (
             (session_meta.get("allocated_port") or args.port)
             if active_pid_record is None
@@ -1641,8 +2079,6 @@ def main(argv: list[str]) -> int:
         return 1
 
     from local_assist.session import SessionLeaseSupplier, status_for_record, control_path, control_node_present
-    from local_assist.registry import _effective_runs_dir
-    session_runs = _effective_runs_dir()
     lease_supplier = None
     if isinstance(active_pid_record, dict):
         session_meta['live_status'] = status_for_record(active_pid_record, session_runs)
@@ -1712,6 +2148,20 @@ def main(argv: list[str]) -> int:
         )
         if "ttl_seconds" in args.explicit_cap_flags:
             worker_ttl = min(worker_ttl, eff_ttl)
+
+        relay_max_reqs = int(session_meta["max_chat_requests"])
+        live_st = session_meta.get("live_status")
+        if (
+            inherit_caps
+            and isinstance(live_st, dict)
+            and live_st.get("state") == "ON"
+            and isinstance(live_st.get("requests_remaining"), int)
+            and int(live_st["requests_remaining"]) > 0
+        ):
+            relay_max_reqs = min(relay_max_reqs, int(live_st["requests_remaining"]))
+        if "max_chat_requests" in args.explicit_cap_flags:
+            relay_max_reqs = min(relay_max_reqs, eff_max_reqs)
+
         def _build_att_base_cfg(relay: _WorkerTokenRelay | None) -> dict[str, Any]:
             assert relay is not None
             base_config_text = render_private_attested_config(
@@ -1731,7 +2181,24 @@ def main(argv: list[str]) -> int:
             base_cfg["provider"]["private-attested"]["options"]["apiKey"] = relay.relay_token
             return base_cfg
 
-        return execute_worker_profile_session(
+        observed_relays: list[Any] = []
+
+        def _make_worker_relay() -> _WorkerTokenRelay:
+            r = _WorkerTokenRelay(
+                upstream_base_url=endpoint.api_base_url,
+                upstream_session_token=endpoint.api_key,
+                max_chat_requests=relay_max_reqs,
+                max_request_bytes=sess_bytes_cap,
+                max_tokens_cap=sess_tokens_cap,
+                ttl_seconds=float(worker_ttl),
+                upstream_timeout_seconds=float(args.stream_timeout_seconds),
+                default_chat_params=session_default_chat_params,
+                lease_provider=lease_supplier,
+            )
+            observed_relays.append(r)
+            return r
+
+        rc_worker = execute_worker_profile_session(
             active_profile=active_profile,
             args=args,
             caller_cwd=caller_cwd,
@@ -1755,23 +2222,38 @@ def main(argv: list[str]) -> int:
                 "isolated_home": str(iso_home),
                 "config": compiled_cfg,
             },
-            relay_factory=lambda: _WorkerTokenRelay(
-                upstream_base_url=endpoint.api_base_url,
-                upstream_session_token=endpoint.api_key,
-                max_chat_requests=int(session_meta["max_chat_requests"]),
-                max_request_bytes=sess_bytes_cap,
-                max_tokens_cap=sess_tokens_cap,
-                ttl_seconds=float(worker_ttl),
-                upstream_timeout_seconds=float(args.stream_timeout_seconds),
-                default_chat_params=session_default_chat_params,
-                lease_provider=lease_supplier,
-            ),
+            relay_factory=_make_worker_relay,
             upstream_port=upstream_port_val,
             endpoint_port=endpoint.port,
             local_assist_port=local_assist_port,
             use_token_relay=True,
             allocate_worker_home_fn=allocate_worker_home,
+            prepared_identity=prepared_identity,
+            ownership_callback=ownership_callback,
         )
+        if rc_worker != 0 and rc_worker < 128 and not getattr(args, "print_config", False):
+            relay_cap_hit = any(
+                bool(
+                    getattr(r, "local_request_cap_exhausted", False)
+                    or getattr(r, "upstream_session_cap_exhausted", False)
+                )
+                for r in observed_relays
+            )
+            post_exhausted = False
+            if not relay_cap_hit and isinstance(active_pid_record, dict):
+                post_live = status_for_record(active_pid_record, session_runs)
+                if (
+                    post_live.get("state") == "ON"
+                    and int(post_live.get("requests_remaining", 1)) <= 0
+                ):
+                    post_exhausted = True
+            if relay_cap_hit or post_exhausted:
+                return _emit_session_blocked_exit(
+                    args,
+                    "opencode_session_caps_exhausted",
+                    f"Attested session chat request budget for '{endpoint.model_id}' was exhausted during execution.",
+                )
+        return normalize_non_session_exit_code(rc_worker)
 
     isolated_home = (
         prechecked_isolated_home
@@ -1799,58 +2281,60 @@ def main(argv: list[str]) -> int:
         "startup_nonce": (active_pid_record or {}).get("startup_nonce"),
         "token_sha256": token_sha,
     }
-    return publish_and_run_opencode(
-        opencode_bin=opencode_bin,
-        opencode_args=opencode_args,
-        caller_cwd=caller_cwd,
-        isolated_home=isolated_home,
-        endpoint=endpoint,
-        config_text=config_text,
-        build_env_fn=lambda cfg_path: build_private_attested_env(
-            caller_cwd,
-            isolated_home,
-            cfg_path,
-            endpoint,
-            local_assist_base_url=local_assist_base_url,
-            preserve_host_home=args.preserve_host_home,
-        ),
-        current_sync=current_sync,
-        print_config=bool(args.print_config),
-        build_print_config_payload_fn=lambda cfg_path, parsed_cfg: {
-            "model_id": endpoint.model_id,
-            "served_model_id": endpoint.served_model_id,
-            "trust_tier": endpoint.trust_tier,
-            "data_control_rung": endpoint.data_control_rung,
-            "usage_policy": endpoint.usage_policy,
-            "api_base_url": endpoint.api_base_url,
-            "session_token": "<redacted-se-session-token>",
-            "session_caps": session_meta,
-            "opencode_config_path": str(cfg_path),
-            "isolated_home": str(isolated_home),
-            "config": parsed_cfg,
-        },
-        relay_factory=lambda svc_pw: SessionAuthRelay(
-            upstream_base_url=endpoint.api_base_url,
-            upstream_session_token=endpoint.api_key,
-            token_prefix="oc-relay",
-            extra_canary_secrets=[svc_pw],
-            max_chat_requests=int(session_meta["max_chat_requests"]),
-            max_request_bytes=sess_bytes_cap,
-            max_tokens_cap=sess_tokens_cap,
-            ttl_seconds=float(session_meta.get("ttl_seconds") or eff_ttl),
-            upstream_timeout_seconds=float(args.stream_timeout_seconds),
-            default_chat_params=session_default_chat_params,
-            lease_provider=lease_supplier,
-            follow_session_window=lease_supplier is not None,
-        ),
-        endpoint_port=endpoint.port,
-        upstream_port=upstream_port_val,
-        local_assist_port=local_assist_port,
-        use_token_relay=True,
-        allowed_shell_localhost_ports=tuple(getattr(args, "allow_shell_localhost_port", None) or ()),
-        allow_ssh_remote=bool(getattr(args, "allow_ssh_remote", False)),
-        allow_self_edit=bool(getattr(args, "allow_self_edit", False)),
-        sandbox_exec_bin=sandbox_exec_bin,
+    return normalize_non_session_exit_code(
+        publish_and_run_opencode(
+            opencode_bin=opencode_bin,
+            opencode_args=opencode_args,
+            caller_cwd=caller_cwd,
+            isolated_home=isolated_home,
+            endpoint=endpoint,
+            config_text=config_text,
+            build_env_fn=lambda cfg_path: build_private_attested_env(
+                caller_cwd,
+                isolated_home,
+                cfg_path,
+                endpoint,
+                local_assist_base_url=local_assist_base_url,
+                preserve_host_home=args.preserve_host_home,
+            ),
+            current_sync=current_sync,
+            print_config=bool(args.print_config),
+            build_print_config_payload_fn=lambda cfg_path, parsed_cfg: {
+                "model_id": endpoint.model_id,
+                "served_model_id": endpoint.served_model_id,
+                "trust_tier": endpoint.trust_tier,
+                "data_control_rung": endpoint.data_control_rung,
+                "usage_policy": endpoint.usage_policy,
+                "api_base_url": endpoint.api_base_url,
+                "session_token": "<redacted-se-session-token>",
+                "session_caps": session_meta,
+                "opencode_config_path": str(cfg_path),
+                "isolated_home": str(isolated_home),
+                "config": parsed_cfg,
+            },
+            relay_factory=lambda svc_pw: SessionAuthRelay(
+                upstream_base_url=endpoint.api_base_url,
+                upstream_session_token=endpoint.api_key,
+                token_prefix="oc-relay",
+                extra_canary_secrets=[svc_pw],
+                max_chat_requests=int(session_meta["max_chat_requests"]),
+                max_request_bytes=sess_bytes_cap,
+                max_tokens_cap=sess_tokens_cap,
+                ttl_seconds=float(session_meta.get("ttl_seconds") or eff_ttl),
+                upstream_timeout_seconds=float(args.stream_timeout_seconds),
+                default_chat_params=session_default_chat_params,
+                lease_provider=lease_supplier,
+                follow_session_window=lease_supplier is not None,
+            ),
+            endpoint_port=endpoint.port,
+            upstream_port=upstream_port_val,
+            local_assist_port=local_assist_port,
+            use_token_relay=True,
+            allowed_shell_localhost_ports=tuple(getattr(args, "allow_shell_localhost_port", None) or ()),
+            allow_ssh_remote=bool(getattr(args, "allow_ssh_remote", False)),
+            allow_self_edit=bool(getattr(args, "allow_self_edit", False)),
+            sandbox_exec_bin=sandbox_exec_bin,
+        )
     )
 
 

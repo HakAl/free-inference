@@ -3,8 +3,108 @@ from __future__ import annotations
 import copy
 import datetime
 import json
+import math
 import re
 from typing import Any
+
+
+# Explicitly accepted YAML subset for stdlib-only parsing (matching PyYAML safe_load / safe_load_all):
+# - Mappings, block sequences, flow sequences (when allow_flow_sequences=True),
+#   block scalars (|, |-, >, >-) in both mappings and sequences, quoted scalars,
+#   per-document anchors/aliases, and multi-document streams separated by column-0 `---` / `...`.
+# Explicitly rejected fail-closed forms:
+# - Tabs in indentation, merge keys (`<<`), tags (`!tag`), YAML directives (`%YAML`, `%TAG`),
+#   unsupported block scalar indicators (`|+`, `>+`, `|2`, `>2`), inline content on `---` / `...`,
+#   unfinished flow collections at document boundaries, duplicate mapping keys (when
+#   reject_duplicate_keys=True), ambiguous YAML 1.1 plain scalars/keys (dates/timestamps/
+#   sexagesimals/non-canonical numerics/YAML 1.1 booleans when strict_plain_scalars=True),
+#   nested flow collections, and multi-line quoted scalars.
+
+_STRICT_YAML_DATE_OR_TS_RE = re.compile(r"^[0-9]{4}-[0-9]{1,2}-[0-9]{1,2}(?:$|[Tt \t].*)", re.ASCII)
+_STRICT_CANONICAL_DATE_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$", re.ASCII)
+_STRICT_SEXAGESIMAL_RE = re.compile(r"^[+-]?[0-9][0-9_]*(?::[0-5]?[0-9])+(?:\.[0-9_]*)?$", re.ASCII)
+_STRICT_YAML_NUM_BOUNDARY_RE = re.compile(
+    r"^[+-]?(?:0[oOxXbB][0-9a-fA-F_]+|[0-9][0-9_]*(?:\.[0-9_]*)?(?:[eE][+-]?[0-9_]+)?|\.[0-9][0-9_]*(?:[eE][+-]?[0-9_]+)?)$",
+    re.ASCII,
+)
+_STRICT_CANONICAL_INT_RE = re.compile(r"^-?(?:0|[1-9][0-9]*)$", re.ASCII)
+_STRICT_CANONICAL_FLOAT_RE = re.compile(r"^-?(?:0|[1-9][0-9]*)\.[0-9]+$", re.ASCII)
+
+_STRICT_RESERVED_LOWER = frozenset(
+    {"null", "~", "true", "false", "yes", "no", "on", "off", "y", "n", ".inf", "+.inf", "-.inf", ".nan"}
+)
+
+
+def _split_physical_lines(text: str) -> tuple[list[str], list[bool]]:
+    """Split text strictly on CRLF, LF, or CR, preserving whether each line ended with a break."""
+    if not text:
+        return [], []
+    lines: list[str] = []
+    has_nl: list[bool] = []
+    start = 0
+    n = len(text)
+    idx = 0
+    while idx < n:
+        ch = text[idx]
+        if ch == "\r":
+            lines.append(text[start:idx])
+            has_nl.append(True)
+            if idx + 1 < n and text[idx + 1] == "\n":
+                idx += 2
+            else:
+                idx += 1
+            start = idx
+        elif ch == "\n":
+            lines.append(text[start:idx])
+            has_nl.append(True)
+            idx += 1
+            start = idx
+        else:
+            idx += 1
+    if start < n:
+        lines.append(text[start:])
+        has_nl.append(False)
+    return lines, has_nl
+
+
+def _json_loads_with_dup_check(text: str, *, reject_duplicate_keys: bool = False) -> Any:
+    if not reject_duplicate_keys:
+        return json.loads(text)
+
+    def _no_dups(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for k, v in pairs:
+            if k in out:
+                raise ValueError(f"Duplicate JSON object key: {k!r}")
+            out[k] = v
+        return out
+
+    return json.loads(text, object_pairs_hook=_no_dups)
+
+
+def yaml_values_strictly_equal(a: Any, b: Any) -> bool:
+    """Recursive type-aware equality (distinguishes bool vs int, int vs float, date vs str)."""
+    if type(a) is not type(b):
+        return False
+    if isinstance(a, dict):
+        if len(a) != len(b):
+            return False
+        a_map = {(type(k), k): v for k, v in a.items()}
+        b_map = {(type(k), k): v for k, v in b.items()}
+        if len(a_map) != len(a) or len(b_map) != len(b):
+            return False
+        if a_map.keys() != b_map.keys():
+            return False
+        return all(yaml_values_strictly_equal(a_map[k], b_map[k]) for k in a_map)
+    if isinstance(a, list):
+        if len(a) != len(b):
+            return False
+        return all(yaml_values_strictly_equal(x, y) for x, y in zip(a, b))
+    if isinstance(a, float):
+        if math.isnan(a) or math.isnan(b):
+            return False
+        return a == b
+    return a == b
 
 
 def safe_load(text: str) -> Any:
@@ -27,29 +127,142 @@ def safe_dump(data: Any) -> str:
     return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
 
 
-def parse_yaml_with_flow_sequences(text: str) -> Any:
-    stripped = text.lstrip()
+def parse_yaml_with_flow_sequences(
+    text: str,
+    *,
+    reject_duplicate_keys: bool = False,
+    strict_plain_scalars: bool = False,
+) -> Any:
+    stripped = text.lstrip(" \t\r\n") if strict_plain_scalars else text.lstrip()
     if stripped.startswith(("{", "[")):
-        return json.loads(stripped)
-    return _MiniYamlParser(text, allow_flow_sequences=True).parse()
+        if strict_plain_scalars:
+            raise ValueError(
+                "Strict YAML mode rejects top-level flow/JSON documents; "
+                "use block-style YAML so stdlib and PyYAML scalar resolution match identically"
+            )
+        return _json_loads_with_dup_check(stripped, reject_duplicate_keys=reject_duplicate_keys)
+    return _MiniYamlParser(
+        text,
+        allow_flow_sequences=True,
+        reject_duplicate_keys=reject_duplicate_keys,
+        strict_plain_scalars=strict_plain_scalars,
+    ).parse()
+
+
+def parse_yaml_documents(
+    text: str,
+    *,
+    allow_flow_sequences: bool = False,
+    reject_duplicate_keys: bool = False,
+    strict_plain_scalars: bool = False,
+) -> list[Any]:
+    """Parse a multi-document YAML stream separated by column-0 `---` / `...` markers."""
+    return _MiniYamlParser(
+        text,
+        allow_flow_sequences=allow_flow_sequences,
+        multi_document=True,
+        reject_duplicate_keys=reject_duplicate_keys,
+        strict_plain_scalars=strict_plain_scalars,
+    ).parse_all()
 
 
 class _MiniYamlParser:
-    def __init__(self, text: str, *, allow_flow_sequences: bool = False) -> None:
-        self.raw_lines = text.splitlines()
+    def __init__(
+        self,
+        text: str,
+        *,
+        allow_flow_sequences: bool = False,
+        multi_document: bool = False,
+        reject_duplicate_keys: bool = False,
+        strict_plain_scalars: bool = False,
+    ) -> None:
+        if strict_plain_scalars and any(ch in text for ch in ("\u0085", "\u2028", "\u2029", "\x0b", "\x0c")):
+            raise ValueError(
+                "Strict YAML mode rejects non-ASCII line-break or vertical whitespace control characters"
+            )
+        self.raw_lines, self.line_has_newline = _split_physical_lines(text)
         self.anchors: dict[str, Any] = {}
         self.pos = 0
         self.allow_flow_sequences = allow_flow_sequences
+        self.multi_document = multi_document
+        self.reject_duplicate_keys = reject_duplicate_keys
+        self.strict_plain_scalars = strict_plain_scalars
+
+    def _is_ws(self, ch: str) -> bool:
+        return ch in (" ", "\t") if self.strict_plain_scalars else ch.isspace()
+
+    def _strip_ws(self, text: str) -> str:
+        return text.strip(" \t") if self.strict_plain_scalars else text.strip()
+
+    def _rstrip_ws(self, text: str) -> str:
+        return text.rstrip(" \t") if self.strict_plain_scalars else text.rstrip()
+
+    def _split_anchor_prefix(self, text: str, *, context: str) -> tuple[str, str]:
+        if self.strict_plain_scalars:
+            sp_idx = text.find(" ")
+            if sp_idx == -1:
+                anchor = text[1:]
+                remainder = ""
+            else:
+                anchor = text[1:sp_idx]
+                remainder = text[sp_idx + 1 :].lstrip(" ")
+            if not anchor or not re.fullmatch(r"[A-Za-z0-9_-]+", anchor, re.ASCII):
+                raise ValueError(f"Invalid YAML anchor name {anchor!r} in {context}: {text!r}")
+            return anchor, remainder
+        parts = text.split(None, 1)
+        anchor = parts[0][1:]
+        if not anchor:
+            raise ValueError(f"Invalid empty YAML anchor in {context}: {text!r}")
+        return anchor, (parts[1] if len(parts) > 1 else "")
 
     @staticmethod
-    def _can_start_flow_sequence_at(line: str, idx: int) -> bool:
+    def _classify_doc_marker(raw_line: str) -> str | None:
+        if raw_line.startswith("%"):
+            raise ValueError(f"Unsupported YAML directive: {raw_line!r}")
+        if raw_line.startswith("---"):
+            rest = raw_line[3:]
+            if rest == "":
+                return "start"
+            if rest[0] in (" ", "\t"):
+                after = rest.lstrip(" ")
+                if after == "" or after.startswith("#"):
+                    return "start"
+                if after.startswith("\t"):
+                    if after.lstrip(" \t") == "" or after.lstrip(" \t").startswith("#"):
+                        return "start"
+                raise ValueError(f"Unsupported inline content on YAML document start marker: {raw_line!r}")
+            return None
+        if raw_line.startswith("..."):
+            rest = raw_line[3:]
+            if rest == "":
+                return "end"
+            if rest[0] in (" ", "\t"):
+                after = rest.lstrip(" ")
+                if after == "" or after.startswith("#"):
+                    return "end"
+                if after.startswith("\t"):
+                    if after.lstrip(" \t") == "" or after.lstrip(" \t").startswith("#"):
+                        return "end"
+                raise ValueError(f"Unsupported trailing content on YAML document end marker: {raw_line!r}")
+            return None
+        return None
+
+    def _can_start_flow_sequence_at(self, line: str, idx: int) -> bool:
         if idx == 0:
             return True
-        if not line[idx - 1].isspace():
+        if not self._is_ws(line[idx - 1]):
             return False
         prefix = line[:idx].rstrip(" ")
         if prefix == "-" or prefix.endswith(":"):
             return True
+        if self.strict_plain_scalars:
+            sp_idx = prefix.rfind(" ")
+            if sp_idx != -1:
+                head = prefix[:sp_idx].rstrip(" ")
+                tail = prefix[sp_idx + 1 :]
+                if tail.startswith("&") and re.fullmatch(r"[A-Za-z0-9_-]+", tail[1:], re.ASCII):
+                    return head == "-" or head.endswith(":")
+            return False
         parts = prefix.rsplit(None, 1)
         if len(parts) == 2 and parts[1].startswith("&") and len(parts[1]) > 1:
             head = parts[0].rstrip(" ")
@@ -88,30 +301,32 @@ class _MiniYamlParser:
                     if ch == "[":
                         if (
                             flow_depth > 0
-                            and (idx == 0 or line[idx - 1].isspace() or line[idx - 1] in ("[", ","))
+                            and (idx == 0 or self._is_ws(line[idx - 1]) or line[idx - 1] in ("[", ","))
                         ) or (flow_depth == 0 and self._can_start_flow_sequence_at(line, idx)):
                             flow_depth += 1
                     elif ch == "]" and flow_depth > 0:
                         flow_depth -= 1
                 can_open_quote = (
                     idx == 0
-                    or line[idx - 1].isspace()
+                    or self._is_ws(line[idx - 1])
                     or (flow_depth > 0 and line[idx - 1] in ("[", ","))
                 )
                 if ch == "'" and can_open_quote:
                     in_single = True
                 elif ch == '"' and can_open_quote:
                     in_double = True
-                elif ch == "#" and (idx == 0 or line[idx - 1].isspace()):
-                    return line[:idx].rstrip()
+                elif ch == "#" and (idx == 0 or self._is_ws(line[idx - 1])):
+                    return self._rstrip_ws(line[:idx])
             idx += 1
         if in_single or in_double or escaped:
             raise ValueError(f"Unterminated or multi-line quoted scalar is not supported: {line!r}")
-        return line.rstrip()
+        return self._rstrip_ws(line)
 
     def _skip_ignorable(self, *, in_flow_sequence: bool = False) -> None:
         while self.pos < len(self.raw_lines):
             raw = self.raw_lines[self.pos]
+            if self.multi_document and self._classify_doc_marker(raw) is not None:
+                break
             if "\t" in raw[: len(raw) - len(raw.lstrip(" \t"))]:
                 raise ValueError(f"Tab characters are not allowed in YAML indentation: {raw!r}")
             stripped = raw.lstrip(" ")
@@ -129,6 +344,8 @@ class _MiniYamlParser:
         if self.pos >= len(self.raw_lines):
             return None
         raw = self.raw_lines[self.pos]
+        if self.multi_document and self._classify_doc_marker(raw) is not None:
+            return None
         stripped = raw.lstrip(" ")
         indent = len(raw) - len(stripped)
         return indent, self._strip_comment(stripped)
@@ -144,6 +361,51 @@ class _MiniYamlParser:
                 f"Unconsumed or out-of-indent YAML input at line {self.pos + 1}: {trailing[1]!r}"
             )
         return node
+
+    def parse_all(self) -> list[Any]:
+        docs: list[Any] = []
+        while self.pos < len(self.raw_lines):
+            self.anchors.clear()
+            self._skip_ignorable()
+            if self.pos >= len(self.raw_lines):
+                break
+            marker = self._classify_doc_marker(self.raw_lines[self.pos])
+            if marker == "end":
+                self.pos += 1
+                continue
+            explicit_start = False
+            if marker == "start":
+                explicit_start = True
+                self.pos += 1
+                self._skip_ignorable()
+                if self.pos >= len(self.raw_lines):
+                    docs.append(None)
+                    break
+                next_marker = self._classify_doc_marker(self.raw_lines[self.pos])
+                if next_marker == "start":
+                    docs.append(None)
+                    continue
+                if next_marker == "end":
+                    docs.append(None)
+                    self.pos += 1
+                    continue
+            peeked = self._peek()
+            if peeked is None:
+                if explicit_start:
+                    docs.append(None)
+                continue
+            node = self._parse_node(peeked[0])
+            trailing = self._peek()
+            if trailing is not None:
+                raise ValueError(
+                    f"Unconsumed or out-of-indent YAML input at line {self.pos + 1}: {trailing[1]!r}"
+                )
+            docs.append(node)
+            if self.pos < len(self.raw_lines):
+                end_marker = self._classify_doc_marker(self.raw_lines[self.pos])
+                if end_marker == "end":
+                    self.pos += 1
+        return docs
 
     def _parse_node(self, expected_indent: int) -> Any:
         peeked = self._peek()
@@ -178,9 +440,25 @@ class _MiniYamlParser:
 
             anchor = None
             if rest.startswith("&"):
-                parts = rest.split(None, 1)
-                anchor = parts[0][1:]
-                rest = parts[1] if len(parts) > 1 else ""
+                anchor, rest = self._split_anchor_prefix(rest, context="sequence")
+                if not rest:
+                    next_peek = self._peek()
+                    if next_peek is not None and next_peek[0] > list_indent:
+                        val = self._parse_node(next_peek[0])
+                    else:
+                        val = None
+                    self.anchors[anchor] = val
+                    items.append(val)
+                    continue
+
+            if rest in ("|", "|-", ">", ">-"):
+                val = self._collect_block_scalar(rest, list_indent)
+                if anchor:
+                    self.anchors[anchor] = val
+                items.append(val)
+                continue
+            if rest.startswith(("|", ">")):
+                raise ValueError(f"Unsupported YAML block scalar indicator in sequence: {rest!r}")
 
             if self._looks_like_mapping_entry(rest):
                 item_indent = list_indent + 2
@@ -188,6 +466,11 @@ class _MiniYamlParser:
                 if anchor:
                     self.anchors[anchor] = item_dict
                 items.append(item_dict)
+            elif self.allow_flow_sequences and rest.startswith("[") and rest != "[]":
+                val = self._collect_and_parse_flow_sequence(rest, list_indent)
+                if anchor:
+                    self.anchors[anchor] = val
+                items.append(val)
             else:
                 val = self._parse_scalar(rest)
                 if anchor:
@@ -197,7 +480,7 @@ class _MiniYamlParser:
 
     def _parse_inline_mapping_start(self, first_entry: str, item_indent: int) -> dict[str, Any]:
         result: dict[str, Any] = {}
-        key, val_str = self._split_kv(first_entry)
+        key, val_str = self._split_kv(first_entry, strict_keys=self.strict_plain_scalars)
         result[key] = self._resolve_value(val_str, item_indent)
         while True:
             peeked = self._peek()
@@ -207,7 +490,9 @@ class _MiniYamlParser:
             if indent != item_indent or content.startswith("- ") or content == "-":
                 break
             self.pos += 1
-            k, v_str = self._split_kv(content)
+            k, v_str = self._split_kv(content, strict_keys=self.strict_plain_scalars)
+            if self.reject_duplicate_keys and k in result:
+                raise ValueError(f"Duplicate YAML mapping key: {k!r}")
             result[k] = self._resolve_value(v_str, item_indent)
         return result
 
@@ -221,24 +506,24 @@ class _MiniYamlParser:
             if indent != map_indent or content.startswith("- ") or content == "-":
                 break
             self.pos += 1
-            key, val_str = self._split_kv(content)
+            key, val_str = self._split_kv(content, strict_keys=self.strict_plain_scalars)
+            if self.reject_duplicate_keys and key in result:
+                raise ValueError(f"Duplicate YAML mapping key: {key!r}")
             result[key] = self._resolve_value(val_str, map_indent)
         return result
 
     def _resolve_value(self, val_str: str, parent_indent: int) -> Any:
         anchor = None
         if val_str.startswith("&"):
-            parts = val_str.split(None, 1)
-            anchor = parts[0][1:]
-            if not anchor:
-                raise ValueError(f"Invalid empty YAML anchor: {val_str!r}")
-            val_str = parts[1] if len(parts) > 1 else ""
+            anchor, val_str = self._split_anchor_prefix(val_str, context="mapping")
 
         if val_str in ("|", "|-", ">", ">-"):
             val = self._collect_block_scalar(val_str, parent_indent)
             if anchor:
                 self.anchors[anchor] = val
             return val
+        if val_str.startswith(("|", ">")):
+            raise ValueError(f"Unsupported YAML block scalar indicator: {val_str!r}")
 
         if val_str == "":
             next_peek = self._peek()
@@ -305,7 +590,7 @@ class _MiniYamlParser:
                     elif ch == "]":
                         depth -= 1
                         if depth == 0:
-                            trailing = text[idx + 1 :].strip()
+                            trailing = self._strip_ws(text[idx + 1 :])
                             if trailing:
                                 raise ValueError(
                                     f"Unexpected trailing content after YAML flow sequence: {trailing!r}"
@@ -324,6 +609,10 @@ class _MiniYamlParser:
             if self.pos >= len(self.raw_lines):
                 raise ValueError(f"Unterminated YAML flow sequence: {combined!r}")
             raw = self.raw_lines[self.pos]
+            if self.multi_document and self._classify_doc_marker(raw) is not None:
+                raise ValueError(
+                    f"Unterminated YAML flow sequence before document boundary: {combined!r}"
+                )
             stripped = raw.lstrip(" ")
             indent = len(raw) - len(stripped)
             if indent <= min_indent and not stripped.startswith("]"):
@@ -335,10 +624,10 @@ class _MiniYamlParser:
             chunks.append(content)
             combined = " ".join(chunks)
 
-        combined = combined.strip()
+        combined = self._strip_ws(combined)
         if not (combined.startswith("[") and combined.endswith("]")):
             raise ValueError(f"Malformed YAML flow sequence: {combined!r}")
-        inner = combined[1:-1].strip()
+        inner = self._strip_ws(combined[1:-1])
         if not inner:
             return []
 
@@ -382,7 +671,7 @@ class _MiniYamlParser:
                 elif ch in ("[", "]", "{", "}"):
                     raise ValueError(f"Nested flow collections are not supported in YAML flow sequence: {combined!r}")
                 elif ch == ",":
-                    item_str = "".join(cur).strip()
+                    item_str = self._strip_ws("".join(cur))
                     if not item_str:
                         raise ValueError(f"Empty item before comma in YAML flow sequence: {combined!r}")
                     raw_items.append(item_str)
@@ -391,7 +680,7 @@ class _MiniYamlParser:
                     cur.append(ch)
             idx += 1
 
-        tail_str = "".join(cur).strip()
+        tail_str = self._strip_ws("".join(cur))
         if tail_str:
             raw_items.append(tail_str)
         elif not raw_items:
@@ -400,13 +689,16 @@ class _MiniYamlParser:
         return [self._parse_scalar(item) for item in raw_items]
 
     def _collect_block_scalar(self, indicator: str, parent_indent: int) -> str:
-        block_lines: list[str] = []
+        raw_items: list[tuple[str, bool, bool]] = []
         block_indent: int | None = None
         while self.pos < len(self.raw_lines):
             raw = self.raw_lines[self.pos]
+            has_nl = self.line_has_newline[self.pos]
+            if self.multi_document and self._classify_doc_marker(raw) is not None:
+                break
             stripped = raw.lstrip(" ")
             if not stripped:
-                block_lines.append("")
+                raw_items.append((raw, has_nl, True))
                 self.pos += 1
                 continue
             indent = len(raw) - len(stripped)
@@ -414,11 +706,39 @@ class _MiniYamlParser:
                 break
             if block_indent is None:
                 block_indent = indent
-            block_lines.append(raw[block_indent:] if len(raw) >= block_indent else stripped)
+                for lead_raw, _, _ in raw_items:
+                    if len(lead_raw) > block_indent:
+                        raise ValueError(
+                            f"Leading blank line in YAML block scalar is more indented ({len(lead_raw)}) "
+                            f"than detected block_indent ({block_indent})"
+                        )
+            elif indent < block_indent:
+                raise ValueError(
+                    f"Under-indented continuation line in YAML block scalar at line {self.pos + 1}: "
+                    f"indent {indent} < block_indent {block_indent}"
+                )
+            raw_items.append((raw, has_nl, False))
             self.pos += 1
 
-        while block_lines and block_lines[-1] == "":
-            block_lines.pop()
+        if block_indent is None:
+            return ""
+
+        block_items: list[tuple[str, bool]] = []
+        for raw, has_nl, is_spaces_only in raw_items:
+            if is_spaces_only:
+                line_text = raw[block_indent:] if len(raw) > block_indent else ""
+            else:
+                line_text = raw[block_indent:]
+            block_items.append((line_text, has_nl))
+
+        while block_items and block_items[-1][0] == "":
+            block_items.pop()
+
+        if not block_items:
+            return ""
+
+        last_retained_has_nl = block_items[-1][1]
+        block_lines = [line_text for line_text, _ in block_items]
 
         if indicator.startswith(">"):
             out_parts: list[str] = []
@@ -433,7 +753,7 @@ class _MiniYamlParser:
                         out_parts.append("\n" * empty_count)
                     out_parts.append(line)
                 else:
-                    more_indented = prev_non_empty.startswith(" ") or line.startswith(" ")
+                    more_indented = prev_non_empty.startswith((" ", "\t")) or line.startswith((" ", "\t"))
                     if empty_count == 0:
                         out_parts.append(("\n" if more_indented else " ") + line)
                     else:
@@ -442,9 +762,12 @@ class _MiniYamlParser:
                 prev_non_empty = line
                 empty_count = 0
             joined = "".join(out_parts)
-            return joined if indicator.endswith("-") else joined + "\n"
-        joined = "\n".join(block_lines)
-        return joined if indicator.endswith("-") else joined + "\n"
+        else:
+            joined = "\n".join(block_lines)
+
+        if indicator.endswith("-"):
+            return joined
+        return joined + ("\n" if last_retained_has_nl else "")
 
     @staticmethod
     def _find_mapping_colon(text: str) -> int:
@@ -503,13 +826,63 @@ class _MiniYamlParser:
     def _looks_like_mapping_entry(cls, text: str) -> bool:
         return cls._find_mapping_colon(text) != -1
 
+    @staticmethod
+    def _resolve_strict_plain_token(text: str, *, is_key: bool) -> Any:
+        """Unified ASCII-only strict plain resolver shared by keys and scalar values."""
+        low = text.lower()
+        if low in _STRICT_RESERVED_LOWER:
+            if is_key:
+                raise ValueError(
+                    f"Unquoted YAML reserved-word mapping key {text!r} is not supported; quote it"
+                )
+            if text in ("null", "~", "Null", "NULL"):
+                return None
+            if text in ("true", "True", "TRUE"):
+                return True
+            if text in ("false", "False", "FALSE"):
+                return False
+            if low in ("yes", "no", "on", "off", "y", "n"):
+                raise ValueError(f"Ambiguous YAML 1.1 boolean literal {text!r}; quote it or use true/false")
+            raise ValueError(f"Unsupported YAML non-finite float literal {text!r}")
+
+        if _STRICT_YAML_DATE_OR_TS_RE.match(text):
+            if is_key:
+                raise ValueError(
+                    f"Unquoted YAML date or timestamp mapping key {text!r} is not supported; quote it"
+                )
+            if _STRICT_CANONICAL_DATE_RE.fullmatch(text):
+                try:
+                    return datetime.date.fromisoformat(text)
+                except ValueError as exc:
+                    raise ValueError(f"Invalid unquoted ISO date in YAML scalar {text!r}") from exc
+            raise ValueError(
+                f"Unquoted YAML 1.1 non-canonical date or timestamp scalar {text!r} is not supported; quote it"
+            )
+
+        if _STRICT_SEXAGESIMAL_RE.fullmatch(text):
+            kind = "mapping key" if is_key else "scalar"
+            raise ValueError(f"Unsupported sexagesimal literal in YAML {kind} {text!r}; quote it as a string")
+
+        if _STRICT_YAML_NUM_BOUNDARY_RE.fullmatch(text):
+            if is_key:
+                raise ValueError(
+                    f"Unquoted numeric YAML mapping key {text!r} is not supported; quote it"
+                )
+            if _STRICT_CANONICAL_INT_RE.fullmatch(text):
+                return int(text)
+            if _STRICT_CANONICAL_FLOAT_RE.fullmatch(text):
+                return float(text)
+            raise ValueError(f"Unsupported numeric literal format in YAML scalar: {text!r}")
+
+        return text
+
     @classmethod
-    def _split_kv(cls, text: str) -> tuple[str, str]:
+    def _split_kv(cls, text: str, *, strict_keys: bool = False) -> tuple[str, str]:
         colon = cls._find_mapping_colon(text)
         if colon == -1:
             raise ValueError(f"Invalid YAML mapping entry (missing mapping colon): {text!r}")
-        raw_key = text[:colon].strip()
-        val = text[colon + 1 :].strip()
+        raw_key = text[:colon].strip(" \t") if strict_keys else text[:colon].strip()
+        val = text[colon + 1 :].strip(" \t") if strict_keys else text[colon + 1 :].strip()
         if raw_key.startswith('"'):
             if not (raw_key.endswith('"') and len(raw_key) >= 2):
                 raise ValueError(f"Unterminated double-quoted YAML mapping key: {raw_key!r}")
@@ -533,9 +906,11 @@ class _MiniYamlParser:
             raise ValueError("Unsupported YAML merge key '<<'; inline the mapping fields explicitly")
         if not raw_key or any(ch in raw_key for ch in ('"', "'", "{", "}", "[", "]", "&", "*", "!", "<", ">", "\t")):
             raise ValueError(f"Unsupported or malformed YAML mapping key: {raw_key!r}")
+        if strict_keys:
+            cls._resolve_strict_plain_token(raw_key, is_key=True)
+            return raw_key, val
         if (
-            raw_key.lower()
-            in ("null", "~", "true", "false", "yes", "no", "on", "off", "y", "n", ".inf", "+.inf", "-.inf", ".nan")
+            raw_key.lower() in _STRICT_RESERVED_LOWER
             or re.fullmatch(r"[+-]?(?:\d[\d_]*|\d*\.\d[\d_]*|\d[\d_]*\.)", raw_key)
         ):
             raise ValueError(
@@ -545,7 +920,12 @@ class _MiniYamlParser:
 
     def _parse_scalar(self, text: str) -> Any:
         if text.startswith("*"):
-            alias = text[1:].strip()
+            if self.strict_plain_scalars:
+                alias = text[1:]
+                if not re.fullmatch(r"[A-Za-z0-9_-]+", alias, re.ASCII):
+                    raise ValueError(f"Invalid YAML alias syntax in scalar: {text!r}")
+            else:
+                alias = text[1:].strip()
             if not alias or alias not in self.anchors:
                 raise ValueError(f"Unknown YAML alias in scalar: {text!r}")
             return copy.deepcopy(self.anchors[alias])
@@ -555,16 +935,6 @@ class _MiniYamlParser:
             raise ValueError(f"Unsupported YAML tag in scalar: {text!r}")
         if text in ("=", "<<"):
             raise ValueError(f"Unsupported YAML special indicator in scalar: {text!r}")
-        if text in ("null", "~", "Null", "NULL"):
-            return None
-        if text in ("true", "True", "TRUE"):
-            return True
-        if text in ("false", "False", "FALSE"):
-            return False
-        if text.lower() in ("yes", "no", "on", "off", "y", "n"):
-            raise ValueError(f"Ambiguous YAML 1.1 boolean literal {text!r}; quote it or use true/false")
-        if text.lower() in (".inf", "+.inf", "-.inf", ".nan"):
-            raise ValueError(f"Unsupported YAML non-finite float literal {text!r}")
         if text == "[]":
             return []
         if text == "{}":
@@ -584,6 +954,18 @@ class _MiniYamlParser:
             return text[1:-1].replace("''", "'")
         if ": " in text or text.endswith(":"):
             raise ValueError(f"Unquoted mapping colon in YAML scalar: {text!r}")
+        if self.strict_plain_scalars:
+            return self._resolve_strict_plain_token(text, is_key=False)
+        if text in ("null", "~", "Null", "NULL"):
+            return None
+        if text in ("true", "True", "TRUE"):
+            return True
+        if text in ("false", "False", "FALSE"):
+            return False
+        if text.lower() in ("yes", "no", "on", "off", "y", "n"):
+            raise ValueError(f"Ambiguous YAML 1.1 boolean literal {text!r}; quote it or use true/false")
+        if text.lower() in (".inf", "+.inf", "-.inf", ".nan"):
+            raise ValueError(f"Unsupported YAML non-finite float literal {text!r}")
         if re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
             try:
                 return datetime.date.fromisoformat(text)

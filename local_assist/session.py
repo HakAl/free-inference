@@ -21,7 +21,7 @@ import threading
 from typing import Any
 
 from .paths import ROOT
-from .registry import (ATTESTED_ENCLAVE_TIERS, list_pid_records, load_model, load_models,
+from .registry import (ATTESTED_ENCLAVE_TIERS, RegistryError, list_pid_records, load_model, load_models,
                        read_pid_record_for_model, resolve_endpoint, session_token_file_for_model)
 from .registry import _effective_runs_dir
 
@@ -190,28 +190,148 @@ def _control_exchange(address: str, wire: bytes, expected_pid: int, timeout: flo
         return bytes(raw)
 
 
+def _before_stale_socket_probe_hook() -> None:
+    return
+
+
+def _probe_control_socket_via_ctl_fd(
+    ctl_fd: int,
+    sock_name: str,
+    *,
+    expected_pid: int,
+    timeout: float = 0.25,
+) -> dict:
+    wire = json.dumps({'action': 'status'}, separators=(',', ':')).encode() + b'\n'
+    code = (
+        'import os,sys;sys.path.insert(0,sys.argv[1]);'
+        'from local_assist.session import _control_exchange;'
+        'fd=int(sys.argv[2]);os.fchdir(fd);os.close(fd)\n'
+        'try: out=_control_exchange(sys.argv[3],sys.stdin.buffer.read(4097),int(sys.argv[4]),float(sys.argv[5]))\n'
+        'except ValueError: raise SystemExit(126)\n'
+        'except OSError as exc: raise SystemExit(exc.errno if exc.errno and 0<exc.errno<126 else 127)\n'
+        'sys.stdout.buffer.write(out)'
+    )
+    try:
+        proc = subprocess.run(
+            [
+                sys.executable,
+                '-I',
+                '-B',
+                '-c',
+                code,
+                str(ROOT),
+                str(ctl_fd),
+                sock_name,
+                str(expected_pid),
+                str(timeout),
+            ],
+            input=wire,
+            capture_output=True,
+            timeout=timeout + 2,
+            env={'PATH': os.defpath},
+            pass_fds=(ctl_fd,),
+        )
+    except subprocess.SubprocessError:
+        raise ValueError('Session control helper unavailable.') from None
+    if proc.returncode:
+        if 0 < proc.returncode < 126:
+            raise OSError(proc.returncode, 'Session control connection failed.')
+        raise ValueError('Session control helper unavailable.')
+    result = json.loads(proc.stdout.split(b'\n', 1)[0])
+    if not isinstance(result, dict) or 'error' in result:
+        raise ValueError('Session control refused the operation; check status before retrying.')
+    return result
+
+
 def remove_stale_control_socket(runs_dir: Path, model_id: str, expected_pid: int) -> bool:
+    from .custody import get_pinned_runs_dir_fd_for, open_existing_runs_dir
+
     path = control_path(runs_dir, model_id)
+    pinned_fd = get_pinned_runs_dir_fd_for(runs_dir)
+    transient_runs_fd: int | None = None
+    ctl_fd: int | None = None
     try:
-        node = path.lstat()
-    except FileNotFoundError:
-        return True
-    try:
-        control_request(path, {'action': 'status'}, expected_pid=expected_pid, timeout=0.25)
-    except OSError as exc:
-        if exc.errno != errno.ECONNREFUSED:
+        if pinned_fd is not None:
+            dir_fd = pinned_fd
+        else:
+            v_runs, r_err = open_existing_runs_dir(runs_dir, label="runs store")
+            if r_err is not None or v_runs is None or v_runs.dir_fd is None:
+                return False
+            transient_runs_fd = v_runs.dir_fd
+            dir_fd = transient_runs_fd
+
+        try:
+            ctl_fd = os.open(
+                ".control",
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=dir_fd,
+            )
+        except FileNotFoundError:
+            return True
+        except OSError:
             return False
-    except ValueError:
-        return False
-    else:
-        return False  # Never unlink a listening endpoint, including a replacement.
-    current = path.lstat()
-    if (not stat.S_ISSOCK(current.st_mode) or current.st_uid != os.geteuid()
+
+        st_ctl = os.fstat(ctl_fd)
+        if (
+            not stat.S_ISDIR(st_ctl.st_mode)
+            or st_ctl.st_uid != os.geteuid()
+            or stat.S_IMODE(st_ctl.st_mode) != 0o700
+        ):
+            return False
+
+        try:
+            node = os.stat(path.name, dir_fd=ctl_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        if (
+            not stat.S_ISSOCK(node.st_mode)
+            or node.st_uid != os.geteuid()
+            or stat.S_IMODE(node.st_mode) != 0o600
+        ):
+            return False
+
+        _before_stale_socket_probe_hook()
+        try:
+            _probe_control_socket_via_ctl_fd(
+                ctl_fd,
+                path.name,
+                expected_pid=expected_pid,
+                timeout=0.25,
+            )
+        except OSError as exc:
+            if exc.errno != errno.ECONNREFUSED:
+                return False
+        except ValueError:
+            return False
+        else:
+            return False  # Never unlink a listening endpoint, including a replacement.
+
+        try:
+            current = os.stat(path.name, dir_fd=ctl_fd, follow_symlinks=False)
+        except OSError:
+            return False
+        if (
+            not stat.S_ISSOCK(current.st_mode)
+            or current.st_uid != os.geteuid()
             or stat.S_IMODE(current.st_mode) != 0o600
-            or (current.st_dev, current.st_ino) != (node.st_dev, node.st_ino)):
-        return False
-    path.unlink()
-    return True
+            or (current.st_dev, current.st_ino) != (node.st_dev, node.st_ino)
+        ):
+            return False
+        os.unlink(path.name, dir_fd=ctl_fd)
+        return True
+    finally:
+        if ctl_fd is not None:
+            try:
+                os.close(ctl_fd)
+            except OSError:
+                pass
+        if transient_runs_fd is not None:
+            try:
+                os.close(transient_runs_fd)
+            except OSError:
+                pass
 
 
 def sanitize_status(raw: dict, *, expected_model: str, expected_pid: int) -> dict:
@@ -408,15 +528,58 @@ def select_model(explicit: str | None, runs_dir: Path) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description='Manage operator-authorized attested session windows.')
+    parser = argparse.ArgumentParser(
+        description='Manage operator-authorized attested session windows.',
+        allow_abbrev=False,
+    )
     parser.add_argument('action', choices=['status', 'start', 'stop', 'renew', 'watch'])
     parser.add_argument('--model')
     parser.add_argument('--for', dest='window', type=parse_duration, default=DEFAULT_WINDOW_SECONDS)
     parser.add_argument('--json', action='store_true')
     parser.add_argument('--notify', action='store_true', help='Send macOS notifications from foreground watch.')
+    parser.add_argument('--launcher-site-packages', default=None, help='Explicit custody dependency directory.')
+    parser.add_argument('--runs-dir', default=None, help='Explicit non-custody session store directory.')
     args = parser.parse_args(argv)
-    runs = _effective_runs_dir()
+    from .custody import (
+        PINNED_RUNS_STAT_ENV_VAR,
+        ensure_creatable_runs_dir,
+        format_pinned_runs_stat,
+        get_active_bootstrap_state,
+        inspect_existing_runs_dir,
+        is_custody_tree,
+        set_cli_runs_dir_override,
+        validate_creatable_runs_dir,
+        write_active_runs_pointer,
+    )
+    prev_boot = get_active_bootstrap_state()
+    in_custody = (prev_boot is not None and prev_boot.custody_mode) or is_custody_tree(ROOT)
+    inproc_runs_applied = False
+    pinned_stat: tuple[int, int] | None = None
+    if args.runs_dir is not None:
+        if in_custody:
+            print('Refusing --runs-dir in read-only/custody mode.', file=sys.stderr)
+            return 1
+        v_runs, r_err = inspect_existing_runs_dir(args.runs_dir, label='--runs-dir')
+        if r_err is not None or v_runs is None:
+            print(r_err or 'Invalid --runs-dir.', file=sys.stderr)
+            return 1
+        set_cli_runs_dir_override(v_runs.path, runs_stat=v_runs.stat_id)
+        pinned_stat = v_runs.stat_id
+        inproc_runs_applied = True
+    should_publish_pointer = (
+        not in_custody
+        and args.runs_dir is None
+        and not bool(os.environ.get('FREE_INFERENCE_RUNS_DIR', '').strip())
+    )
     try:
+        runs = _effective_runs_dir()
+        if not in_custody and args.runs_dir is None:
+            v_eff, eff_err = validate_creatable_runs_dir(runs, label='FREE_INFERENCE_RUNS_DIR')
+            if eff_err is not None or v_eff is None:
+                print(eff_err or 'Invalid session store directory.', file=sys.stderr)
+                return 1
+            runs = v_eff.path
+            pinned_stat = v_eff.stat_id
         model_id = select_model(args.model, runs)
         record = read_pid_record_for_model(model_id, runs)
         info = status_for_record(record, runs) if record else {'state': 'OFF', 'model_id': model_id}
@@ -424,6 +587,11 @@ def main(argv: list[str] | None = None) -> int:
             if info['state'] == 'UNKNOWN':
                 raise OperatorError('Existing session state is unknown; refusing automatic replacement.')
             if info['state'] == 'ON':
+                if should_publish_pointer and pinned_stat is not None:
+                    try:
+                        write_active_runs_pointer(runs, expected_stat=pinned_stat)
+                    except (ValueError, OSError) as exc:
+                        raise OperatorError(f'Failed to publish active session pointer: {exc}') from None
                 print('Existing session unchanged; use session renew to change its window.', file=sys.stderr)
             if info['state'] == 'OFF':
                 model = load_model(model_id)
@@ -439,9 +607,28 @@ def main(argv: list[str] | None = None) -> int:
                     raise OperatorError('Legacy OpenCode state requires containment before session start.')
                 if ep.routing_private_attested != 'cleared':
                     raise OperatorError('Model is not cleared for private attested use.')
-                rc = subprocess.run([str(ROOT / 'scripts/serve-model'), model_id, '--interactive',
-                                     '--ttl-seconds', str(args.window)], check=False,
-                                    stdout=sys.stderr if args.json else None).returncode
+                serve_cmd = [str(ROOT / 'scripts/serve-model')]
+                serve_env: dict[str, str] | None = None
+                if not in_custody:
+                    created_res, c_err = ensure_creatable_runs_dir(
+                        runs,
+                        expected_stat=pinned_stat,
+                        label='--runs-dir',
+                    )
+                    if c_err is not None or created_res is None or created_res.stat_id is None:
+                        raise OperatorError(c_err or 'Cannot create or validate session store directory.')
+                    runs = created_res.path
+                    pinned_stat = created_res.stat_id
+                    serve_cmd.extend(['--runs-dir', str(runs)])
+                    if should_publish_pointer:
+                        serve_cmd.append('--publish-active-runs')
+                    serve_env = dict(os.environ)
+                    serve_env[PINNED_RUNS_STAT_ENV_VAR] = format_pinned_runs_stat(pinned_stat)
+                serve_cmd.extend([model_id, '--interactive', '--ttl-seconds', str(args.window)])
+                sub_kw: dict[str, Any] = {'check': False, 'stdout': sys.stderr if args.json else None}
+                if serve_env is not None:
+                    sub_kw['env'] = serve_env
+                rc = subprocess.run(serve_cmd, **sub_kw).returncode
                 if rc:
                     return rc
                 record = read_pid_record_for_model(model_id, runs)
@@ -449,8 +636,22 @@ def main(argv: list[str] | None = None) -> int:
         elif args.action == 'stop':
             # Existing stop code revalidates exact process identities before signaling.
             if record:
-                rc = subprocess.run([str(ROOT / 'scripts/stop-model'), model_id], check=False,
-                                    stdout=sys.stderr if args.json else None).returncode
+                stop_cmd = [str(ROOT / 'scripts/stop-model')]
+                stop_env: dict[str, str] | None = None
+                if not in_custody:
+                    ex_res, ex_err = inspect_existing_runs_dir(runs, expected_stat=pinned_stat, label='--runs-dir')
+                    if ex_err is not None or ex_res is None or ex_res.stat_id is None:
+                        raise OperatorError(ex_err or 'Cannot validate active session store directory.')
+                    runs = ex_res.path
+                    pinned_stat = ex_res.stat_id
+                    stop_cmd.extend(['--runs-dir', str(runs)])
+                    stop_env = dict(os.environ)
+                    stop_env[PINNED_RUNS_STAT_ENV_VAR] = format_pinned_runs_stat(pinned_stat)
+                stop_cmd.append(model_id)
+                stop_kw: dict[str, Any] = {'check': False, 'stdout': sys.stderr if args.json else None}
+                if stop_env is not None:
+                    stop_kw['env'] = stop_env
+                rc = subprocess.run(stop_cmd, **stop_kw).returncode
                 if rc:
                     return rc
                 record = read_pid_record_for_model(model_id, runs)
@@ -490,10 +691,16 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if info['state'] != 'UNKNOWN' else 1
     except KeyboardInterrupt:
         return 130
-    except OperatorError as exc:
+    except (OperatorError, RegistryError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
     except Exception:
         # Never echo exception values: they may contain credential-store content.
         print('Session operation failed. Check model selection and session status; no automatic renewal or restart was attempted.', file=sys.stderr)
         return 1
+    finally:
+        if inproc_runs_applied:
+            set_cli_runs_dir_override(
+                prev_boot.cli_runs_dir if prev_boot is not None else None,
+                runs_stat=prev_boot.cli_runs_stat if prev_boot is not None else None,
+            )

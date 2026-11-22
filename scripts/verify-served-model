@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import os
+import sys
+
+sys.dont_write_bytecode = True
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+
 import argparse
 import json
-import os
 import shlex
 import shutil
 import subprocess
-import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -16,13 +20,23 @@ from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 ROOT = Path(__file__).resolve().parents[1]
 VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
+_HAS_SITE_FLAG = any(
+    tok == "--launcher-site-packages" or tok.startswith("--launcher-site-packages=")
+    for tok in sys.argv[1:]
+)
+_IS_RO_EXPORT = not (ROOT / ".git").exists() and not os.access(ROOT, os.W_OK)
+_WAS_VENV_REEXEC = os.environ.pop("_LOCAL_ASSIST_VENV_REEXEC", None) == "1"
 if (
     __name__ == "__main__"
+    and not sys.flags.isolated
+    and not _HAS_SITE_FLAG
+    and not _IS_RO_EXPORT
     and os.environ.get("LOCAL_ASSIST_WORKER_SANDBOX") != "1"
-    and os.environ.get("_LOCAL_ASSIST_VENV_REEXEC") != "1"
+    and not _WAS_VENV_REEXEC
     and VENV_PYTHON.exists()
+    and os.access(VENV_PYTHON, os.X_OK)
     and (ROOT / ".venv" / "pyvenv.cfg").is_file()
-    and Path(sys.executable) != VENV_PYTHON
+    and Path(sys.prefix).resolve() != (ROOT / ".venv").resolve()
 ):
     _tok_fd_raw = os.environ.get("_FREE_INFERENCE_TOKEN_FD", "").strip()
     if _tok_fd_raw.isdigit() and int(_tok_fd_raw) >= 3:
@@ -31,9 +45,13 @@ if (
         except OSError:
             pass
     os.environ["_LOCAL_ASSIST_VENV_REEXEC"] = "1"
-    os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), __file__, *sys.argv[1:]])
+    os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), "-B", __file__, *sys.argv[1:]])
 
 sys.path.insert(0, str(ROOT))
+if __name__ == "__main__":
+    from local_assist.custody import bootstrap_entrypoint
+
+    bootstrap_entrypoint(ROOT, sys.argv, allow_absent_runs_dir_flag=True)
 
 from local_assist.client import open_loopback_http
 from local_assist.registry import (
@@ -463,7 +481,8 @@ def _consume_handoff_token_fd() -> str | None:
 def main(argv: list[str]) -> int:
     handoff_token = _consume_handoff_token_fd()
     parser = argparse.ArgumentParser(
-        description="Verify the configured model endpoint is serving the expected model."
+        description="Verify the configured model endpoint is serving the expected model.",
+        allow_abbrev=False,
     )
     parser.add_argument("model_id", help="Model id from models.yaml.")
     parser.add_argument(
@@ -489,65 +508,174 @@ def main(argv: list[str]) -> int:
         default=None,
         help="Expected local port (overrides models.yaml and PID record default).",
     )
+    parser.add_argument(
+        "--launcher-site-packages",
+        default=None,
+        help="Explicit custody dependency directory.",
+    )
+    parser.add_argument(
+        "--runs-dir",
+        default=None,
+        help="Explicit non-custody session store directory.",
+    )
+    parser.add_argument(
+        "--allow-absent-runs-dir",
+        dest="allow_absent_runs_dir",
+        action="store_true",
+        default=False,
+        help=argparse.SUPPRESS,
+    )
     args = parser.parse_args(argv[1:])
+    import contextlib
+    from local_assist.custody import (
+        bind_pinned_runs_dir,
+        get_active_bootstrap_state,
+        inspect_existing_runs_dir,
+        is_custody_tree,
+        parse_pinned_runs_stat_env,
+        set_cli_runs_dir_override,
+        validate_creatable_runs_dir,
+    )
+    from local_assist.registry import _effective_runs_dir
+
+    prev_boot = get_active_bootstrap_state()
+    if args.runs_dir is not None or args.allow_absent_runs_dir:
+        from local_assist.launch import apply_inprocess_runs_dir_arg
+
+        runs_err = apply_inprocess_runs_dir_arg(args)
+        if runs_err is not None:
+            print(runs_err, file=sys.stderr)
+            return EXIT_UNREACHABLE
 
     try:
-        model = load_model(args.model_id)
-        initial_pid_record = read_pid_record_for_model(args.model_id)
-        endpoint_meta = resolve_endpoint(
-            model,
-            pid_record=initial_pid_record,
-            require_api_key=False,
-            port_override=args.port,
-        )
+        eff_runs = _effective_runs_dir()
     except RegistryError as exc:
         print(str(exc), file=sys.stderr)
         return EXIT_UNREACHABLE
 
-    deadline = time.monotonic() + max(0.0, args.wait)
-    while True:
-        pid_ok, pid_err = verify_pid_record_matches(
-            endpoint_meta,
-            require_offline=args.require_offline,
-        )
-        if not pid_ok and "has no active PID record" not in str(pid_err):
-            print(str(pid_err), file=sys.stderr)
-            return EXIT_MODEL_MISMATCH
+    expected_stat, pin_err = parse_pinned_runs_stat_env()
+    if pin_err is not None:
+        print(pin_err, file=sys.stderr)
+        return EXIT_UNREACHABLE
 
-        pid_record = read_pid_record_for_model(args.model_id)
-        try:
-            endpoint = resolve_endpoint(
-                model,
-                pid_record=pid_record,
-                require_api_key=True,
-                port_override=args.port,
-                session_token_override=handoff_token,
+    in_custody = (prev_boot is not None and prev_boot.custody_mode) or is_custody_tree(ROOT)
+    store_exists = False
+    if not in_custody:
+        if args.runs_dir is not None and not args.allow_absent_runs_dir:
+            store_exists = True
+        elif expected_stat is not None:
+            v_eff, eff_err = inspect_existing_runs_dir(
+                eff_runs,
+                expected_stat=expected_stat,
+                label="--runs-dir" if args.runs_dir is not None else "FREE_INFERENCE_RUNS_DIR",
             )
-        except RegistryError as exc:
-            if time.monotonic() >= deadline:
+            if eff_err is not None or v_eff is None:
+                print(eff_err or "Invalid session store directory.", file=sys.stderr)
+                return EXIT_UNREACHABLE
+            eff_runs = v_eff.path
+            store_exists = True
+        else:
+            v_eff, eff_err = validate_creatable_runs_dir(
+                eff_runs,
+                label="--runs-dir" if args.runs_dir is not None else "FREE_INFERENCE_RUNS_DIR",
+            )
+            if eff_err is not None or v_eff is None:
+                print(eff_err or "Invalid session store directory.", file=sys.stderr)
+                if args.runs_dir is not None:
+                    set_cli_runs_dir_override(
+                        prev_boot.cli_runs_dir if prev_boot is not None else None,
+                        runs_stat=prev_boot.cli_runs_stat if prev_boot is not None else None,
+                    )
+                return EXIT_UNREACHABLE
+            eff_runs = v_eff.path
+            store_exists = v_eff.exists
+            if expected_stat is None and v_eff.stat_id is not None:
+                expected_stat = v_eff.stat_id
+    else:
+        v_cust, cust_err = validate_creatable_runs_dir(eff_runs, label="active-runs pointer")
+        if cust_err is None and v_cust is not None and v_cust.exists:
+            eff_runs = v_cust.path
+            store_exists = True
+
+    pin_ctx: Any = (
+        bind_pinned_runs_dir(
+            eff_runs,
+            create=False,
+            expected_stat=expected_stat,
+            label="--runs-dir",
+        )
+        if (store_exists or expected_stat is not None)
+        else contextlib.nullcontext()
+    )
+
+    try:
+        with pin_ctx:
+            try:
+                model = load_model(args.model_id)
+                initial_pid_record = read_pid_record_for_model(args.model_id)
+                endpoint_meta = resolve_endpoint(
+                    model,
+                    pid_record=initial_pid_record,
+                    require_api_key=False,
+                    port_override=args.port,
+                )
+            except RegistryError as exc:
                 print(str(exc), file=sys.stderr)
                 return EXIT_UNREACHABLE
-            time.sleep(args.poll_interval)
-            continue
 
-        probe_timeout = compute_probe_timeout_seconds(
-            endpoint,
-            wait_seconds=args.wait,
-            remaining_seconds=max(0.0, deadline - time.monotonic()),
-        )
-        ok, message, is_mismatch = check_once_detailed(
-            endpoint,
-            timeout_seconds=probe_timeout,
-            pid_record=pid_record,
-            require_offline=args.require_offline,
-        )
-        if ok:
-            print(message)
-            return 0
-        if is_mismatch or time.monotonic() >= deadline:
-            print(message, file=sys.stderr)
-            return EXIT_MODEL_MISMATCH if is_mismatch else EXIT_UNREACHABLE
-        time.sleep(args.poll_interval)
+            deadline = time.monotonic() + max(0.0, args.wait)
+            while True:
+                pid_ok, pid_err = verify_pid_record_matches(
+                    endpoint_meta,
+                    require_offline=args.require_offline,
+                )
+                if not pid_ok and "has no active PID record" not in str(pid_err):
+                    print(str(pid_err), file=sys.stderr)
+                    return EXIT_MODEL_MISMATCH
+
+                pid_record = read_pid_record_for_model(args.model_id)
+                try:
+                    endpoint = resolve_endpoint(
+                        model,
+                        pid_record=pid_record,
+                        require_api_key=True,
+                        port_override=args.port,
+                        session_token_override=handoff_token,
+                    )
+                except RegistryError as exc:
+                    if time.monotonic() >= deadline:
+                        print(str(exc), file=sys.stderr)
+                        return EXIT_UNREACHABLE
+                    time.sleep(args.poll_interval)
+                    continue
+
+                probe_timeout = compute_probe_timeout_seconds(
+                    endpoint,
+                    wait_seconds=args.wait,
+                    remaining_seconds=max(0.0, deadline - time.monotonic()),
+                )
+                ok, message, is_mismatch = check_once_detailed(
+                    endpoint,
+                    timeout_seconds=probe_timeout,
+                    pid_record=pid_record,
+                    require_offline=args.require_offline,
+                )
+                if ok:
+                    print(message)
+                    return 0
+                if is_mismatch or time.monotonic() >= deadline:
+                    print(message, file=sys.stderr)
+                    return EXIT_MODEL_MISMATCH if is_mismatch else EXIT_UNREACHABLE
+                time.sleep(args.poll_interval)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return EXIT_UNREACHABLE
+    finally:
+        if args.runs_dir is not None:
+            set_cli_runs_dir_override(
+                prev_boot.cli_runs_dir if prev_boot is not None else None,
+                runs_stat=prev_boot.cli_runs_stat if prev_boot is not None else None,
+            )
 
 
 if __name__ == "__main__":

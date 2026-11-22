@@ -11,6 +11,7 @@ import select
 import shlex
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -21,12 +22,15 @@ from urllib.request import Request
 
 ROOT = Path(__file__).resolve().parents[1]
 VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
+_WAS_VENV_REEXEC = os.environ.pop("_LOCAL_ASSIST_VENV_REEXEC", None) == "1"
 if (
     __name__ == "__main__"
-    and os.environ.get("_LOCAL_ASSIST_VENV_REEXEC") != "1"
+    and not sys.flags.isolated
+    and not _WAS_VENV_REEXEC
     and VENV_PYTHON.exists()
+    and os.access(VENV_PYTHON, os.X_OK)
     and (ROOT / ".venv" / "pyvenv.cfg").is_file()
-    and Path(sys.executable) != VENV_PYTHON
+    and Path(sys.prefix).resolve() != (ROOT / ".venv").resolve()
 ):
     os.environ["_LOCAL_ASSIST_VENV_REEXEC"] = "1"
     os.execv(str(VENV_PYTHON), [str(VENV_PYTHON), __file__, *sys.argv[1:]])
@@ -65,8 +69,28 @@ from local_assist.security_profile import (
 
 
 from local_assist.registry import _effective_runs_dir
+from local_assist.custody import (
+    bind_pinned_runs_dir,
+    get_active_bootstrap_state,
+    inspect_existing_runs_dir,
+    is_custody_tree,
+    parse_pinned_runs_stat_env,
+    runs_store_open_file,
+    runs_store_read_text,
+    runs_store_unlink,
+    runs_store_write_atomic,
+    runs_store_write_exclusive,
+    set_cli_runs_dir_override,
+    validate_creatable_runs_dir,
+    write_active_runs_pointer,
+)
 
-RUNS = _effective_runs_dir()
+_HAD_EXPLICIT_ENV_RUNS_DIR = bool(os.environ.get("FREE_INFERENCE_RUNS_DIR", "").strip())
+try:
+    _INITIAL_RUNS = _effective_runs_dir()
+except RegistryError:
+    _INITIAL_RUNS = ROOT / "runs"
+RUNS = _INITIAL_RUNS
 DEFAULT_PORT = 8080
 DEFAULT_MAX_TOKENS_CAP = 4096
 INTERACTIVE_MAX_CHAT_REQUESTS = 1000
@@ -339,14 +363,17 @@ def build_se_key_proxy_child_env(
 
 
 def _write_exclusive_session_token(path: Path, token: str) -> None:
-    path.unlink(missing_ok=True)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(str(path), flags, 0o600)
-    try:
-        os.fchmod(fd, 0o600)
-        os.write(fd, (token + "\n").encode("utf-8"))
-    finally:
-        os.close(fd)
+    runs_store_write_exclusive(path.parent, path.name, token + "\n", mode=0o600)
+
+
+def _assert_runs_path_unswapped(runs_dir: Path, expected_stat: tuple[int, int] | None) -> None:
+    if expected_stat is None:
+        return
+    st = os.lstat(runs_dir)
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        raise RuntimeError(f"Session store '{runs_dir}' is no longer a directory")
+    if (int(st.st_dev), int(st.st_ino)) != (int(expected_stat[0]), int(expected_stat[1])):
+        raise RuntimeError(f"Session store '{runs_dir}' was replaced concurrently")
 
 
 def _terminate_proc(proc: subprocess.Popen[Any] | None) -> None:
@@ -371,9 +398,7 @@ class _SignalInterruptedError(BaseException):
 
 @contextlib.contextmanager
 def _pid_lock(runs_dir: Path):
-    runs_dir.mkdir(parents=True, exist_ok=True)
-    pid_lock_path = runs_dir / ".pid.lock"
-    with pid_lock_path.open("w") as fh:
+    with runs_store_open_file(runs_dir, ".pid.lock", append=False, mode=0o600) as fh:
         fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
         try:
             yield
@@ -391,10 +416,11 @@ def _write_pid_files(
     record: dict[str, Any],
 ) -> None:
     serialized = json.dumps(record, indent=2) + "\n"
-    model_pid_file.write_text(serialized)
-    if default_pid_file.exists():
+    runs_store_write_atomic(model_pid_file.parent, model_pid_file.name, serialized, mode=0o600)
+    raw_default = runs_store_read_text(default_pid_file.parent, default_pid_file.name)
+    if raw_default is not None:
         try:
-            existing = json.loads(default_pid_file.read_text())
+            existing = json.loads(raw_default)
             if (
                 isinstance(existing, dict)
                 and existing.get("model_id") != record.get("model_id")
@@ -409,19 +435,20 @@ def _write_pid_files(
                         return
         except (OSError, json.JSONDecodeError):
             pass
-    default_pid_file.write_text(serialized)
+    runs_store_write_atomic(default_pid_file.parent, default_pid_file.name, serialized, mode=0o600)
 
 
 def _assert_provisional_record_active(
     model_pid_file: Path,
     startup_nonce: str,
 ) -> None:
-    if not model_pid_file.exists():
+    raw_txt = runs_store_read_text(model_pid_file.parent, model_pid_file.name)
+    if raw_txt is None:
         raise RuntimeError(
             "Startup aborted: provisional PID file was removed concurrently by stop-model"
         )
     try:
-        current_disk_rec = json.loads(model_pid_file.read_text())
+        current_disk_rec = json.loads(raw_txt)
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError(
             f"Startup aborted: provisional PID record unreadable: {exc}"
@@ -443,21 +470,19 @@ def _unlink_pid_files_if_matching(
 ) -> None:
     for p in (model_pid_file, default_pid_file):
         try:
-            if not p.exists():
+            raw_txt = runs_store_read_text(p.parent, p.name)
+            if raw_txt is None:
                 continue
-            rec = json.loads(p.read_text())
+            rec = json.loads(raw_txt)
             if isinstance(rec, dict) and (
                 rec.get("startup_nonce") == startup_nonce
                 or rec.get("model_id") == model_id
             ):
-                p.unlink(missing_ok=True)
+                runs_store_unlink(p.parent, p.name)
         except OSError:
             pass
         except json.JSONDecodeError:
-            try:
-                p.unlink(missing_ok=True)
-            except OSError:
-                pass
+            runs_store_unlink(p.parent, p.name)
 
 
 def _extract_default_chat_params(
@@ -477,7 +502,8 @@ def _extract_default_chat_params(
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(
-        description="Start the local model or proxy server configured in models.yaml."
+        description="Start the local model or proxy server configured in models.yaml.",
+        allow_abbrev=False,
     )
     parser.add_argument("model_id", help="Model id from models.yaml.")
     parser.add_argument(
@@ -570,7 +596,156 @@ def main(argv: list[str]) -> int:
         default=False,
         help="Stop any active server/proxy session for this model on the target port and start a fresh session.",
     )
+    parser.add_argument(
+        "--runs-dir",
+        dest="runs_dir",
+        default=None,
+        help="Explicit non-custody session store directory.",
+    )
+    parser.add_argument(
+        "--publish-active-runs",
+        dest="publish_active_runs",
+        action="store_true",
+        default=False,
+        help="Publish RUNS to ~/.config/free-inference/active-runs.json even when --runs-dir was passed by a parent CLI.",
+    )
     args = parser.parse_args(argv[1:])
+
+    global RUNS
+
+    prev_boot = get_active_bootstrap_state()
+    prev_runs = RUNS
+    inproc_runs_applied = False
+    in_custody = (prev_boot is not None and prev_boot.custody_mode) or is_custody_tree(ROOT)
+    if args.runs_dir is not None or args.publish_active_runs:
+        if in_custody:
+            print("Refusing --runs-dir / --publish-active-runs in read-only/custody mode.", file=sys.stderr)
+            return 1
+    expected_stat, pin_err = parse_pinned_runs_stat_env()
+    if pin_err is not None and not in_custody:
+        print(pin_err, file=sys.stderr)
+        return 1
+
+    if args.runs_dir is not None:
+        v_runs, runs_err = inspect_existing_runs_dir(
+            args.runs_dir,
+            expected_stat=expected_stat,
+            label="--runs-dir",
+        )
+        if runs_err is not None or v_runs is None:
+            print(runs_err or "Invalid --runs-dir.", file=sys.stderr)
+            return 1
+        set_cli_runs_dir_override(v_runs.path, runs_stat=v_runs.stat_id)
+        RUNS = v_runs.path
+        expected_stat = v_runs.stat_id
+        inproc_runs_applied = True
+        should_publish_pointer = bool(args.publish_active_runs)
+    else:
+        if prev_runs == _INITIAL_RUNS:
+            try:
+                RUNS = _effective_runs_dir()
+            except RegistryError as exc:
+                print(str(exc), file=sys.stderr)
+                return 1
+            if not in_custody:
+                if expected_stat is not None:
+                    v_eff, eff_err = inspect_existing_runs_dir(
+                        RUNS,
+                        expected_stat=expected_stat,
+                        label="FREE_INFERENCE_RUNS_DIR",
+                    )
+                else:
+                    v_eff, eff_err = validate_creatable_runs_dir(RUNS, label="FREE_INFERENCE_RUNS_DIR")
+                if eff_err is not None or v_eff is None:
+                    print(eff_err or "Invalid session store directory.", file=sys.stderr)
+                    return 1
+                RUNS = v_eff.path
+                if expected_stat is None:
+                    expected_stat = v_eff.stat_id
+        should_publish_pointer = (
+            not in_custody
+            and prev_runs == _INITIAL_RUNS
+            and not _HAD_EXPLICIT_ENV_RUNS_DIR
+            and not bool(os.environ.get("FREE_INFERENCE_RUNS_DIR", "").strip())
+        )
+
+    try:
+        return _main_serve_inner(
+            args,
+            argv,
+            should_publish_pointer=should_publish_pointer,
+            in_custody=in_custody,
+            expected_stat=expected_stat,
+        )
+    finally:
+        RUNS = prev_runs
+        if inproc_runs_applied:
+            set_cli_runs_dir_override(
+                prev_boot.cli_runs_dir if prev_boot is not None else None,
+                runs_stat=prev_boot.cli_runs_stat if prev_boot is not None else None,
+            )
+
+
+def _publish_active_runs_pointer_with_warning(
+    runs_dir: Path,
+    *,
+    expected_stat: tuple[int, int] | None = None,
+) -> None:
+    try:
+        ok = write_active_runs_pointer(runs_dir, expected_stat=expected_stat)
+    except Exception as ptr_exc:
+        print(
+            f"WARNING: failed to update ~/.config/free-inference/active-runs.json: {ptr_exc}",
+            file=sys.stderr,
+        )
+        return
+    if not ok:
+        print(
+            f"WARNING: failed to update ~/.config/free-inference/active-runs.json for '{runs_dir}'.",
+            file=sys.stderr,
+        )
+
+
+def _main_serve_inner(
+    args: argparse.Namespace,
+    argv: list[str],
+    *,
+    should_publish_pointer: bool,
+    in_custody: bool,
+    expected_stat: tuple[int, int] | None,
+) -> int:
+    with contextlib.ExitStack() as runs_stack:
+        try:
+            return _main_serve_body(
+                args,
+                argv,
+                runs_stack=runs_stack,
+                should_publish_pointer=should_publish_pointer,
+                in_custody=in_custody,
+                expected_stat=expected_stat,
+            )
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+
+
+def _main_serve_body(
+    args: argparse.Namespace,
+    argv: list[str],
+    *,
+    runs_stack: contextlib.ExitStack,
+    should_publish_pointer: bool,
+    in_custody: bool,
+    expected_stat: tuple[int, int] | None,
+) -> int:
+    global RUNS
+    pinned_stat = expected_stat
+    if not in_custody and (args.runs_dir is not None or expected_stat is not None or RUNS.is_dir()):
+        v_initial = runs_stack.enter_context(
+            bind_pinned_runs_dir(RUNS, create=False, expected_stat=expected_stat, label="--runs-dir")
+        )
+        RUNS = v_initial.path
+        pinned_stat = v_initial.stat_id
 
     if args.interactive and args.eval_caps:
         print("Cannot combine --interactive and --eval-caps.", file=sys.stderr)
@@ -631,8 +806,16 @@ def main(argv: list[str]) -> int:
     port = args.port if args.port is not None else (endpoint.port or DEFAULT_PORT)
     api_base_url = build_base_url(host, port)
 
-    RUNS.mkdir(exist_ok=True)
-    (ROOT / ".home" / "huggingface").mkdir(parents=True, exist_ok=True)
+    if not in_custody:
+        v_created = runs_stack.enter_context(
+            bind_pinned_runs_dir(RUNS, create=True, expected_stat=pinned_stat, label="--runs-dir")
+        )
+        RUNS = v_created.path
+        pinned_stat = v_created.stat_id
+        (ROOT / ".home" / "huggingface").mkdir(parents=True, exist_ok=True)
+    else:
+        print("Refusing to start or write session store in read-only/custody mode.", file=sys.stderr)
+        return 1
 
     uses_se_key_proxy = bool(endpoint.api_key_keychain_service)
     se_proxy_bin: Path | None = None
@@ -702,8 +885,7 @@ def main(argv: list[str]) -> int:
         or os.environ.get("LOCAL_ASSIST_STARTED_BY")
         or "manual"
     )
-    lock_path = RUNS / ".serve.lock"
-    with lock_path.open("w") as lock_file:
+    with runs_store_open_file(RUNS, ".serve.lock", append=False, mode=0o600) as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         same_model_record: dict[str, Any] | None = None
         legacy_port_record: dict[str, Any] | None = None
@@ -778,6 +960,8 @@ def main(argv: list[str]) -> int:
             return 1
 
         if same_model_record is not None and not args.refresh_session:
+            if should_publish_pointer:
+                _publish_active_runs_pointer_with_warning(RUNS, expected_stat=pinned_stat)
             print(
                 f"Server for '{endpoint.model_id}' is already active (or starting) on port {port} "
                 f"(pid={same_model_record.get('pid')}, {api_base_url})."
@@ -841,7 +1025,7 @@ def main(argv: list[str]) -> int:
                         endpoint.model_id,
                         str(srec.get("startup_nonce") or ""),
                     )
-                session_token_file_for_model(endpoint.model_id, RUNS).unlink(missing_ok=True)
+                runs_store_unlink(RUNS, session_token_file_for_model(endpoint.model_id, RUNS).name)
 
         if health(api_base_url, endpoint.api_key):
             print(
@@ -953,7 +1137,8 @@ def main(argv: list[str]) -> int:
                             isolated_upstream_home = ROOT / ".home"
                             isolated_upstream_home.mkdir(parents=True, exist_ok=True)
                             upstream_env = build_tinfoil_child_env(isolated_home=isolated_upstream_home)
-                            with log.open("a") as log_fh:
+                            _assert_runs_path_unswapped(RUNS, pinned_stat)
+                            with runs_store_open_file(RUNS, "serve.log", append=True, mode=0o600) as log_fh:
                                 upstream_proc = subprocess.Popen(
                                     upstream_cmd,
                                     cwd=ROOT,
@@ -1032,7 +1217,8 @@ def main(argv: list[str]) -> int:
                         provisional_record["command"] = se_cmd
                         print("Starting se-key-proxy (Touch ID required):", " ".join(shlex.quote(part) for part in se_cmd[:8]), "...")
                         se_child_env = build_se_key_proxy_child_env()
-                        with log.open("a") as log_fh:
+                        _assert_runs_path_unswapped(RUNS, pinned_stat)
+                        with runs_store_open_file(RUNS, "serve.log", append=True, mode=0o600) as log_fh:
                             se_proc = subprocess.Popen(
                                 se_cmd,
                                 cwd=ROOT,
@@ -1089,6 +1275,8 @@ def main(argv: list[str]) -> int:
                         ready_record = dict(provisional_record)
                         ready_record["status"] = "ready"
                         _write_pid_files(model_pid_file, default_pid_file, ready_record)
+                    if should_publish_pointer:
+                        _publish_active_runs_pointer_with_warning(RUNS, expected_stat=pinned_stat)
                 except BaseException as exc:
                     signal.signal(signal.SIGINT, signal.SIG_IGN)
                     signal.signal(signal.SIGTERM, signal.SIG_IGN)
@@ -1102,7 +1290,7 @@ def main(argv: list[str]) -> int:
                     _terminate_proc(se_proc)
                     _terminate_proc(upstream_proc)
                     with _pid_lock(RUNS):
-                        token_path.unlink(missing_ok=True)
+                        runs_store_unlink(RUNS, token_path.name)
                         _unlink_pid_files_if_matching(model_pid_file, default_pid_file, endpoint.model_id, startup_nonce)
                     if isinstance(exc, KeyboardInterrupt):
                         print(f"Interrupted while starting proxy for '{endpoint.model_id}'.", file=sys.stderr)
@@ -1144,7 +1332,8 @@ def main(argv: list[str]) -> int:
                 with _pid_lock(RUNS):
                     _assert_provisional_record_active(model_pid_file, startup_nonce)
                     print("Starting:", " ".join(shlex.quote(part) for part in cmd))
-                    with log.open("a") as log_fh:
+                    _assert_runs_path_unswapped(RUNS, pinned_stat)
+                    with runs_store_open_file(RUNS, "serve.log", append=True, mode=0o600) as log_fh:
                         proc = subprocess.Popen(
                             cmd,
                             cwd=ROOT,
@@ -1158,6 +1347,8 @@ def main(argv: list[str]) -> int:
                     ready_local["pid_lstart"] = _require_process_lstart(proc.pid)
                     ready_local["status"] = "ready"
                     _write_pid_files(model_pid_file, default_pid_file, ready_local)
+                if should_publish_pointer:
+                    _publish_active_runs_pointer_with_warning(RUNS, expected_stat=pinned_stat)
             except BaseException as exc:
                 signal.signal(signal.SIGINT, signal.SIG_IGN)
                 signal.signal(signal.SIGTERM, signal.SIG_IGN)

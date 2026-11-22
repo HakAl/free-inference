@@ -16,6 +16,7 @@ import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -25,7 +26,17 @@ from typing import Any, Callable, Mapping, Sequence
 from urllib.parse import urlparse
 
 from ._miniyaml import safe_load
+from .custody import (
+    _resolve_passwd_home_dir,
+    effective_worker_homes_dir,
+    get_active_bootstrap_state,
+    is_custody_tree,
+    resolve_user_custody_opencode_dir,
+    unvalidated_external_worker_homes_path,
+    validate_owned_directory,
+)
 from .paths import LOCAL_ASSIST_RUNS, ROOT
+from .proc_identity import WORKER_TAG_RE
 from .relay import SessionAuthRelay, _WorkerTokenRelay, redact_session_tokens
 from .registry import (
     DEFAULT_RUNS_DIR,
@@ -41,11 +52,26 @@ from .registry import (
 
 
 SCHEMA_VERSION = 1
-TESTED_OPENCODE_VERSION = "2.0.32"
+TESTED_OPENCODE_VERSION = "2.3.2"
 WORKER_HOMES_DIR = ROOT / ".home" / "workers"
 WORKER_SANDBOX_LOG_ROOT = LOCAL_ASSIST_RUNS / "worker-sandbox"
 STALE_WORKER_HOME_MAX_AGE_SECONDS = 3600
 MAX_HARVEST_LOG_BYTES = 10 * 1024 * 1024
+SUN_PATH_MAX_BYTES = 103
+BRIDGE_METADATA_FILENAMES: tuple[str, ...] = (
+    "owner.json",
+    "profile.yaml",
+    "manifest.json",
+    "launcher_exit.json",
+)
+
+
+def _active_worker_homes_dir(*, create: bool = False) -> Path:
+    if WORKER_HOMES_DIR != (ROOT / ".home" / "workers"):
+        if create:
+            WORKER_HOMES_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        return WORKER_HOMES_DIR
+    return effective_worker_homes_dir(ROOT, create=create)
 
 KNOWN_BUILTIN_TOOLS: tuple[str, ...] = (
     "read",
@@ -69,7 +95,11 @@ KNOWN_BUILTIN_TOOLS: tuple[str, ...] = (
     "question",
     "external_directory",
     "doom_loop",
+    "browser",
+    "execute",
 )
+
+HARD_DENIED_WORKER_TOOLS: frozenset[str] = frozenset({"browser", "execute"})
 
 DEFAULT_ALLOWED_TOOLS: tuple[str, ...] = (
     "read",
@@ -156,6 +186,7 @@ DEFAULT_STRIP_ENV_PREFIXES: tuple[str, ...] = (
 )
 
 DEFAULT_STRIP_ENV_NAMES: tuple[str, ...] = (
+    "_FREE_INFERENCE_PINNED_RUNS_STAT",
     "SSH_AUTH_SOCK",
     "SSH_AGENT_PID",
     "GPG_AGENT_INFO",
@@ -199,12 +230,17 @@ RESERVED_WORKER_ENV_NAMES: tuple[str, ...] = (
     "OPENCODE_CONFIG",
     "OPENCODE_CONFIG_DIR",
     "OPENCODE_CONFIG_CONTENT",
+    "OPENCODE_CLI_CONFIG_CONTENT",
     "OPENCODE_DISABLE_PROJECT_CONFIG",
     "OPENCODE_CONFIG_PROJECT_DISABLE",
     "OPENCODE_DISABLE_CLAUDE_CODE",
     "OPENCODE_DISABLE_CLAUDE_CODE_SKILLS",
     "OPENCODE_DISABLE_AUTOUPDATE",
     "OPENCODE_PERMISSION",
+    "OPENCODE_PTY_BIN",
+    "OPENCODE_PTY_HANDOFF",
+    "OPENCODE_PTY_SOCKET_DIR",
+    "OPENCODE_DB",
     "SHELL",
     "PATH",
     "GIT_CONFIG_GLOBAL",
@@ -219,7 +255,7 @@ RESERVED_WORKER_ENV_NAMES: tuple[str, ...] = (
 RESERVED_PORT_DENYLIST: tuple[int, ...] = (8080, 8081, 8082, 9081, 9082, 9181, 9182, 49374)
 
 ALLOWED_RUN_BOOLEAN_FLAGS: frozenset[str] = frozenset({"--standalone", "--thinking"})
-ALLOWED_RUN_VALUE_FLAGS: frozenset[str] = frozenset({"--format", "--title", "--variant"})
+ALLOWED_RUN_VALUE_FLAGS: frozenset[str] = frozenset({"--format", "--title"})
 
 MCP_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -256,6 +292,7 @@ class WorkerSecurityProfile:
     enforce_os_sandbox: bool = True
     allow_uncleared_model: bool = False
     spend_max_session_usd: float | None = None
+    spend_inherit_attached_session_caps: bool = False
     read_roots: tuple[str, ...] = (".",)
     write_roots: tuple[str, ...] = (".",)
     protected_paths: tuple[str, ...] = ()
@@ -272,6 +309,7 @@ class WorkerSecurityProfile:
     network_allowed_endpoints: tuple[str, ...] = ("loopback",)
     network_allowed_shell_localhost_ports: tuple[int, ...] = ()
     network_denied_localhost_ports: tuple[int, ...] = ()
+    network_allowed_unix_sockets: tuple[str, ...] = ()
     env_allowlist: tuple[str, ...] = DEFAULT_ENV_ALLOWLIST
     env_strip_prefixes: tuple[str, ...] = ()
     env_strip_names: tuple[str, ...] = ()
@@ -495,6 +533,132 @@ def _validate_mcp_tool_patterns(
             )
 
 
+def _check_local_mcp_shell_port_conflict(
+    mcp_servers: Mapping[str, McpServerPolicy],
+    shell_ports: Sequence[int],
+) -> None:
+    if any(srv.enabled and srv.type == "local" for srv in mcp_servers.values()) and bool(shell_ports):
+        raise SecurityProfileError(
+            "Cannot combine enabled local MCP servers (mcp.servers type='local') with "
+            "network.allowed_shell_localhost_ports; local MCP relays and shell children "
+            "must remain denied all IP/TCP outbound."
+        )
+
+
+def _is_prohibited_mdnsresponder_socket(
+    cand: Path,
+    leaf_st: os.stat_result | None = None,
+) -> bool:
+    low = str(cand).lower()
+    if low.startswith("/system/volumes/data/"):
+        low = low[len("/system/volumes/data") :]
+    if low in ("/var/run/mdnsresponder", "/private/var/run/mdnsresponder"):
+        return True
+    st_cand = leaf_st
+    if st_cand is None:
+        try:
+            st_cand = os.lstat(cand)
+        except OSError:
+            st_cand = None
+    if st_cand is not None:
+        cand_id = (int(st_cand.st_dev), int(st_cand.st_ino))
+        for ref_sock in ("/private/var/run/mDNSResponder", "/System/Volumes/Data/private/var/run/mDNSResponder"):
+            try:
+                ref_st = os.lstat(ref_sock)
+                if (int(ref_st.st_dev), int(ref_st.st_ino)) == cand_id:
+                    return True
+            except OSError:
+                continue
+    return False
+
+
+def _validate_unix_socket_path(
+    raw_sock: str,
+    *,
+    credential_deny_paths: Sequence[Path],
+    context: str,
+) -> str:
+    if not isinstance(raw_sock, str) or not raw_sock.strip():
+        raise SecurityProfileError(f"{context}: Unix socket path must be a non-empty string.")
+    cleaned = raw_sock.strip()
+    if not cleaned.startswith("/") or cleaned.endswith("/"):
+        raise SecurityProfileError(
+            f"{context}: Unix socket path must be an absolute file path starting with '/', got {raw_sock!r}."
+        )
+    if "//" in cleaned:
+        raise SecurityProfileError(
+            f"{context}: Unix socket path must not contain duplicate '/' separators: {raw_sock!r}."
+        )
+    parts = [p for p in cleaned.split("/") if p]
+    if not parts or "." in parts or ".." in parts:
+        raise SecurityProfileError(
+            f"{context}: Unix socket path must not contain '.' or '..' segments: {raw_sock!r}."
+        )
+    cleaned = "/" + "/".join(parts)
+    if len(os.fsencode(cleaned)) > SUN_PATH_MAX_BYTES:
+        raise SecurityProfileError(
+            f"{context}: Unix socket path exceeds {SUN_PATH_MAX_BYTES} bytes ({len(os.fsencode(cleaned))} bytes): {cleaned!r}."
+        )
+
+    sock_path = Path(cleaned)
+    if _is_prohibited_mdnsresponder_socket(sock_path):
+        raise SecurityProfileError(f"{context}: mDNSResponder socket cannot be granted in worker profiles.")
+
+    cur = Path("/")
+    for part in parts[:-1]:
+        cur = cur / part
+        try:
+            st = os.lstat(cur)
+        except FileNotFoundError:
+            break
+        except OSError as exc:
+            raise SecurityProfileError(f"{context}: cannot stat socket ancestor '{cur}': {exc}") from exc
+        if stat.S_ISLNK(st.st_mode):
+            if cur in (Path("/tmp"), Path("/var"), Path("/etc")) and st.st_uid == 0 and cur.is_dir():
+                continue
+            raise SecurityProfileError(
+                f"{context}: Unix socket ancestor '{cur}' must be a real non-symlink directory."
+            )
+        if not stat.S_ISDIR(st.st_mode):
+            raise SecurityProfileError(
+                f"{context}: Unix socket ancestor '{cur}' must be a real non-symlink directory."
+            )
+
+    try:
+        leaf_st = os.lstat(sock_path)
+    except FileNotFoundError:
+        leaf_st = None
+    except OSError as exc:
+        raise SecurityProfileError(f"{context}: cannot stat Unix socket '{sock_path}': {exc}") from exc
+    if leaf_st is not None and (stat.S_ISLNK(leaf_st.st_mode) or stat.S_ISDIR(leaf_st.st_mode)):
+        raise SecurityProfileError(
+            f"{context}: Unix socket target '{sock_path}' must not be a symlink or directory."
+        )
+    if _is_prohibited_mdnsresponder_socket(sock_path, leaf_st):
+        raise SecurityProfileError(f"{context}: mDNSResponder socket cannot be granted in worker profiles.")
+
+    parent_real = sock_path.parent.resolve() if sock_path.parent.exists() else sock_path.parent
+    canonical_sock = parent_real / sock_path.name
+    if _is_prohibited_mdnsresponder_socket(canonical_sock):
+        raise SecurityProfileError(f"{context}: mDNSResponder socket cannot be granted in worker profiles.")
+    if len(os.fsencode(str(canonical_sock))) > SUN_PATH_MAX_BYTES:
+        raise SecurityProfileError(
+            f"{context}: canonical Unix socket path '{canonical_sock}' exceeds {SUN_PATH_MAX_BYTES} bytes."
+        )
+
+    for dp in credential_deny_paths:
+        try:
+            dp_real = dp.expanduser().resolve()
+        except OSError:
+            dp_real = dp.expanduser().absolute()
+        for cand in (sock_path, canonical_sock):
+            if cand == dp_real or dp_real in cand.parents:
+                raise SecurityProfileError(
+                    f"{context}: Unix socket '{cand}' overlaps denied credential/runtime path '{dp_real}'."
+                )
+    return cleaned
+
+
 def parse_security_profile_dict(raw: dict[str, Any]) -> WorkerSecurityProfile:
     top = _ensure_mapping(raw, "security_profile")
     _reject_unknown_keys(
@@ -539,7 +703,11 @@ def parse_security_profile_dict(raw: dict[str, Any]) -> WorkerSecurityProfile:
     )
 
     spend_raw = _ensure_mapping(top.get("spend") or {}, "spend")
-    _reject_unknown_keys(spend_raw, {"max_session_usd"}, "spend")
+    _reject_unknown_keys(
+        spend_raw,
+        {"max_session_usd", "inherit_attached_session_caps"},
+        "spend",
+    )
     max_session_usd_raw = spend_raw.get("max_session_usd")
     spend_max_session_usd: float | None = None
     if max_session_usd_raw is not None:
@@ -553,6 +721,10 @@ def parse_security_profile_dict(raw: dict[str, Any]) -> WorkerSecurityProfile:
                 f"spend.max_session_usd must be a finite positive number or null, got {max_session_usd_raw!r}."
             )
         spend_max_session_usd = float(max_session_usd_raw)
+    spend_inherit_attached_session_caps = _ensure_bool(
+        spend_raw.get("inherit_attached_session_caps", False),
+        "spend.inherit_attached_session_caps",
+    )
 
     fs_raw = _ensure_mapping(top.get("filesystem") or {}, "filesystem")
     _reject_unknown_keys(
@@ -598,6 +770,11 @@ def parse_security_profile_dict(raw: dict[str, Any]) -> WorkerSecurityProfile:
         if t not in KNOWN_BUILTIN_TOOLS:
             raise SecurityProfileError(
                 f"Unknown built-in tool {t!r}. Allowed built-in tool names: {', '.join(KNOWN_BUILTIN_TOOLS)}."
+            )
+    for t in allowed_tools:
+        if t in HARD_DENIED_WORKER_TOOLS:
+            raise SecurityProfileError(
+                f"Built-in tool {t!r} is unconditionally denied in unattended worker mode."
             )
     allow_subagents = _ensure_bool(
         tools_raw.get("allow_subagents", False), "tools.allow_subagents"
@@ -701,6 +878,7 @@ def parse_security_profile_dict(raw: dict[str, Any]) -> WorkerSecurityProfile:
             "allowed_endpoints",
             "allowed_shell_localhost_ports",
             "denied_localhost_ports",
+            "allowed_unix_sockets",
         },
         "network",
     )
@@ -728,12 +906,30 @@ def parse_security_profile_dict(raw: dict[str, Any]) -> WorkerSecurityProfile:
         "network.denied_localhost_ports",
     )
 
+    prelim_cred_denies = _collect_credential_deny_paths_raw(credential_deny_paths)
+    raw_unix_sockets = _ensure_str_list(
+        net_raw.get("allowed_unix_sockets", []),
+        "network.allowed_unix_sockets",
+    )
+    validated_unix_sockets: list[str] = []
+    for raw_us in raw_unix_sockets:
+        clean_us = _validate_unix_socket_path(
+            raw_us,
+            credential_deny_paths=prelim_cred_denies,
+            context="network.allowed_unix_sockets",
+        )
+        if clean_us not in validated_unix_sockets:
+            validated_unix_sockets.append(clean_us)
+
+    _check_local_mcp_shell_port_conflict(mcp_servers, network_allowed_shell_localhost_ports)
+
     return WorkerSecurityProfile(
         schema_version=schema_version,
         mode=mode,
         enforce_os_sandbox=enforce_os_sandbox,
         allow_uncleared_model=allow_uncleared_model,
         spend_max_session_usd=spend_max_session_usd,
+        spend_inherit_attached_session_caps=spend_inherit_attached_session_caps,
         read_roots=read_roots,
         write_roots=write_roots,
         protected_paths=protected_paths,
@@ -750,6 +946,7 @@ def parse_security_profile_dict(raw: dict[str, Any]) -> WorkerSecurityProfile:
         network_allowed_endpoints=network_allowed_endpoints,
         network_allowed_shell_localhost_ports=network_allowed_shell_localhost_ports,
         network_denied_localhost_ports=network_denied_localhost_ports,
+        network_allowed_unix_sockets=tuple(validated_unix_sockets),
         env_allowlist=env_allowlist,
         env_strip_prefixes=env_strip_prefixes,
         env_strip_names=env_strip_names,
@@ -802,6 +999,8 @@ def apply_cli_overrides(
     allow_subagents: bool | None = None,
     allow_ssh_agent: bool | None = None,
     allowed_localhost_ports: Sequence[int] | None = None,
+    allowed_unix_sockets: Sequence[str] | None = None,
+    inherit_session_caps: bool | None = None,
     pass_env: Sequence[str] | None = None,
 ) -> WorkerSecurityProfile:
     eff_read_roots = tuple(read_roots) if read_roots else profile.read_roots
@@ -823,6 +1022,11 @@ def apply_cli_overrides(
     eff_allow_ssh_agent = (
         allow_ssh_agent if allow_ssh_agent is not None else profile.allow_ssh_agent
     )
+    eff_inherit_caps = (
+        inherit_session_caps
+        if inherit_session_caps is not None
+        else profile.spend_inherit_attached_session_caps
+    )
 
     extra_ports: list[int] = []
     for raw_port in allowed_localhost_ports or ():
@@ -837,6 +1041,20 @@ def apply_cli_overrides(
         extra_ports.append(raw_port)
     eff_allowed_shell_ports = tuple(
         dict.fromkeys((*profile.network_allowed_shell_localhost_ports, *extra_ports))
+    )
+    _check_local_mcp_shell_port_conflict(profile.mcp_servers, eff_allowed_shell_ports)
+
+    prelim_cred_denies = _collect_credential_deny_paths(profile)
+    extra_unix_socks: list[str] = []
+    for raw_sock in allowed_unix_sockets or ():
+        clean_sock = _validate_unix_socket_path(
+            raw_sock,
+            credential_deny_paths=prelim_cred_denies,
+            context="--allow-unix-socket",
+        )
+        extra_unix_socks.append(clean_sock)
+    eff_allowed_unix_sockets = tuple(
+        dict.fromkeys((*profile.network_allowed_unix_sockets, *extra_unix_socks))
     )
 
     extra_env_names: list[str] = []
@@ -865,6 +1083,11 @@ def apply_cli_overrides(
             raise SecurityProfileError(
                 f"Unknown built-in tool {t!r}. Allowed built-in tool names: {', '.join(KNOWN_BUILTIN_TOOLS)}."
             )
+    for t in eff_allowed_tools:
+        if t in HARD_DENIED_WORKER_TOOLS:
+            raise SecurityProfileError(
+                f"Built-in tool {t!r} is unconditionally denied in unattended worker mode."
+            )
 
     configured_server_names = set(profile.mcp_servers.keys())
     if profile.mcp_enable_local_assist:
@@ -886,6 +1109,7 @@ def apply_cli_overrides(
         enforce_os_sandbox=profile.enforce_os_sandbox,
         allow_uncleared_model=profile.allow_uncleared_model,
         spend_max_session_usd=profile.spend_max_session_usd,
+        spend_inherit_attached_session_caps=eff_inherit_caps,
         read_roots=eff_read_roots,
         write_roots=eff_write_roots,
         protected_paths=eff_protected_paths,
@@ -902,6 +1126,7 @@ def apply_cli_overrides(
         network_allowed_endpoints=profile.network_allowed_endpoints,
         network_allowed_shell_localhost_ports=eff_allowed_shell_ports,
         network_denied_localhost_ports=profile.network_denied_localhost_ports,
+        network_allowed_unix_sockets=eff_allowed_unix_sockets,
         env_allowlist=eff_env_allowlist,
         env_strip_prefixes=profile.env_strip_prefixes,
         env_strip_names=profile.env_strip_names,
@@ -959,7 +1184,7 @@ def validate_worker_opencode_args(opencode_args: Sequence[str]) -> list[str]:
                 continue
             raise SecurityProfileError(
                 f"Disallowed opencode flag {token!r} in unattended worker mode. "
-                "Only '--standalone', '--format', '--title', '--variant', and '--thinking' are permitted."
+                "Only '--standalone', '--format', '--title', and '--thinking' are permitted."
             )
         if token.strip():
             prompt_tokens.append(token)
@@ -979,13 +1204,25 @@ def verify_opencode_version(
     allow_version_drift: bool = False,
 ) -> str:
     try:
-        proc = subprocess.run(
-            [str(opencode_bin), "--version"],
-            capture_output=True,
-            text=True,
-            timeout=5,
-            check=False,
-        )
+        with tempfile.TemporaryDirectory(prefix="oc-ver-") as tmp_home:
+            ver_env = {
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                "HOME": tmp_home,
+                "OPENCODE_TEST_HOME": tmp_home,
+                "XDG_CONFIG_HOME": f"{tmp_home}/.config",
+                "XDG_DATA_HOME": f"{tmp_home}/.local/share",
+                "XDG_STATE_HOME": f"{tmp_home}/.local/state",
+                "XDG_CACHE_HOME": f"{tmp_home}/.cache",
+                "TMPDIR": tmp_home,
+            }
+            proc = subprocess.run(
+                [str(opencode_bin), "--version"],
+                env=ver_env,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
+            )
     except OSError as exc:
         raise SecurityProfileError(f"Failed to execute '{opencode_bin} --version': {exc}") from exc
     out = (proc.stdout or proc.stderr or "").strip()
@@ -1041,6 +1278,9 @@ def _expand_tool_set(
     for always_guarded in ("webfetch", "websearch", "codesearch", "question", "external_directory"):
         if always_guarded not in allowed_tools:
             expanded_denied.add(always_guarded)
+
+    # Hard-denied tools are unconditionally excluded regardless of allowed_tools.
+    expanded_denied.update(HARD_DENIED_WORKER_TOOLS)
 
     return expanded_allowed - expanded_denied
 
@@ -1102,6 +1342,10 @@ def compile_opencode_security_config(
     permission_map["external_directory"] = "deny"
     permission_map["doom_loop"] = "deny"
     permission_map["question"] = "deny"
+    for hard_denied in HARD_DENIED_WORKER_TOOLS:
+        tools_map[hard_denied] = False
+        policies_map[hard_denied] = "deny"
+        permission_map[hard_denied] = "deny"
 
     # Configure MCP servers and fail-closed MCP tool permissions.
     mcp_servers_out: dict[str, Any] = {}
@@ -1311,6 +1555,49 @@ def _is_forbidden_broad_read_root(path: Path) -> bool:
     return resolved in _forbidden_broad_roots(is_write_root=False)
 
 
+def _dual_realpath_variants_for_leaf(path: Path) -> list[str]:
+    parent = path.expanduser().absolute().parent
+    leaf_name = path.name
+    parent_variants = _dual_realpath_variants(parent) if parent.exists() else [str(parent)]
+    variants: list[str] = []
+    for p_var in parent_variants:
+        prefix = "" if p_var == "/" else p_var.rstrip("/")
+        cand = f"{prefix}/{leaf_name}"
+        if cand not in variants:
+            variants.append(cand)
+        if cand.startswith("/private/"):
+            stripped = cand[len("/private") :]
+            if stripped and stripped not in variants:
+                variants.append(stripped)
+        elif cand.startswith(("/var/", "/tmp/", "/etc/")):
+            prefixed = f"/private{cand}"
+            if prefixed not in variants:
+                variants.append(prefixed)
+        if cand.startswith("/Users/"):
+            data_vol = f"/System/Volumes/Data{cand}"
+            if data_vol not in variants:
+                variants.append(data_vol)
+        elif cand.startswith("/System/Volumes/Data/Users/"):
+            short_users = cand[len("/System/Volumes/Data") :]
+            if short_users not in variants:
+                variants.append(short_users)
+    return variants
+
+
+def _ancestor_dir_literals(path: Path) -> list[str]:
+    out: list[str] = ["/"]
+    for var in _dual_realpath_variants_for_leaf(path):
+        cur = Path(var).parent
+        chain: list[str] = []
+        while str(cur) not in ("", "/"):
+            chain.append(str(cur))
+            cur = cur.parent
+        for anc in reversed(chain):
+            if anc not in out:
+                out.append(anc)
+    return out
+
+
 def _is_safe_opencode_package_root(root: Path) -> bool:
     if _is_forbidden_broad_read_root(root):
         return False
@@ -1318,16 +1605,26 @@ def _is_safe_opencode_package_root(root: Path) -> bool:
         resolved = root.expanduser().resolve()
     except OSError:
         return False
-    host_home = Path.home().resolve()
-    if resolved == host_home or host_home in resolved.parents:
-        # Under $HOME, only allow dedicated opencode package directories (never ~/bin, ~/.local, or $HOME).
-        allowed_home_prefixes = (
-            host_home / ".local" / "share" / "opencode",
-            host_home / ".opencode",
-        )
-        return any(
-            resolved == pfx or pfx in resolved.parents for pfx in allowed_home_prefixes
-        )
+    candidate_homes: list[Path] = [Path.home().resolve()]
+    pw_home = _resolve_passwd_home_dir()
+    if pw_home is not None:
+        try:
+            pw_real = pw_home.resolve()
+            if pw_real not in candidate_homes:
+                candidate_homes.append(pw_real)
+        except OSError:
+            pass
+    for home_base in candidate_homes:
+        if resolved == home_base or home_base in resolved.parents:
+            # Under $HOME, only allow dedicated opencode package or custody directories (never ~/bin, ~/.local, or $HOME).
+            allowed_home_prefixes = (
+                home_base / ".local" / "share" / "opencode",
+                home_base / ".local" / "share" / "agent-comms" / "custody" / "opencode",
+                home_base / ".opencode",
+            )
+            return any(
+                resolved == pfx or pfx in resolved.parents for pfx in allowed_home_prefixes
+            )
     return True
 
 
@@ -1412,23 +1709,44 @@ def _resolve_and_validate_roots(
     return resolved_roots
 
 
-def _collect_credential_deny_paths(
-    profile: WorkerSecurityProfile | None = None,
+def _collect_credential_deny_paths_raw(
+    extra_credential_deny_paths: Sequence[str] = (),
 ) -> list[Path]:
     host_home = Path.home()
-    paths: list[Path] = [host_home / rel for rel in DEFAULT_CREDENTIAL_DENY_RELPATHS]
+    homes: list[Path] = [host_home]
+    pw_home = _resolve_passwd_home_dir()
+    if pw_home is not None and pw_home not in homes:
+        homes.append(pw_home)
+
+    paths: list[Path] = []
+    for h in homes:
+        for rel in DEFAULT_CREDENTIAL_DENY_RELPATHS:
+            cand = h / rel
+            if cand not in paths:
+                paths.append(cand)
+        ext_state = h / ".local" / "state" / "free-inference"
+        if ext_state not in paths:
+            paths.append(ext_state)
+
     paths.append(ROOT / "runs")
     eff_runs = _effective_runs_dir()
     if eff_runs != (ROOT / "runs") and eff_runs not in paths:
         paths.append(eff_runs)
     paths.append(ROOT / ".home")
-    if profile is not None:
-        for raw in profile.credential_deny_paths:
-            p = Path(raw).expanduser()
-            if not p.is_absolute():
-                p = host_home / p
+    for raw in extra_credential_deny_paths:
+        p = Path(raw).expanduser()
+        if not p.is_absolute():
+            p = host_home / p
+        if p not in paths:
             paths.append(p)
     return paths
+
+
+def _collect_credential_deny_paths(
+    profile: WorkerSecurityProfile | None = None,
+) -> list[Path]:
+    extra = profile.credential_deny_paths if profile is not None else ()
+    return _collect_credential_deny_paths_raw(extra)
 
 
 def _collect_runtime_write_deny_paths() -> list[Path]:
@@ -1553,7 +1871,24 @@ def compile_seatbelt_profile(
     service_port: int | None = None,
     local_assist_port: int = 8080,
     use_token_relay: bool = False,
+    worker_tag: str | None = None,
+    launcher_site_packages: Path | None = None,
+    custody_opencode_root: Path | None = None,
+    worker_manifest_path: Path | None = None,
+    launcher_exit_path: Path | None = None,
+    security_profile_path: Path | None = None,
 ) -> str:
+    if worker_tag is not None and (
+        not isinstance(worker_tag, str) or not WORKER_TAG_RE.fullmatch(worker_tag)
+    ):
+        raise SecurityProfileError(
+            f"compile_seatbelt_profile requires worker_tag to be 32 lowercase hex characters, got {worker_tag!r}."
+        )
+    _check_local_mcp_shell_port_conflict(
+        profile.mcp_servers,
+        profile.network_allowed_shell_localhost_ports,
+    )
+
     ws_real = workspace_dir.resolve(strict=True)
     iso_real = isolated_home.resolve(strict=True)
     opencode_real = opencode_bin.resolve(strict=True)
@@ -1561,11 +1896,71 @@ def compile_seatbelt_profile(
     sandbox_real = sandbox_exec_bin.resolve(strict=True)
 
     cred_deny_paths = _collect_credential_deny_paths(profile)
+    for raw_sock in profile.network_allowed_unix_sockets:
+        _validate_unix_socket_path(
+            raw_sock,
+            credential_deny_paths=cred_deny_paths,
+            context="network.allowed_unix_sockets",
+        )
+
     runtime_write_deny_paths = _collect_runtime_write_deny_paths()
+    if is_custody_tree(ROOT) and not _is_forbidden_broad_read_root(ROOT):
+        try:
+            root_real = ROOT.resolve()
+            if root_real not in runtime_write_deny_paths:
+                runtime_write_deny_paths.append(root_real)
+        except OSError:
+            pass
+
+    custody_readonly_dirs: list[Path] = []
+    eff_cust_opencode = (
+        custody_opencode_root
+        if custody_opencode_root is not None
+        else resolve_user_custody_opencode_dir()
+    )
+    eff_site_pkgs = launcher_site_packages
+    if eff_site_pkgs is None:
+        boot_state = get_active_bootstrap_state()
+        if boot_state is not None:
+            eff_site_pkgs = boot_state.launcher_site_packages
+
+    for cand_ro in (eff_cust_opencode, eff_site_pkgs):
+        if cand_ro is None:
+            continue
+        if not validate_owned_directory(cand_ro) or _is_forbidden_broad_read_root(cand_ro):
+            continue
+        cand_real = cand_ro.resolve()
+        overlaps_cred = False
+        for dp in cred_deny_paths:
+            try:
+                dp_real = dp.expanduser().resolve()
+            except OSError:
+                dp_real = dp.expanduser().absolute()
+            if cand_real == dp_real or dp_real in cand_real.parents:
+                overlaps_cred = True
+                break
+        if not overlaps_cred and cand_real not in custody_readonly_dirs:
+            custody_readonly_dirs.append(cand_real)
+
+    bridge_dirs: list[Path] = []
+    for raw_sock in profile.network_allowed_unix_sockets:
+        bdir = Path(raw_sock).parent
+        bdir_real = bdir.resolve() if bdir.exists() else bdir
+        if bdir_real not in bridge_dirs:
+            bridge_dirs.append(bdir_real)
+
     write_deny_paths: list[Path] = list(cred_deny_paths)
-    for rwp in runtime_write_deny_paths:
+    for rwp in (*runtime_write_deny_paths, *custody_readonly_dirs, *bridge_dirs):
         if rwp not in write_deny_paths:
             write_deny_paths.append(rwp)
+    if (
+        eff_cust_opencode is not None
+        and eff_cust_opencode.parent.name == "custody"
+        and validate_owned_directory(eff_cust_opencode.parent)
+    ):
+        cust_parent = eff_cust_opencode.parent.resolve()
+        if not _is_forbidden_broad_read_root(cust_parent) and cust_parent not in write_deny_paths:
+            write_deny_paths.append(cust_parent)
 
     read_roots = _resolve_and_validate_roots(
         profile.read_roots,
@@ -1604,6 +1999,13 @@ def compile_seatbelt_profile(
         '  (global-name "com.apple.system.opendirectoryd.membership")',
         ")",
     ]
+    if worker_tag is not None:
+        lines.extend(
+            [
+                f'(allow mach-lookup (global-name "org.free-inference.worker-allow.{worker_tag}"))',
+                f'(deny mach-lookup (global-name "org.free-inference.worker-deny.{worker_tag}"))',
+            ]
+        )
 
     iso_variants = _dual_realpath_variants(iso_real)
     local_assist_py_variants: list[str] = [
@@ -1677,6 +2079,7 @@ def compile_seatbelt_profile(
         "/usr/bin/pbpaste",
         "/usr/sbin/screencapture",
         "/usr/bin/screencapture",
+        *(f"{iv}/.config/.disabled-opencode-pty" for iv in _dual_realpath_variants(iso_real)),
     ):
         if p_str not in exec_deny_literals:
             exec_deny_literals.append(p_str)
@@ -1755,6 +2158,11 @@ def compile_seatbelt_profile(
         ]
     )
 
+    # Emit all AF_UNIX outbound allow rules immediately after the default network-outbound
+    # deny and BEFORE process-path + remote-ip rules: macOS libsandbox compiles AF_UNIX
+    # clauses placed after process-path + remote-ip clauses in a way that drops the
+    # process-path remote-ip allow for dedicated local-assist-python. Subsequent deny
+    # blocks below match only (remote ip ...), so AF_UNIX allow precedence is preserved.
     for iso_var in _dual_realpath_variants(iso_real):
         lines.append(
             f'(allow network-outbound (remote unix-socket (subpath "{_seatbelt_escape_literal(iso_var)}")))'
@@ -1763,10 +2171,16 @@ def compile_seatbelt_profile(
     if profile.allow_ssh_agent:
         ssh_sock = os.environ.get("SSH_AUTH_SOCK", "").strip()
         if ssh_sock:
-            for sock_var in _dual_realpath_variants(Path(ssh_sock)):
+            for sock_var in _dual_realpath_variants_for_leaf(Path(ssh_sock)):
                 lines.append(
                     f'(allow network-outbound (remote unix-socket (path-literal "{_seatbelt_escape_literal(sock_var)}")))'
                 )
+
+    for raw_sock in profile.network_allowed_unix_sockets:
+        for sock_var in _dual_realpath_variants_for_leaf(Path(raw_sock)):
+            lines.append(
+                f'(allow network-outbound (remote unix-socket (path-literal "{_seatbelt_escape_literal(sock_var)}")))'
+            )
 
     lines.extend(
         [
@@ -1855,8 +2269,51 @@ def compile_seatbelt_profile(
             if var not in read_allow_literals:
                 read_allow_literals.append(var)
 
+    explicit_write_deny_literals: list[str] = []
+    metadata_allow_literals: list[str] = []
+    for raw_sock in profile.network_allowed_unix_sockets:
+        for anc in _ancestor_dir_literals(Path(raw_sock)):
+            if anc not in metadata_allow_literals:
+                metadata_allow_literals.append(anc)
+
+    for srv in profile.mcp_servers.values():
+        if not (srv.enabled and srv.type == "local" and srv.command):
+            continue
+        cmd0 = Path(srv.command[0])
+        if not cmd0.is_absolute():
+            continue
+        in_cred_deny = False
+        for dp in cred_deny_paths:
+            try:
+                dp_real = dp.expanduser().resolve()
+            except OSError:
+                dp_real = dp.expanduser().absolute()
+            for cand_cmd in (cmd0, (cmd0.resolve() if cmd0.exists() else cmd0)):
+                if cand_cmd == dp_real or dp_real in cand_cmd.parents:
+                    in_cred_deny = True
+                    break
+            if in_cred_deny:
+                break
+        if in_cred_deny:
+            continue
+        if cmd0.exists() and cmd0.is_dir():
+            continue
+        cmd_vars = _dual_realpath_variants_for_leaf(cmd0)
+        if cmd0.is_file():
+            for rv in _dual_realpath_variants(cmd0.resolve()):
+                if rv not in cmd_vars:
+                    cmd_vars.append(rv)
+        for v in cmd_vars:
+            if v not in read_allow_literals:
+                read_allow_literals.append(v)
+            if v not in explicit_write_deny_literals:
+                explicit_write_deny_literals.append(v)
+        for anc in _ancestor_dir_literals(cmd0):
+            if anc not in metadata_allow_literals:
+                metadata_allow_literals.append(anc)
+
     read_allow_subpaths: list[str] = []
-    for p in (iso_real, *read_roots, *write_roots):
+    for p in (iso_real, *read_roots, *write_roots, *custody_readonly_dirs):
         for var in _dual_realpath_variants(p):
             if var not in read_allow_subpaths:
                 read_allow_subpaths.append(var)
@@ -1909,6 +2366,11 @@ def compile_seatbelt_profile(
     for sp in read_allow_subpaths:
         lines.append(f'  (subpath "{_seatbelt_escape_literal(sp)}")')
     lines.append(")")
+    if metadata_allow_literals:
+        lines.append("(allow file-read-metadata")
+        for mlit in metadata_allow_literals:
+            lines.append(f'  (literal "{_seatbelt_escape_literal(mlit)}")')
+        lines.append(")")
 
     # Restrict opencode.json and .config reads to opencode_real only.
     iso_variants = _dual_realpath_variants(iso_real)
@@ -1941,10 +2403,50 @@ def compile_seatbelt_profile(
             if var not in cred_deny_subpaths:
                 cred_deny_subpaths.append(var)
 
+    bridge_dir_literals: list[str] = []
+    bridge_meta_deny_literals: list[str] = []
+    for bdir in bridge_dirs:
+        for bvar in _dual_realpath_variants(bdir):
+            if bvar not in bridge_dir_literals:
+                bridge_dir_literals.append(bvar)
+            for mname in BRIDGE_METADATA_FILENAMES:
+                mlit = f"{bvar}/{mname}"
+                if mlit not in bridge_meta_deny_literals:
+                    bridge_meta_deny_literals.append(mlit)
+                if mlit not in explicit_write_deny_literals:
+                    explicit_write_deny_literals.append(mlit)
+            slit = f"{bvar}/ledger.sock"
+            if slit not in explicit_write_deny_literals:
+                explicit_write_deny_literals.append(slit)
+
+    for opt_meta_path in (worker_manifest_path, launcher_exit_path, security_profile_path):
+        if opt_meta_path is None:
+            continue
+        for mvar in _dual_realpath_variants_for_leaf(opt_meta_path):
+            if mvar not in explicit_write_deny_literals:
+                explicit_write_deny_literals.append(mvar)
+            if opt_meta_path is security_profile_path:
+                # Only read-deny security_profile_path when it lies outside declared read/write roots.
+                in_rw = any(
+                    Path(mvar) == r or r in Path(mvar).parents
+                    for r in (*read_roots, *write_roots)
+                )
+                if in_rw:
+                    continue
+            if mvar not in bridge_meta_deny_literals:
+                bridge_meta_deny_literals.append(mvar)
+
     for op_name in ("file-read*", "file-read-data"):
         lines.append(f"(deny {op_name}")
         for sp in cred_deny_subpaths:
             lines.append(f'  (subpath "{_seatbelt_escape_literal(sp)}")')
+        for mlit in bridge_meta_deny_literals:
+            lines.append(f'  (literal "{_seatbelt_escape_literal(mlit)}")')
+        lines.append(")")
+    if bridge_dir_literals:
+        lines.append("(deny file-read-data")
+        for bvar in bridge_dir_literals:
+            lines.append(f'  (literal "{_seatbelt_escape_literal(bvar)}")')
         lines.append(")")
 
     # Re-allow this worker's non-secret runtime subdirectories inside isolated_home (since isolated_home is under LAB_ROOT/.home).
@@ -2172,15 +2674,41 @@ def compile_seatbelt_profile(
         f'(require-not (subpath "{_seatbelt_escape_literal(iv)}"))' for iv in iso_variants
     )
     protected_entries: list[str] = []
-    for wh_var in _dual_realpath_variants(WORKER_HOMES_DIR):
-        wh_lit = f'  (literal "{_seatbelt_escape_literal(wh_var)}")'
-        if wh_lit not in protected_entries:
-            protected_entries.append(wh_lit)
-        wh_sub_rule = (
-            f'  (require-all (subpath "{_seatbelt_escape_literal(wh_var)}") {iso_not_clauses})'
-        )
-        if wh_sub_rule not in protected_entries:
-            protected_entries.append(wh_sub_rule)
+    worker_home_containers: list[Path] = [WORKER_HOMES_DIR]
+    ext_unval = unvalidated_external_worker_homes_path()
+    if ext_unval is not None and ext_unval not in worker_home_containers:
+        worker_home_containers.append(ext_unval)
+    try:
+        eff_wh = _active_worker_homes_dir(create=False)
+        if eff_wh not in worker_home_containers:
+            worker_home_containers.append(eff_wh)
+    except Exception:
+        pass
+    for wh_dir in worker_home_containers:
+        for wh_var in _dual_realpath_variants(wh_dir):
+            wh_lit = f'  (literal "{_seatbelt_escape_literal(wh_var)}")'
+            if wh_lit not in protected_entries:
+                protected_entries.append(wh_lit)
+            wh_sub_rule = (
+                f'  (require-all (subpath "{_seatbelt_escape_literal(wh_var)}") {iso_not_clauses})'
+            )
+            if wh_sub_rule not in protected_entries:
+                protected_entries.append(wh_sub_rule)
+
+    for wlit in explicit_write_deny_literals:
+        lit_entry = f'  (literal "{_seatbelt_escape_literal(wlit)}")'
+        if lit_entry not in protected_entries:
+            protected_entries.append(lit_entry)
+        wlit_path = Path(wlit)
+        for wr_var in write_root_variants:
+            wr_path = Path(wr_var)
+            if wr_path in wlit_path.parents:
+                cur = wlit_path.parent
+                while cur != wr_path and wr_path in cur.parents:
+                    anc_rule = f'  (literal "{_seatbelt_escape_literal(str(cur))}")'
+                    if anc_rule not in protected_entries:
+                        protected_entries.append(anc_rule)
+                    cur = cur.parent
 
     for cp in write_deny_paths:
         for cp_var in _dual_realpath_variants(cp):
@@ -2261,6 +2789,7 @@ def compile_interactive_seatbelt_profile(
     allowed_shell_localhost_ports: Sequence[int] = (),
     allow_ssh_remote: bool = False,
     allow_self_edit: bool = False,
+    allow_opencode_self_exec: bool = True,
 ) -> str:
     ws_real = workspace_dir.resolve(strict=True)
     iso_real = isolated_home.resolve(strict=True)
@@ -2398,6 +2927,7 @@ def compile_interactive_seatbelt_profile(
         "/usr/bin/pbpaste",
         "/usr/sbin/screencapture",
         "/usr/bin/screencapture",
+        *(f"{iv}/.config/.disabled-opencode-pty" for iv in inv_variants),
     ):
         if p_str not in exec_deny_literals:
             exec_deny_literals.append(p_str)
@@ -2426,12 +2956,21 @@ def compile_interactive_seatbelt_profile(
             f"    {target_expr}",
             "  )",
             ")",
-            "(allow process-exec",
-            "  (require-all",
-            f'    (process-path "{_seatbelt_escape_literal(str(opencode_real))}")',
-            f"    {target_expr}",
-            "  )",
-            ")",
+        ]
+    )
+    if allow_opencode_self_exec:
+        lines.extend(
+            [
+                "(allow process-exec",
+                "  (require-all",
+                f'    (process-path "{_seatbelt_escape_literal(str(opencode_real))}")',
+                f"    {target_expr}",
+                "  )",
+                ")",
+            ]
+        )
+    lines.extend(
+        [
             "(allow process-exec",
             "  (require-all",
             f'    (process-path "{_seatbelt_escape_literal(str(opencode_real))}")',
@@ -2874,7 +3413,22 @@ def compile_interactive_seatbelt_profile(
 
     lines.extend(protected_entries)
     lines.append(")")
-    lines.append("")
+    lines.extend(
+        [
+            "",
+            ";; Narrow cli.json UI-preference write carveout strictly for opencode_real",
+            "(allow file-write*",
+            "  (require-all",
+            f'    (process-path "{_seatbelt_escape_literal(str(opencode_real))}")',
+            "    (require-any",
+        ]
+    )
+    for iv in inv_variants:
+        esc_iv = _seatbelt_escape_regex(iv)
+        lines.append(
+            f'      (regex #"^{esc_iv}/\\.config/opencode/cli\\.json(\\.tmp|\\.[0-9]+\\.[0-9a-fA-F-]+\\.tmp)?$")'
+        )
+    lines.extend(["    )", "  )", ")", ""])
     return "\n".join(lines)
 
 
@@ -2934,6 +3488,7 @@ def build_worker_environment(
     env["OPENCODE_DISABLE_CLAUDE_CODE"] = "true"
     env["OPENCODE_DISABLE_CLAUDE_CODE_SKILLS"] = "true"
     env["OPENCODE_DISABLE_AUTOUPDATE"] = "true"
+    env["OPENCODE_PTY_BIN"] = str(iso_real / ".config" / ".disabled-opencode-pty")
     env["GIT_CONFIG_GLOBAL"] = "/dev/null"
     env["GIT_CONFIG_NOSYSTEM"] = "1"
     env["GIT_TERMINAL_PROMPT"] = "0"
@@ -2955,7 +3510,21 @@ def _build_worker_shell_script(
     bin_dir = iso_real / "bin"
     tmp_dir = iso_real / ".tmp"
     unset_names = sorted(
-        (set(DEFAULT_STRIP_ENV_NAMES) | set(profile.env_strip_names) | {"OPENCODE_CONFIG", "OPENCODE_CONFIG_DIR", "OPENCODE_CONFIG_CONTENT", "OPENCODE_PERMISSION"})
+        (
+            set(DEFAULT_STRIP_ENV_NAMES)
+            | set(profile.env_strip_names)
+            | {
+                "OPENCODE_CONFIG",
+                "OPENCODE_CONFIG_DIR",
+                "OPENCODE_CONFIG_CONTENT",
+                "OPENCODE_CLI_CONFIG_CONTENT",
+                "OPENCODE_PERMISSION",
+                "OPENCODE_PTY_BIN",
+                "OPENCODE_PTY_HANDOFF",
+                "OPENCODE_PTY_SOCKET_DIR",
+                "OPENCODE_DB",
+            }
+        )
         - ({"SSH_AUTH_SOCK"} if profile.allow_ssh_agent else set())
     )
     unset_line = " ".join(shlex.quote(name) for name in unset_names)
@@ -2984,15 +3553,20 @@ def _build_worker_shell_script(
     )
 
 
-def allocate_worker_home() -> tuple[str, Path]:
-    WORKER_HOMES_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+def allocate_worker_home(*, worker_homes_dir: Path | None = None) -> tuple[str, Path]:
+    homes_dir = (
+        worker_homes_dir.expanduser().resolve()
+        if worker_homes_dir is not None
+        else _active_worker_homes_dir(create=True)
+    )
+    homes_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     try:
-        os.chmod(WORKER_HOMES_DIR, 0o700)
+        os.chmod(homes_dir, 0o700)
     except OSError:
         pass
     owner_pid = os.getpid()
     worker_id = f"worker-{owner_pid}-{int(time.time() * 1000)}-{secrets.token_hex(4)}"
-    isolated_home = WORKER_HOMES_DIR / worker_id
+    isolated_home = homes_dir / worker_id
     isolated_home.mkdir(parents=True, exist_ok=False, mode=0o700)
     for rel in (
         ".config/opencode",
@@ -3968,6 +4542,9 @@ def harvest_worker_local_assist_logs(
     isolated_home: Path,
     worker_id: str,
 ) -> Path | None:
+    bstate = get_active_bootstrap_state()
+    if (bstate is not None and bstate.custody_mode) or is_custody_tree(ROOT) or not os.access(ROOT, os.W_OK):
+        return None
     # Reject symlinks anywhere along the staging chain and open the staging root via
     # descriptor-relative O_NOFOLLOW traversal (WORK-MAJOR-3, R2-MAJOR-4, F4, F10).
     for ancestor in (
@@ -4597,7 +5174,7 @@ def run_worker_sandbox_lifecycle(
                                 )
                                 exit_code = 128 + int(cancel_state["signum"])
                             else:
-                                exit_code = int(rc)
+                                exit_code = 1 if int(rc) == 4 else int(rc)
                             break
                         time.sleep(0.03)
         finally:
@@ -4741,10 +5318,14 @@ def sweep_stale_worker_homes_detailed(
         "skipped_active": [],
         "incomplete": [],
     }
-    if not WORKER_HOMES_DIR.is_dir():
+    try:
+        homes_dir = _active_worker_homes_dir(create=False)
+    except Exception:
+        return result
+    if not homes_dir.is_dir():
         return result
     now = time.time()
-    for child in sorted(WORKER_HOMES_DIR.iterdir()):
+    for child in sorted(homes_dir.iterdir()):
         if child.is_symlink() or not child.is_dir() or not child.name.startswith("worker-"):
             continue
         # Never reap or remove a worker home whose owner is alive or whose identity observation is unavailable (WORK-MAJOR-8, F7).

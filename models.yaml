@@ -502,7 +502,7 @@ models:
     enclave_tag: v0.0.10
 
   - id: tinfoil-kimi-k3
-    status: candidate
+    status: archived
     repo: kimi-k3
     upstream: moonshotai/Kimi-K3
     converter: tinfoilsh
@@ -539,7 +539,7 @@ models:
         cached_input: 0.6
     license: mit
     release_date: null
-    verified_date: "2026-11-07"
+    verified_date: "2026-11-20"
     params_total: null
     params_active: null
     quantization:
@@ -928,3 +928,73 @@ models:
       (see docs/attestations/2026-11-13-privatemode-rung3-trial.md). Kept at status: candidate
       and routing.private_attested: blocked (same upstream model scored 8/10 on v1 and 3/4 on
       tools in the 2026-10-31 Tinfoil Rung 3 trial).
+
+  - id: tinfoil-inkling-2-small
+    status: candidate
+    repo: inkling-2-small
+    upstream: thinkingmachines/Inkling-2-Small
+    converter: tinfoilsh
+    conversion_runtime_version: vllm
+    runtime: proxy
+    serve_command: ./bin/tinfoil-proxy --bind {host} --port {port} -e inference.tinfoil.sh --repo tinfoilsh/confidential-model-router
+    enclave_repo: tinfoilsh/confidential-inkling-2-small
+    enclave_tag: v0.0.6
+    promptfoo_provider:
+      id: openai:chat:inkling-2-small
+      apiBaseUrl: http://127.0.0.1:8081/v1
+      apiKeyKeychainService: free-inference.tinfoil
+      config:
+        showThinking: false
+        passthrough:
+          include_reasoning: false
+    capabilities:
+      tool_calling: true
+    routing:
+      private_local: blocked
+      private_attested: blocked
+    remote_trust:
+      tier: enclave_runtime_attested
+      attestation_method: tinfoil-proxy-sigstore
+      weights_hash: null
+      weights_source: null
+      provider_manifest_weights_hash: dmverity:sha256:2eb1ad6339674a38f3e9179c2933c16fc52f66d8e8b48047007665d4d48b477f
+      provider_manifest_weights_source: thinkingmachines/Inkling-2-Small@aac974122acd33ddb0d3e1f54433a9c5dd2249ce
+      usage_policy: provider_terms_apply
+      jurisdiction: US
+      pricing_per_m_tokens:
+        input: 0.3
+        output: 1.0
+        cached_input: 0.03
+    license: null
+    release_date: null
+    verified_date: "2026-11-20"
+    params_total: null
+    params_active: null
+    quantization:
+      bits: null
+      group_size: null
+      tool: null
+      tool_version: null
+    kv_cache_dtype: null
+    disk_gb_estimate: 393.5
+    ram_gb_estimate: null
+    context_window: 524288
+    modalities:
+      - text
+      - image
+    chat_template:
+      source: inkling
+      roles_supported:
+        - system
+        - user
+        - assistant
+        - tool
+    source_links:
+      - https://github.com/tinfoilsh/confidential-inkling-2-small
+      - https://github.com/tinfoilsh/confidential-model-router
+      - https://huggingface.co/thinkingmachines/Inkling-2-Small
+    fit_notes: |
+      Inkling 2 Small served inside Tinfoil's attested enclaves (tinfoilsh/confidential-inkling-2-small v0.0.6) with --tool-call-parser inkling, --reasoning-parser inkling, and 524288 context window. Pricing verified on 2026-11-20: $0.30/1M input ($0.03 cached) and $1.00/1M output.
+    review_notes: |
+      Discovered and scaffolded via scripts/sync-model-catalog on 2026-11-20 from live router manifest (tinfoilsh/confidential-inkling-2-small@v0.0.6) and /v1/models. Kept at status: candidate and routing.private_attested: blocked until evaluated.
+    eval_summary: null

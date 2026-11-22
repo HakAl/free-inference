@@ -366,6 +366,8 @@ class SessionAuthRelay:
         self._lock = threading.RLock()
         self._inflight_sem = threading.BoundedSemaphore(16)
         self.chat_requests_used = 0
+        self.local_request_cap_exhausted = False
+        self.upstream_session_cap_exhausted = False
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -628,6 +630,7 @@ class SessionAuthRelay:
 
                 with relay._lock:
                     if relay.chat_requests_used >= relay.max_chat_requests:
+                        relay.local_request_cap_exhausted = True
                         self._send_json_error(
                             429,
                             f"Session relay max_chat_requests ({relay.max_chat_requests}) reached.",
@@ -730,11 +733,14 @@ class SessionAuthRelay:
                     self.end_headers()
 
                     total_read = 0
+                    cap_probe_buf = bytearray() if (resp.status == 429 and not is_sse) else None
                     read_fn = getattr(resp, "read1", None)
                     while True:
                         chunk = read_fn(4096) if callable(read_fn) else resp.read(4096)
                         if not chunk:
                             break
+                        if cap_probe_buf is not None and len(cap_probe_buf) < 4096:
+                            cap_probe_buf.extend(chunk[: 4096 - len(cap_probe_buf)])
                         total_read += len(chunk)
                         if total_read > relay.max_response_bytes:
                             if is_sse:
@@ -745,6 +751,29 @@ class SessionAuthRelay:
                             break
                         self.wfile.write(chunk)
                         self.wfile.flush()
+                    if cap_probe_buf is not None and total_read <= 4096:
+                        try:
+                            err_doc = json.loads(cap_probe_buf.decode("utf-8"))
+                            err_obj = err_doc.get("error") if isinstance(err_doc, dict) else None
+                            if isinstance(err_obj, dict):
+                                err_code = err_obj.get("code")
+                                err_type = err_obj.get("type")
+                                err_msg = err_obj.get("message")
+                                if (
+                                    err_code == "session_request_budget_exceeded"
+                                    or err_type == "session_request_budget_exceeded"
+                                    or (
+                                        isinstance(err_msg, str)
+                                        and (
+                                            "Session chat request cap (" in err_msg
+                                            or "se-key-proxy max_chat_requests" in err_msg
+                                        )
+                                    )
+                                ):
+                                    with relay._lock:
+                                        relay.upstream_session_cap_exhausted = True
+                        except Exception:
+                            pass
                 except (BrokenPipeError, ConnectionResetError):
                     self.close_connection = True
                 except Exception as exc:

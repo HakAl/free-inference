@@ -352,7 +352,7 @@ agy mcp add local_assist -- /path/to/free-inference/scripts/local-assist-server
 agy mcp list
 ```
 
-For workspace-only scoping in Antigravity (without editing `~/.gemini/config/mcp_config.json`), place a workspace plugin at `<workspace>/.agents/plugins/local-assist/plugin.json` (`{"name": "local-assist", "version": "0.2.1"}`) and `<workspace>/.agents/plugins/local-assist/mcp_config.json`, then validate with `agy plugin validate <workspace>/.agents/plugins/local-assist --strict`.
+For workspace-only scoping in Antigravity (without editing `~/.gemini/config/mcp_config.json`), place a workspace plugin at `<workspace>/.agents/plugins/local-assist/plugin.json` (`{"name": "local-assist", "version": "0.3.1"}`) and `<workspace>/.agents/plugins/local-assist/mcp_config.json`, then validate with `agy plugin validate <workspace>/.agents/plugins/local-assist --strict`.
 
 ### Inspecting `local_assist` Telemetry (`./scripts/local-assist-stats`)
 
@@ -373,3 +373,65 @@ cd /path/to/free-inference
 # Operator-approved live 3-5x Rung 1 benchmark against 127.0.0.1:8080
 ./scripts/eval-local-assist-dogfood --live --operator-approved --repeats 3
 ```
+
+---
+
+## 7. Unattended OpenCode Worker Runtime and Read-Only Custody (`v0.3.0`)
+
+Supervisors such as `agent-comms` can launch sandboxed OpenCode workers directly from a read-only exported custody tree (`git archive <tag>` plus a hash-pinned `requirements-launcher.txt` target environment) without mutating any file in custody or placing session credentials in child process environments.
+
+### Provisioning a Custody Dependency Directory (`requirements-launcher.txt`)
+
+```bash
+uv pip install \
+  --target /path/to/custody/env \
+  --no-compile \
+  --no-deps \
+  --require-hashes \
+  -r /path/to/custody/launcher/requirements-launcher.txt
+```
+
+All four custody entrypoints (`scripts/opencode-attested`, `scripts/opencode-local`, `scripts/session`, and `scripts/verify-served-model`) set `sys.dont_write_bytecode = True` before importing modules and accept `--launcher-site-packages /path/to/custody/env` (or automatically discover a sibling `../env` directory when `ROOT` is read-only custody).
+
+### Active-Runs Pointer (`~/.config/free-inference/active-runs.json`)
+
+When the operator starts an attested session from a live checkout (`./scripts/session start` or `./scripts/serve-model`), `free-inference` writes an owner-only `0600` pointer file inside `0700` `~/.config/free-inference/active-runs.json` (`{"schema_version": 1, "runs_dir": "/abs/path/to/runs", "updated_at": <epoch>}`).
+
+- Custody invocations (`scripts/session status --model <id> --json` and `scripts/opencode-attested`) resolve the active `runs/` store via `~/.config/free-inference/active-runs.json`, strip inherited `FREE_INFERENCE_RUNS_DIR` and runtime override environment variables, and refuse `--runs-dir`.
+- Non-custody unattended worker and reap CLI invocations also strip inherited `FREE_INFERENCE_RUNS_DIR` (preventing ambient environment redirection while still honoring explicit `--runs-dir <abs-path>` in local tests).
+- `worker.sb` denies both `file-read*` and `file-write*` on `~/.config/free-inference` and allocates per-worker homes under `~/.local/state/free-inference/workers` (`0700`) whenever `ROOT` is read-only custody.
+
+### Unattended Supervisor Launch and Reap Flags
+
+```bash
+# Check active attested session readiness from custody before dispatching a worker
+/path/to/custody/launcher/scripts/session \
+  --launcher-site-packages /path/to/custody/env \
+  status --model tinfoil-deepseek-v4-1-flash --json
+
+# Launch an in-group Seatbelt-confined OpenCode worker attached to the live session
+/path/to/custody/launcher/scripts/opencode-attested \
+  --launcher-site-packages /path/to/custody/env \
+  --opencode-bin /path/to/custody/opencode/bin/opencode \
+  --model tinfoil-deepseek-v4-1-flash \
+  --security-profile /path/to/bridge/profile.yaml \
+  --inherit-process-group \
+  --worker-manifest /path/to/bridge/manifest.json \
+  --run-token "<run-token>" \
+  --launcher-exit-file /path/to/bridge/launcher_exit.json \
+  -- run "Complete the assigned task."
+
+# Race-safe post-run / timeout reap on macOS (proc_pidinfo + 3-way sandbox_check + SSTOP verification)
+/path/to/custody/launcher/scripts/opencode-attested \
+  --launcher-site-packages /path/to/custody/env \
+  --reap-worker /path/to/bridge/manifest.json
+```
+
+Key guarantees:
+- **Early `manifest.json` publication (`R1`)**: When `--worker-manifest <abs-path>` is passed with `--inherit-process-group` and `--run-token`, both launchers publish the initial `0600` `manifest.json` (`children: []`) at entry before token handoff, CLI parsing, `--runs-dir` validation, or session readiness prechecks can exit, ensuring supervisors observe a valid recovery manifest on early `1`, `2`, or `4` exits (bounded residual: when `--worker-manifest` is invalid or unwritable, `--inherit-process-group` or `--run-token` is missing/invalid, `launcher_pgid != launcher_pid`, kernel `proc_pidinfo(os.getpid())` fails, or Python cannot import `local_assist`, the launcher fails closed without writing `manifest.json` or `launcher_exit.json`).
+- **XDG `0400` `service.json` attach, reader-owned stderr drain, and strict CLI flags (`Q1`/`Q2`/`R2`/`R2-2`/`R2-3`)**: Under `--inherit-process-group`, the launcher stages `0400` `$XDG_CONFIG_HOME/opencode/service.json` (`{"hostname": "127.0.0.1", "port": <ephemeral>, "password": <secret>}`) inside the per-worker home so `opencode run` attaches over authenticated loopback HTTP without placing `--server <url>` or passwords in `argv` or process environment, drains `opencode serve --service` `stderr` continuously via a bounded `4096`-byte ring buffer (`_BoundedPipeDrain`) with exclusive reader-owned `os.dup` descriptor and self-pipe wake teardown, enforces `allow_abbrev=False` across CLI `ArgumentParser` instances so prefix abbreviations cannot bypass pre-separator scanners, and keeps both `opencode_serve` and `opencode_run` in `launcher_pgid == launcher_pid` (empirically verified on OpenCode `2.0.32`).
+- **Descriptor-pinned session store propagation (`R3`/`R2-1`)**: Non-custody `session`, `opencode-attested`, and `opencode-local` validate lexical `FREE_INFERENCE_RUNS_DIR` overrides before resolution, probe absent cold-start stores read-only via `--allow-absent-runs-dir` without creating directories on `status`/`stop`/`--no-serve`, create absent stores via descriptor-relative `O_DIRECTORY | O_NOFOLLOW` traversal (`ensure_creatable_runs_dir`) only at start boundaries, pass `--runs-dir <abs-path>` paired with `_FREE_INFERENCE_PINNED_RUNS_STAT` (`<st_dev>:<st_ino>`) to `verify-served-model`, `stop-model`, and `serve-model`, and perform Python store operations through retained `dir_fd` handles (`--publish-active-runs` remains gated independently so explicit `--runs-dir` or interactive non-custody `FREE_INFERENCE_RUNS_DIR` overrides never clobber `~/.config/free-inference/active-runs.json` or stop a bystander session; unattended worker/reap CLI invocations strip ambient `FREE_INFERENCE_RUNS_DIR` up front).
+- **`kinfo_proc` self-calibration and Seatbelt ancestor write-denies (`Q3`/`R4`)**: `proc_identity.py` cross-calibrates `sysctl(KERN_PROC_PID)` (`648`-byte `kinfo_proc`) against `proc_pidinfo(PROC_PIDTBSDINFO)` on `os.getpid()` before consulting `sysctl` for `SZOMB` or cross-UID `EPERM` records, and `compile_seatbelt_profile` emits intermediate ancestor `(literal "<dir>")` `file-write*` denies inside `write_roots` so standalone `manifest.json`, `launcher_exit.json`, `profile.yaml`, and local MCP executables cannot be swapped via parent-directory `rename()`.
+- **Exit code `4` reservation (`EXIT_SESSION_BLOCKED`)**: Reserved strictly for `opencode_session_unavailable` and `opencode_session_caps_exhausted` (paired with an atomic `0600` `launcher_exit.json` record when `--launcher-exit-file` is passed; returns `1` if the diagnostic write fails, and normalizes child/non-session `4` to `1`).
+- **Unix domain MCP bridge sockets (`network.allowed_unix_sockets` / `--allow-unix-socket`, `R6`/`R2-4`)**: Allows `AF_UNIX` `<= 103`-byte socket paths (rejecting duplicate slashes and case-insensitive, `/System/Volumes/Data` firmlink, and `(st_dev, st_ino)` `mDNSResponder` aliases) immediately after the default `(deny network-outbound)` / `(deny network-bind)` rules and before process-scoped `(remote ip ...)` rules in `worker.sb` Section 2 (preserving dedicated `local-assist-python` loopback TCP under macOS `libsandbox` while all subsequent `network-outbound` denies match remote IP ports and local MCP relays and shell children remain denied all IP/TCP/UDP outbound; combining `type: "local"` `mcp.servers` with `network.allowed_shell_localhost_ports` is rejected).
+- **Attached session cap inheritance (`spend.inherit_attached_session_caps: true` / `--inherit-session-caps`)**: Inherits the attached session's live `requests_remaining`, `max_tokens_cap`, `max_request_bytes`, and remaining window seconds without enforcing interactive `$5.00` cold-start `--max-session-usd` ceilings.

@@ -14,7 +14,20 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from local_assist.custody import (
+    bind_pinned_runs_dir,
+    get_active_bootstrap_state,
+    inspect_existing_runs_dir,
+    is_custody_tree,
+    parse_pinned_runs_stat_env,
+    runs_store_open_file,
+    runs_store_read_text,
+    runs_store_unlink,
+    set_cli_runs_dir_override,
+    validate_creatable_runs_dir,
+)
 from local_assist.registry import (
+    RegistryError,
     _legacy_unhashed_pid_file,
     _effective_runs_dir,
     get_process_command,
@@ -29,14 +42,16 @@ from local_assist.registry import (
 )
 
 
-RUNS = _effective_runs_dir()
+try:
+    _INITIAL_RUNS = _effective_runs_dir()
+except RegistryError:
+    _INITIAL_RUNS = ROOT / "runs"
+RUNS = _INITIAL_RUNS
 
 
 @contextlib.contextmanager
 def _pid_lock(runs_dir: Path):
-    runs_dir.mkdir(parents=True, exist_ok=True)
-    pid_lock_path = runs_dir / ".pid.lock"
-    with pid_lock_path.open("w") as fh:
+    with runs_store_open_file(runs_dir, ".pid.lock", append=False, mode=0o600) as fh:
         fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
         try:
             yield
@@ -154,14 +169,11 @@ def _kill_pid(
 
 def _safe_unlink_token_file(candidate: Path, runs_dir: Path) -> None:
     try:
-        if candidate.is_symlink():
-            return
         name = candidate.name
         if not (name.startswith(".se-session-") and name.endswith(".token")):
             return
-        if candidate.resolve().parent != runs_dir.resolve():
-            return
-        candidate.unlink(missing_ok=True)
+        if candidate.parent == runs_dir or candidate.resolve().parent == runs_dir.resolve():
+            runs_store_unlink(runs_dir, name)
     except OSError:
         pass
 
@@ -254,24 +266,127 @@ def _stop_record(
 
 
 def main(argv: list[str]) -> int:
+    global RUNS
+
     force_legacy = False
     discard_legacy = False
+    raw_runs_dir: str | None = None
     pos_args: list[str] = []
-    for arg in argv[1:]:
+    tokens = list(argv[1:])
+    idx = 0
+    while idx < len(tokens):
+        arg = tokens[idx]
         if arg == "--force-legacy":
             force_legacy = True
+            idx += 1
         elif arg == "--discard-legacy":
             discard_legacy = True
+            idx += 1
+        elif arg == "--runs-dir":
+            if idx + 1 >= len(tokens):
+                print("--runs-dir requires an absolute directory path.", file=sys.stderr)
+                return 1
+            raw_runs_dir = tokens[idx + 1]
+            idx += 2
+        elif arg.startswith("--runs-dir="):
+            raw_runs_dir = arg.split("=", 1)[1]
+            idx += 1
         else:
             pos_args.append(arg)
+            idx += 1
 
     if len(pos_args) > 1 or (force_legacy and discard_legacy):
         print(
-            "usage: scripts/stop-model [--force-legacy | --discard-legacy] [model-id | --all]",
+            "usage: scripts/stop-model [--runs-dir <abs-path>] [--force-legacy | --discard-legacy] [model-id | --all]",
             file=sys.stderr,
         )
         return 2
 
+    prev_boot = get_active_bootstrap_state()
+    prev_runs = RUNS
+    inproc_runs_applied = False
+    in_custody = (prev_boot is not None and prev_boot.custody_mode) or is_custody_tree(ROOT)
+    expected_stat, pin_err = parse_pinned_runs_stat_env()
+    if pin_err is not None and not in_custody:
+        print(pin_err, file=sys.stderr)
+        return 1
+
+    if raw_runs_dir is not None:
+        if in_custody:
+            print("Refusing --runs-dir in read-only/custody mode.", file=sys.stderr)
+            return 1
+        v_runs, runs_err = inspect_existing_runs_dir(
+            raw_runs_dir,
+            expected_stat=expected_stat,
+            label="--runs-dir",
+        )
+        if runs_err is not None or v_runs is None:
+            print(runs_err or "Invalid --runs-dir.", file=sys.stderr)
+            return 1
+        set_cli_runs_dir_override(v_runs.path, runs_stat=v_runs.stat_id)
+        RUNS = v_runs.path
+        expected_stat = v_runs.stat_id
+        inproc_runs_applied = True
+    elif RUNS == _INITIAL_RUNS:
+        try:
+            RUNS = _effective_runs_dir()
+        except RegistryError as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        if not in_custody:
+            if expected_stat is not None:
+                v_eff, eff_err = inspect_existing_runs_dir(
+                    RUNS,
+                    expected_stat=expected_stat,
+                    label="FREE_INFERENCE_RUNS_DIR",
+                )
+                if eff_err is not None or v_eff is None:
+                    print(eff_err or "Invalid session store directory.", file=sys.stderr)
+                    RUNS = prev_runs
+                    return 1
+                RUNS = v_eff.path
+            else:
+                v_eff, eff_err = validate_creatable_runs_dir(RUNS, label="FREE_INFERENCE_RUNS_DIR")
+                if eff_err is not None or v_eff is None:
+                    print(eff_err or "Invalid session store directory.", file=sys.stderr)
+                    return 1
+                RUNS = v_eff.path
+                if not v_eff.exists:
+                    target = pos_args[0] if pos_args else None
+                    if target and target != "--all":
+                        print(f"No active server PID file found for {target}.")
+                    else:
+                        print("No active server PID file found.")
+                    RUNS = prev_runs
+                    return 0
+                expected_stat = v_eff.stat_id
+
+    try:
+        pin_ctx: Any = (
+            bind_pinned_runs_dir(RUNS, create=False, expected_stat=expected_stat, label="--runs-dir")
+            if (not in_custody and (raw_runs_dir is not None or RUNS.is_dir()))
+            else contextlib.nullcontext()
+        )
+        with pin_ctx:
+            return _main_stop_inner(pos_args, force_legacy=force_legacy, discard_legacy=discard_legacy)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    finally:
+        RUNS = prev_runs
+        if inproc_runs_applied:
+            set_cli_runs_dir_override(
+                prev_boot.cli_runs_dir if prev_boot is not None else None,
+                runs_stat=prev_boot.cli_runs_stat if prev_boot is not None else None,
+            )
+
+
+def _main_stop_inner(
+    pos_args: list[str],
+    *,
+    force_legacy: bool,
+    discard_legacy: bool,
+) -> int:
     target = pos_args[0] if pos_args else None
     default_pid = legacy_pid_file(RUNS)
     stopped_pids: set[int] = set()
@@ -290,7 +405,7 @@ def main(argv: list[str]) -> int:
                     force_legacy=force_legacy,
                     discard_legacy=discard_legacy,
                 ):
-                    path.unlink(missing_ok=True)
+                    runs_store_unlink(RUNS, path.name)
                 else:
                     all_ok = False
             return 0 if all_ok else 1
@@ -303,13 +418,16 @@ def main(argv: list[str]) -> int:
                 _legacy_unhashed_pid_file(target, RUNS),
                 default_pid,
             ]
-            seen_paths: set[Path] = set()
+            seen_names: set[str] = set()
             for path in candidates:
-                if path in seen_paths or not path.exists():
+                if path.name in seen_names:
                     continue
-                seen_paths.add(path)
+                raw_txt = runs_store_read_text(RUNS, path.name)
+                if raw_txt is None:
+                    continue
+                seen_names.add(path.name)
                 try:
-                    record = json.loads(path.read_text())
+                    record = json.loads(raw_txt)
                 except (OSError, json.JSONDecodeError):
                     continue
                 if not isinstance(record, dict) or record.get("model_id") != target:
@@ -321,12 +439,12 @@ def main(argv: list[str]) -> int:
                     force_legacy=force_legacy,
                     discard_legacy=discard_legacy,
                 ):
-                    path.unlink(missing_ok=True)
+                    runs_store_unlink(RUNS, path.name)
                 else:
                     all_ok = False
 
             for path, record in list_pid_records(RUNS):
-                if path in seen_paths:
+                if path.name in seen_names:
                     continue
                 if record.get("model_id") == target:
                     matched = True
@@ -336,7 +454,7 @@ def main(argv: list[str]) -> int:
                         force_legacy=force_legacy,
                         discard_legacy=discard_legacy,
                     ):
-                        path.unlink(missing_ok=True)
+                        runs_store_unlink(RUNS, path.name)
                     else:
                         all_ok = False
 
@@ -345,9 +463,10 @@ def main(argv: list[str]) -> int:
                 return 0
             return 0 if all_ok else 1
 
-        if default_pid.exists():
+        raw_default = runs_store_read_text(RUNS, default_pid.name)
+        if raw_default is not None:
             try:
-                record = json.loads(default_pid.read_text())
+                record = json.loads(raw_default)
             except (OSError, json.JSONDecodeError):
                 record = None
             if isinstance(record, dict):
@@ -358,18 +477,19 @@ def main(argv: list[str]) -> int:
                     discard_legacy=discard_legacy,
                 ):
                     return 1
-                default_pid.unlink(missing_ok=True)
+                runs_store_unlink(RUNS, default_pid.name)
                 model_id = record.get("model_id")
                 if isinstance(model_id, str) and model_id:
                     for extra in (
                         pid_file_for_model(model_id, RUNS),
                         _legacy_unhashed_pid_file(model_id, RUNS),
                     ):
-                        if extra.exists():
+                        raw_extra = runs_store_read_text(RUNS, extra.name)
+                        if raw_extra is not None:
                             try:
-                                extra_rec = json.loads(extra.read_text())
+                                extra_rec = json.loads(raw_extra)
                                 if isinstance(extra_rec, dict) and extra_rec.get("model_id") == model_id:
-                                    extra.unlink(missing_ok=True)
+                                    runs_store_unlink(RUNS, extra.name)
                             except (OSError, json.JSONDecodeError):
                                 pass
                 return 0
@@ -386,7 +506,7 @@ def main(argv: list[str]) -> int:
             force_legacy=force_legacy,
             discard_legacy=discard_legacy,
         ):
-            path.unlink(missing_ok=True)
+            runs_store_unlink(RUNS, path.name)
             return 0
         return 1
 

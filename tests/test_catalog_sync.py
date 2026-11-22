@@ -2907,6 +2907,2158 @@ containers:
             )
             self.assertFalse(drift_after.has_drift)
 
+    def test_router_only_nonchat_qwen3_tts_base_exemption_and_cli_paths(self) -> None:
+        """Router-only non-chat TTS enclave qwen3-tts-base does not trigger feed disagreement across API and CLI paths."""
+        import importlib.machinery
+        import importlib.util
+
+        models_data = _make_base_models_fixture()
+        router_manifest = _make_router_manifest_fixture()
+        router_manifest["models"]["qwen3-tts-base"] = {
+            "repo": "tinfoilsh/confidential-small-models",
+            "tag": "v0.0.5",
+            "verification": {"healthy": 1, "verified": 1, "configured": 1},
+            "enclaves": {},
+        }
+        openai_models = _make_openai_models_fixture()
+        enclave_configs = {
+            "tinfoilsh/confidential-deepseek-v4-1-flash@v0.0.10+b200": parse_tinfoil_config_yaml(DEEPSEEK_V4_1_FLASH_YAML),
+            "tinfoilsh/confidential-kimi-k3@v0.0.16": parse_tinfoil_config_yaml(KIMI_K3_V0_0_16_YAML),
+            "tinfoilsh/confidential-kimi-k3-1-pro@v0.0.3": parse_tinfoil_config_yaml(KIMI_K3_1_PRO_V0_0_3_YAML),
+        }
+
+        # 1. Default policy exempts unregistered router-only qwen3-tts-base (zero disagreements)
+        rep_default = compute_catalog_drift(
+            models_data,
+            router_manifest,
+            openai_models,
+            enclave_configs,
+            observed_date="2026-11-20",
+        )
+        self.assertEqual(rep_default.disagreements, [])
+
+        # 2. Explicit empty ignored_router_only_nonchat_ids restores disagreement detection
+        rep_strict = compute_catalog_drift(
+            models_data,
+            router_manifest,
+            openai_models,
+            enclave_configs,
+            observed_date="2026-11-20",
+            ignored_router_only_nonchat_ids=set(),
+        )
+        self.assertEqual(len(rep_strict.disagreements), 1)
+        self.assertEqual(rep_strict.disagreements[0].served_model_id, "qwen3-tts-base")
+
+        # 3. If /v1/models ever advertises qwen3-tts-base as tool-capable chat, discovery still picks it up
+        oai_as_chat = copy.deepcopy(openai_models)
+        oai_as_chat["data"].append(
+            {
+                "id": "qwen3-tts-base",
+                "type": "chat",
+                "tool_calling": True,
+                "context_window": 32768,
+                "pricing": {
+                    "inputTokenPricePer1M": 0.1,
+                    "outputTokenPricePer1M": 0.2,
+                },
+            }
+        )
+        enclaves_with_tts_chat = dict(enclave_configs)
+        enclaves_with_tts_chat["tinfoilsh/confidential-small-models@v0.0.5"] = parse_tinfoil_config_yaml(
+            KIMI_K3_1_PRO_V0_0_3_YAML.replace("kimi-k3-1-pro", "qwen3-tts-base")
+        )
+        rep_chat = compute_catalog_drift(
+            models_data,
+            router_manifest,
+            oai_as_chat,
+            enclaves_with_tts_chat,
+            observed_date="2026-11-20",
+        )
+        self.assertEqual(rep_chat.disagreements, [])
+        self.assertIn("tinfoil-qwen3-tts-base", [m["id"] for m in rep_chat.new_models])
+
+        # 4. Registered-model feed disagreement checks remain active
+        models_with_reg_disagree = copy.deepcopy(models_data)
+        rm_missing_ds = copy.deepcopy(router_manifest)
+        rm_missing_ds["models"].pop("deepseek-v4-1-flash")
+        rep_reg_dis = compute_catalog_drift(
+            models_with_reg_disagree,
+            rm_missing_ds,
+            openai_models,
+            enclave_configs,
+            observed_date="2026-11-20",
+        )
+        self.assertTrue(any(d.served_model_id == "deepseek-v4-1-flash" for d in rep_reg_dis.disagreements))
+
+        # 5. End-to-end CLI regression across --check, --apply, and --include-all-chat
+        script_path = ROOT / "scripts" / "sync-model-catalog"
+        loader = importlib.machinery.SourceFileLoader("sync_model_catalog_cli_tts", str(script_path))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        assert spec is not None and spec.loader is not None
+        cli_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cli_mod)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_models = Path(tmpdir) / "models.yaml"
+            tmp_models.write_text(dump_models_yaml(models_data), encoding="utf-8")
+            with (
+                patch.object(cli_mod, "fetch_tinfoil_router_manifest", return_value=router_manifest),
+                patch.object(cli_mod, "fetch_tinfoil_openai_models", return_value=openai_models),
+                patch.object(
+                    cli_mod,
+                    "fetch_tinfoil_enclave_config",
+                    side_effect=lambda r, t, **kw: enclave_configs[f"{r}@{t}"],
+                ),
+            ):
+                self.assertEqual(cli_mod.main(["--check", "--models-path", str(tmp_models)]), 2)
+                self.assertEqual(cli_mod.main(["--apply", "--models-path", str(tmp_models)]), 0)
+                self.assertEqual(cli_mod.main(["--check", "--models-path", str(tmp_models)]), 0)
+                self.assertEqual(
+                    cli_mod.main(["--check", "--include-all-chat", "--models-path", str(tmp_models)]),
+                    0,
+                )
+
+    def test_miniyaml_block_scalars_strict_keys_and_multi_document_parity(self) -> None:
+        import datetime
+        import hashlib
+        from local_assist._miniyaml import (
+            parse_yaml_documents,
+            parse_yaml_with_flow_sequences,
+            yaml_values_strictly_equal,
+        )
+
+        try:
+            import yaml as pyyaml  # type: ignore[import-untyped]
+        except ImportError:
+            pyyaml = None
+        if os.environ.get("FREE_INFERENCE_REQUIRE_PYYAML_PARITY") == "1":
+            self.assertIsNotNone(pyyaml, "FREE_INFERENCE_REQUIRE_PYYAML_PARITY=1 requires PyYAML")
+
+        # 1. Type-aware strict equality
+        self.assertFalse(yaml_values_strictly_equal(True, 1))
+        self.assertFalse(yaml_values_strictly_equal(1, 1.0))
+        self.assertFalse(yaml_values_strictly_equal(datetime.date(2026, 11, 21), "2026-11-21"))
+        self.assertFalse(yaml_values_strictly_equal({True: "a"}, {1: "a"}))
+        self.assertTrue(yaml_values_strictly_equal({"k": [1, "x", None, True]}, {"k": [1, "x", None, True]}))
+
+        # 2. Block scalars: empty clip/strip, single-line & multiline EOF with and without terminal newline, folded & blank lines
+        block_cases = [
+            ("a: |\n", {"a": ""}),
+            ("a: |-\n", {"a": ""}),
+            ("a: >\n", {"a": ""}),
+            ("a: >-\n", {"a": ""}),
+            ("a: |\n  \n  \n", {"a": ""}),
+            ("a: |\n  hi", {"a": "hi"}),
+            ("a: |\n  hi\n", {"a": "hi\n"}),
+            ("a: |\n  first\n  last", {"a": "first\nlast"}),
+            ("a: |\n  first\n  last\n", {"a": "first\nlast\n"}),
+            ("a: |\n  first\n  last\n\n", {"a": "first\nlast\n"}),
+            ("a: |-\n  first\n  last\n\n", {"a": "first\nlast"}),
+            ("a: >\n  first\n  last", {"a": "first last"}),
+            ("a: >\n  first\n  last\n", {"a": "first last\n"}),
+            ("a: >\n  first\n  last\n\n", {"a": "first last\n"}),
+            ("a: >-\n  first\n  last\n", {"a": "first last"}),
+            ("a: |\n  text\n   \n", {"a": "text\n \n"}),
+            ("a: |\n  text\n   \n\n", {"a": "text\n \n"}),
+            ("a: |-\n  text\n   \n", {"a": "text\n "}),
+            ("a: |\n  text\n   ", {"a": "text\n "}),
+            ("a: >\n  line1\n   \n  line2\n", {"a": "line1\n \nline2\n"}),
+            ("a: >\n  line1\n  \n  line2\n", {"a": "line1\nline2\n"}),
+            ("a: >\n  line1\n   \n", {"a": "line1\n \n"}),
+            ("a: |\n  \tword\n  next\n", {"a": "\tword\nnext\n"}),
+            ("a: |\n  text\n  \tword\n  next\n", {"a": "text\n\tword\nnext\n"}),
+            ("a: >\n  \tword\n  next\n", {"a": "\tword\nnext\n"}),
+            ("a: >\n  text\n  \tword\n  next\n", {"a": "text\n\tword\nnext\n"}),
+            ("a: >\n  text\n\n  \tword\n\n  next\n", {"a": "text\n\n\tword\n\nnext\n"}),
+            ("a: |\n  \n  text\n", {"a": "\ntext\n"}),
+            ("a: |\n   \n   \n", {"a": ""}),
+            ("a: >\n\n  lead\n\n  mid\n    more\n  end\n", {"a": "\nlead\nmid\n  more\nend\n"}),
+            ("items:\n  - |\n    line1\n    line2\n  - |-\n    strip1\n  - >\n    fold1\n    fold2\n",
+             {"items": ["line1\nline2\n", "strip1", "fold1 fold2\n"]}),
+            ("items:\n  - &s |\n    anchored\n  - *s\n", {"items": ["anchored\n", "anchored\n"]}),
+        ]
+        for raw_yaml, expected in block_cases:
+            got = parse_yaml_with_flow_sequences(
+                raw_yaml,
+                reject_duplicate_keys=True,
+                strict_plain_scalars=True,
+            )
+            self.assertTrue(
+                yaml_values_strictly_equal(got, expected),
+                f"Block scalar mismatch for {raw_yaml!r}: got={got!r}, expected={expected!r}",
+            )
+            if pyyaml is not None:
+                py_got = pyyaml.safe_load(raw_yaml)
+                self.assertTrue(
+                    yaml_values_strictly_equal(got, py_got),
+                    f"PyYAML parity mismatch for {raw_yaml!r}: stdlib={got!r}, pyyaml={py_got!r}",
+                )
+
+        # Under-indented continuation, over-indented leading blank line, and unsupported block indicators fail closed
+        for bad_block in (
+            "a: |\n    line1\n  line2\n",
+            "a: |\n    \n  text\n",
+            "a: >\n    \n  text\n",
+            "a: |+\n  hi\n",
+            "a: |2\n  hi\n",
+            "a: >+\n  hi\n",
+            "items:\n  - |+\n    hi\n",
+            "items:\n  - >2\n    hi\n",
+        ):
+            with self.assertRaises(ValueError, msg=f"Should reject {bad_block!r}"):
+                parse_yaml_with_flow_sequences(
+                    bad_block,
+                    reject_duplicate_keys=True,
+                    strict_plain_scalars=True,
+                )
+
+        # 3. Duplicate mapping keys + strict ASCII plain keys/scalars + mixed-script parity
+        for bad_strict in (
+            "a: 1\na: 2\n",
+            "items:\n  - x: 1\n    x: 2\n",
+            "2026-11-21: val\n",
+            "2026-1-2: val\n",
+            "2026-1-2 03:04:05: val\n",
+            "1_0.0e+2: val\n",
+            "12:30: val\n",
+            "0x1f: val\n",
+            "val: 2026-1-2\n",
+            "val: 2026-1-2 03:04:05\n",
+            "val: 1_0.0e+2\n",
+            "val: 12:30\n",
+            "val: 0o755\n",
+            "val: +5\n",
+        ):
+            with self.assertRaises(ValueError, msg=f"Strict YAML should reject {bad_strict!r}"):
+                parse_yaml_with_flow_sequences(
+                    bad_strict,
+                    reject_duplicate_keys=True,
+                    strict_plain_scalars=True,
+                )
+
+        mixed_script = "1\u0662: 1\u0662\n"
+        got_mixed = parse_yaml_with_flow_sequences(
+            mixed_script,
+            reject_duplicate_keys=True,
+            strict_plain_scalars=True,
+        )
+        self.assertTrue(yaml_values_strictly_equal(got_mixed, {"1\u0662": "1\u0662"}))
+        if pyyaml is not None:
+            self.assertTrue(yaml_values_strictly_equal(got_mixed, pyyaml.safe_load(mixed_script)))
+
+        # 4. Multi-document streams and edge cases
+        multi_cases = [
+            ("", []),
+            ("# comment only\n\n", []),
+            ("a: 1\n", [{"a": 1}]),
+            ("---\na: 1\n", [{"a": 1}]),
+            ("---\na: 1\n...\n# trailing comment\n", [{"a": 1}]),
+            ("---\n---\na: 1\n", [None, {"a": 1}]),
+            ("---\n...\n", [None]),
+            ("a: 1\n---\nb: |\n  keep --- indented\n  and ...\n...\n", [{"a": 1}, {"b": "keep --- indented\nand ...\n"}]),
+            ("a: |\n  clip-before-doc\n---\nb: |-\n  strip-before-eof", [{"a": "clip-before-doc\n"}, {"b": "strip-before-eof"}]),
+        ]
+        for raw_stream, expected_docs in multi_cases:
+            got_docs = parse_yaml_documents(
+                raw_stream,
+                allow_flow_sequences=True,
+                reject_duplicate_keys=True,
+                strict_plain_scalars=True,
+            )
+            self.assertTrue(
+                yaml_values_strictly_equal(got_docs, expected_docs),
+                f"Multi-doc mismatch for {raw_stream!r}: got={got_docs!r}, expected={expected_docs!r}",
+            )
+            if pyyaml is not None:
+                py_docs = list(pyyaml.safe_load_all(raw_stream))
+                self.assertTrue(
+                    yaml_values_strictly_equal(got_docs, py_docs),
+                    f"Multi-doc PyYAML mismatch for {raw_stream!r}: stdlib={got_docs!r}, pyyaml={py_docs!r}",
+                )
+
+        # Per-document anchor isolation, unfinished flow at doc boundary, directives, inline doc start
+        for bad_multi in (
+            "a: &x 1\n---\nb: *x\n",
+            "a: [1,\n---\nb: 2\n",
+            "%YAML 1.2\n---\na: 1\n",
+            "--- foo\n",
+            "...\n--- {a: 1}\n",
+        ):
+            with self.assertRaises(ValueError, msg=f"Multi-doc should reject {bad_multi!r}"):
+                parse_yaml_documents(
+                    bad_multi,
+                    allow_flow_sequences=True,
+                    reject_duplicate_keys=True,
+                    strict_plain_scalars=True,
+                )
+
+        # 5. Pinned real v1.64.0 fixtures provenance SHA-256 + full stdlib vs PyYAML parity
+        fix_dir = ROOT / "tests" / "fixtures" / "privatemode_v1_64_0"
+        prov = json.loads((fix_dir / "PROVENANCE.json").read_text(encoding="utf-8"))
+        self.assertEqual(prov["repo"], "edgelesssys/privatemode-public")
+        self.assertEqual(prov["tag"], "v1.64.0")
+        self.assertEqual(prov["commit_sha"], "3c98e0abf3219a6ebcc29112867a5f004605041b")
+        for fname in ("models.yaml", "deployment.yaml"):
+            raw_bytes = (fix_dir / fname).read_bytes()
+            self.assertEqual(hashlib.sha256(raw_bytes).hexdigest(), prov["files"][fname]["sha256"])
+            self.assertEqual(len(raw_bytes), prov["files"][fname]["bytes"])
+
+        models_text = (fix_dir / "models.yaml").read_text(encoding="utf-8")
+        deploy_text = (fix_dir / "deployment.yaml").read_text(encoding="utf-8")
+        parsed_m = parse_yaml_with_flow_sequences(
+            models_text, reject_duplicate_keys=True, strict_plain_scalars=True
+        )
+        parsed_d = parse_yaml_documents(
+            deploy_text,
+            allow_flow_sequences=True,
+            reject_duplicate_keys=True,
+            strict_plain_scalars=True,
+        )
+        self.assertEqual(len(parsed_d), 13)
+        if pyyaml is not None:
+            self.assertTrue(yaml_values_strictly_equal(parsed_m, pyyaml.safe_load(models_text)))
+            self.assertTrue(yaml_values_strictly_equal(parsed_d, list(pyyaml.safe_load_all(deploy_text))))
+
+    def test_privatemode_fetchers_url_binding_and_rollback_guard(self) -> None:
+        import importlib.machinery
+        import importlib.util
+        from local_assist.catalog_sync import (
+            fetch_privatemode_deployment_yaml,
+            fetch_privatemode_latest_release,
+            fetch_privatemode_models_yaml,
+            fetch_privatemode_tag_commit,
+        )
+
+        valid_release = {
+            "tag_name": "v1.64.0",
+            "draft": False,
+            "prerelease": False,
+            "published_at": "2026-11-14T16:36:05Z",
+            "assets": [
+                {
+                    "name": "manifest.json",
+                    "size": 12345,
+                    "browser_download_url": "https://github.com/edgelesssys/privatemode-public/releases/download/v1.64.0/manifest.json",
+                }
+            ],
+        }
+        rel = fetch_privatemode_latest_release(http_get=lambda _u: json.dumps(valid_release))
+        self.assertEqual(rel["tag_name"], "v1.64.0")
+        self.assertEqual(rel["manifest_asset_size"], 12345)
+
+        # Reject bad URLs: userinfo, port, query, fragment, wrong path, wrong host, plaintext loopback without opt-in
+        for bad_url in (
+            "https://user@api.github.com/repos/edgelesssys/privatemode-public/releases/latest",
+            "https://api.github.com:443/repos/edgelesssys/privatemode-public/releases/latest",
+            "https://api.github.com/repos/edgelesssys/privatemode-public/releases/latest?x=1",
+            "https://api.github.com/repos/edgelesssys/privatemode-public/releases/latest#frag",
+            "https://api.github.com/repos/evil/privatemode-public/releases/latest",
+            "https://evil.example/repos/edgelesssys/privatemode-public/releases/latest",
+            "http://127.0.0.1:8080/repos/edgelesssys/privatemode-public/releases/latest",
+        ):
+            with self.assertRaises(CatalogSyncError, msg=f"Should reject {bad_url}"):
+                fetch_privatemode_latest_release(url=bad_url, http_get=lambda _u: json.dumps(valid_release))
+
+        # Loopback fixture opt-in works only on exact path
+        rel_lb = fetch_privatemode_latest_release(
+            url="http://127.0.0.1:9999/repos/edgelesssys/privatemode-public/releases/latest",
+            http_get=lambda _u: json.dumps(valid_release),
+            allow_loopback_fixture=True,
+        )
+        self.assertEqual(rel_lb["tag_name"], "v1.64.0")
+
+        # Strict release metadata checks
+        for mutate in (
+            lambda d: d.update({"draft": True}),
+            lambda d: d.update({"draft": None}),
+            lambda d: d.update({"prerelease": True}),
+            lambda d: d.update({"prerelease": "false"}),
+            lambda d: d.update({"tag_name": "../v1.64.0"}),
+            lambda d: d.update({"assets": []}),
+            lambda d: d["assets"].append(dict(d["assets"][0])),
+            lambda d: d["assets"][0].update({"size": 0}),
+            lambda d: d["assets"][0].update({"size": True}),
+            lambda d: d["assets"][0].update({"browser_download_url": "https://evil.example/manifest.json"}),
+        ):
+            bad_rel = copy.deepcopy(valid_release)
+            mutate(bad_rel)
+            with self.assertRaises(CatalogSyncError):
+                fetch_privatemode_latest_release(http_get=lambda _u: json.dumps(bad_rel))
+
+        # Duplicate JSON key in release payload fails closed
+        with self.assertRaises(CatalogSyncError):
+            fetch_privatemode_latest_release(
+                http_get=lambda _u: '{"tag_name":"v1.64.0","tag_name":"v1.65.0","draft":false,"prerelease":false,"assets":[]}'
+            )
+
+        # Tag-to-commit resolution
+        sha = fetch_privatemode_tag_commit(
+            "v1.64.0",
+            http_get=lambda _u: json.dumps({"sha": "3c98e0abf3219a6ebcc29112867a5f004605041b"}),
+        )
+        self.assertEqual(sha, "3c98e0abf3219a6ebcc29112867a5f004605041b")
+        with self.assertRaises(CatalogSyncError):
+            fetch_privatemode_tag_commit("v1.64.0", http_get=lambda _u: json.dumps({"sha": "not-a-sha"}))
+        with self.assertRaises(CatalogSyncError):
+            fetch_privatemode_models_yaml("v1.64.0", http_get=lambda _u: "")
+        with self.assertRaises(CatalogSyncError):
+            fetch_privatemode_deployment_yaml("v1.64.0", http_get=lambda _u: "")
+
+        # CLI --privatemode-tag --apply is refused fail-closed without touching models.yaml
+        script_path = ROOT / "scripts" / "sync-model-catalog"
+        loader = importlib.machinery.SourceFileLoader("sync_model_catalog_cli_pm_ro", str(script_path))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        assert spec is not None and spec.loader is not None
+        cli_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cli_mod)
+        with tempfile.TemporaryDirectory() as td:
+            p = Path(td) / "models.yaml"
+            p.write_text(dump_models_yaml(_make_base_models_fixture()), encoding="utf-8")
+            orig = p.read_bytes()
+            rc = cli_mod.main(
+                ["--provider", "privatemode", "--privatemode-tag", "v1.63.0", "--apply", "--models-path", str(p)]
+            )
+            self.assertEqual(rc, 1)
+            self.assertEqual(p.read_bytes(), orig)
+
+    def test_privatemode_parsers_disk_binding_and_overlapping_slugs(self) -> None:
+        from local_assist.catalog_sync import (
+            compute_privatemode_catalog_drift,
+            parse_privatemode_deployment_yaml,
+            parse_privatemode_models_yaml,
+        )
+
+        fix_dir = ROOT / "tests" / "fixtures" / "privatemode_v1_64_0"
+        models_yaml_text = (fix_dir / "models.yaml").read_text(encoding="utf-8")
+        deploy_yaml_text = (fix_dir / "deployment.yaml").read_text(encoding="utf-8")
+
+        disk_map = parse_privatemode_models_yaml(models_yaml_text)
+        self.assertEqual(len(disk_map), 11)
+        dep_data = parse_privatemode_deployment_yaml(deploy_yaml_text)
+        self.assertEqual(dep_data["partial_deployments"], [])
+        self.assertEqual(
+            sorted(dep_data["workloads"].keys()),
+            [
+                "deepseek-ocr-2",
+                "glm-5.3",
+                "glm-5.3-flash",
+                "openai/gpt-oss-120b",
+                "openai/whisper-large-v3",
+                "qwen3-embedding-4b",
+                "voxtral-mini-3b",
+            ],
+        )
+
+        # Forged disk_key, duplicate root_hash, duplicate JSON key in models.yaml fail closed
+        forged_models = models_yaml_text.replace("openai-gpt-oss-120b:", "forged-disk-key:")
+        with self.assertRaises(CatalogSyncError):
+            parse_privatemode_models_yaml(forged_models)
+
+        dup_root_models = models_yaml_text.replace(
+            "df66c4cfc7f34c4f7aefd710795a511cde8384677cd041220a04b55541a07d75",
+            "c5dcd713fffc38c956bbd41fb299c360ed07d60de61938a6ff2729f6c3acd245",
+        )
+        with self.assertRaises(CatalogSyncError):
+            parse_privatemode_models_yaml(dup_root_models)
+
+        dup_json_key_models = models_yaml_text.replace(
+            '"file_size_bytes": 206086352896',
+            '"file_size_bytes": 206086352896, "file_size_bytes": 1',
+        )
+        self.assertNotEqual(dup_json_key_models, models_yaml_text)
+        with self.assertRaises(CatalogSyncError):
+            parse_privatemode_models_yaml(dup_json_key_models)
+
+        # Helper to build a minimal valid single-workload deployment YAML for negative tests
+        def _make_single_dep(
+            *,
+            dep_name: str = "workload-nova-2",
+            disk_name: str = "nova-2",
+            root_hash: str = "1" * 64,
+            served_args: list[str] | None = None,
+            extra_args: list[str] | None = None,
+            replicas: int | None = None,
+            include_workload_ctr: bool = True,
+            h2c_mount: bool = True,
+            bidi_mount: bool = True,
+            pvc_claim: str | None = None,
+            ctr_args_override: list[Any] | None = None,
+        ) -> str:
+            k8s_slug = disk_name.replace(".", "-")
+            claim = pvc_claim or k8s_slug
+            s_args = served_args if served_args is not None else ["--served-model-name", disk_name]
+            args_list = ctr_args_override if ctr_args_override is not None else [
+                f"/mnt/modelweights-{disk_name}-0",
+                *s_args,
+                *(extra_args or []),
+            ]
+            ctr_mounts = (
+                [{"name": "mount-dir", "mountPath": "/mnt", "mountPropagation": "HostToContainer"}]
+                if h2c_mount
+                else []
+            )
+            ic_mounts = (
+                [{"name": "mount-dir", "mountPath": "/mnt", "mountPropagation": "Bidirectional"}]
+                if bidi_mount
+                else []
+            )
+            doc: dict[str, Any] = {
+                "apiVersion": "apps/v1",
+                "kind": "Deployment",
+                "metadata": {"name": dep_name},
+                "spec": {
+                    "template": {
+                        "spec": {
+                            "initContainers": [
+                                {
+                                    "name": f"disk-mounter-{k8s_slug}-0",
+                                    "args": [disk_name, "0", root_hash],
+                                    "volumeDevices": [
+                                        {
+                                            "name": f"modelweights-{k8s_slug}-0",
+                                            "devicePath": f"/dev/modelweights-{disk_name}-0",
+                                        }
+                                    ],
+                                    "volumeMounts": ic_mounts,
+                                }
+                            ],
+                            "containers": (
+                                [
+                                    {
+                                        "name": f"workload-{k8s_slug}-0",
+                                        "args": args_list,
+                                        "volumeMounts": ctr_mounts,
+                                    }
+                                ]
+                                if include_workload_ctr
+                                else []
+                            ),
+                            "volumes": [
+                                {"name": "mount-dir", "emptyDir": {"medium": "Memory"}},
+                                {
+                                    "name": f"modelweights-{k8s_slug}-0",
+                                    "persistentVolumeClaim": {"claimName": claim},
+                                },
+                            ],
+                        }
+                    }
+                },
+            }
+            if replicas is not None:
+                doc["spec"]["replicas"] = replicas
+            return dump_models_yaml(doc)
+
+        # Missing backing mounts, PVC mismatch, non-string args, conflicting flags, independently varying served ID vs pod slug
+        for bad_dep in (
+            _make_single_dep(h2c_mount=False),
+            _make_single_dep(bidi_mount=False),
+            _make_single_dep(pvc_claim="wrong-pvc"),
+            _make_single_dep(ctr_args_override=["/mnt/modelweights-nova-2-0", 123, "--served-model-name", "nova-2"]),
+            _make_single_dep(extra_args=["--max-model-len", "0"]),
+            _make_single_dep(extra_args=["--max-model-len", "1024", "--max-model-len", "2048"]),
+            _make_single_dep(extra_args=["--enable-auto-tool-choice=false"]),
+            _make_single_dep(extra_args=["--tool-call-parser", "a", "--tool-call-parser", "b"]),
+            _make_single_dep(disk_name="glm-5.3-flash", served_args=["--served-model-name", "other-model"]),
+        ):
+            with self.assertRaises(CatalogSyncError):
+                parse_privatemode_deployment_yaml(bad_dep)
+
+        # Alias-vs-alias collision across Deployments fails closed
+        dep_a = _make_single_dep(
+            dep_name="workload-nova-a",
+            disk_name="nova-a",
+            served_args=["--served-model-name", "nova-a", "shared-alias"],
+        )
+        dep_b = _make_single_dep(
+            dep_name="workload-nova-b",
+            disk_name="nova-b",
+            served_args=["--served-model-name", "nova-b", "shared-alias"],
+        )
+        with self.assertRaises(CatalogSyncError):
+            parse_privatemode_deployment_yaml(dep_a + "---\n" + dep_b)
+
+        # Partial deployments (replicas == 0 and orphan disk-mounter) emit partial_deployments
+        p_zero = parse_privatemode_deployment_yaml(_make_single_dep(replicas=0))
+        self.assertEqual(len(p_zero["partial_deployments"]), 1)
+        p_orphan = parse_privatemode_deployment_yaml(_make_single_dep(include_workload_ctr=False))
+        self.assertEqual(len(p_orphan["partial_deployments"]), 1)
+
+        # Overlapping-slug cross-feed mismatch on REGISTERED path:
+        # Coherent glm-5-3 pod mounting nvidia-glm-5-3-flash-nvfp4's valid root_hash -> registered FeedDisagreementItem!
+        flash_root = "c5dcd713fffc38c956bbd41fb299c360ed07d60de61938a6ff2729f6c3acd245"
+        glm_dep_with_flash_root = parse_privatemode_deployment_yaml(
+            _make_single_dep(
+                dep_name="workload-glm-5-3",
+                disk_name="glm-5.3",
+                root_hash=flash_root,
+                served_args=["--served-model-name", "glm-5.3"],
+                extra_args=["--tool-call-parser", "glm47", "--max-model-len", "1048576"],
+            )
+        )
+        real_models_data = safe_load((ROOT / "models.yaml").read_text(encoding="utf-8"))
+        only_glm_5_3 = {
+            "models": [copy.deepcopy(m) for m in real_models_data["models"] if m.get("id") == "privatemode-glm-5-3"]
+        }
+        rep_overlap_reg = compute_privatemode_catalog_drift(
+            only_glm_5_3,
+            "v1.63.0",
+            disk_map,
+            glm_dep_with_flash_root,
+            observed_date="2026-11-21",
+        )
+        self.assertEqual(len(rep_overlap_reg.disagreements), 1)
+        self.assertTrue(rep_overlap_reg.disagreements[0].registered)
+        self.assertIn("cross-feed disk identity mismatch", rep_overlap_reg.disagreements[0].reason)
+        self.assertEqual(rep_overlap_reg.updated_models, [])
+
+        # Overlapping-slug cross-feed mismatch on UNKNOWN DISCOVERY path:
+        # Truly unknown nova-2 pod mounting acme/Nova-2-Flash-NVFP4's valid root_hash -> unregistered FeedDisagreementItem!
+        nova_flash_root = "a" * 64
+        nova_exact_root = "b" * 64
+        custom_disks = {
+            nova_flash_root: {
+                "disk_key": "acme-nova-2-flash-nvfp4",
+                "upstream": "acme/Nova-2-Flash-NVFP4",
+                "commit_hash": "c" * 40,
+                "weights_source": f"acme/Nova-2-Flash-NVFP4@{'c' * 40}",
+                "root_hash": nova_flash_root,
+                "weights_hash": f"dmverity:sha256:{nova_flash_root}",
+                "file_size_bytes": 100_000_000_000,
+                "disk_gb_estimate": 100.0,
+            },
+            nova_exact_root: {
+                "disk_key": "acme-nova-2-nvfp4",
+                "upstream": "acme/Nova-2-NVFP4",
+                "commit_hash": "d" * 40,
+                "weights_source": f"acme/Nova-2-NVFP4@{'d' * 40}",
+                "root_hash": nova_exact_root,
+                "weights_hash": f"dmverity:sha256:{nova_exact_root}",
+                "file_size_bytes": 120_000_000_000,
+                "disk_gb_estimate": 120.0,
+            },
+        }
+        nova_overlap_dep = parse_privatemode_deployment_yaml(
+            _make_single_dep(
+                dep_name="workload-nova-2",
+                disk_name="nova-2",
+                root_hash=nova_flash_root,
+                served_args=["--served-model-name", "nova-2"],
+                extra_args=["--tool-call-parser", "glm47", "--max-model-len", "131072"],
+            )
+        )
+        rep_overlap_disc = compute_privatemode_catalog_drift(
+            {"models": []},
+            "v1.64.0",
+            custom_disks,
+            nova_overlap_dep,
+            observed_date="2026-11-21",
+        )
+        self.assertEqual(rep_overlap_disc.new_models, [])
+        self.assertEqual(len(rep_overlap_disc.disagreements), 1)
+        self.assertFalse(rep_overlap_disc.disagreements[0].registered)
+        self.assertIn("mismatched models.yaml disk 'acme-nova-2-flash-nvfp4'", rep_overlap_disc.disagreements[0].reason)
+
+        # Valid exact match unknown coding model IS discovered as manual_onboarding_required at Rung 3
+        nova_ok_dep = parse_privatemode_deployment_yaml(
+            _make_single_dep(
+                dep_name="workload-nova-2",
+                disk_name="nova-2",
+                root_hash=nova_exact_root,
+                served_args=["--served-model-name", "nova-2"],
+                extra_args=["--tool-call-parser", "glm47", "--max-model-len", "131072"],
+            )
+        )
+        rep_nova_ok = compute_privatemode_catalog_drift(
+            {"models": []},
+            "v1.64.0",
+            custom_disks,
+            nova_ok_dep,
+            observed_date="2026-11-21",
+        )
+        self.assertEqual(rep_nova_ok.disagreements, [])
+        self.assertEqual(len(rep_nova_ok.new_models), 1)
+        cand = rep_nova_ok.new_models[0]
+        self.assertEqual(cand["id"], "privatemode-nova-2")
+        self.assertTrue(cand["manual_onboarding_required"])
+        self.assertIsNone(cand["remote_trust"]["pricing_per_m_tokens"])
+        self.assertEqual(cand["remote_trust"]["tier"], "enclave_runtime_attested")
+        self.assertIsNone(cand["remote_trust"]["weights_hash"])
+
+        # Missing deployment: disk still in models.yaml -> registered disagreement; absent from BOTH -> confirmed archive_removed
+        rep_missing_dep_disk_present = compute_privatemode_catalog_drift(
+            only_glm_5_3,
+            "v1.64.0",
+            disk_map,
+            nova_ok_dep,
+            observed_date="2026-11-21",
+            discover_new_coding_models=False,
+        )
+        self.assertEqual(len(rep_missing_dep_disk_present.disagreements), 1)
+        self.assertEqual(rep_missing_dep_disk_present.removed_models, [])
+
+        rep_confirmed_removal = compute_privatemode_catalog_drift(
+            only_glm_5_3,
+            "v1.64.0",
+            custom_disks,
+            nova_ok_dep,
+            observed_date="2026-11-21",
+            discover_new_coding_models=False,
+        )
+        self.assertEqual(rep_confirmed_removal.disagreements, [])
+        self.assertEqual(len(rep_confirmed_removal.removed_models), 1)
+        self.assertEqual(rep_confirmed_removal.removed_models[0].action, "archive_removed")
+
+        # voxtral-mini-3b ignored by default, included when ignored_served_ids=set()
+        pm_only_catalog = {
+            "models": [copy.deepcopy(m) for m in real_models_data["models"] if str(m.get("id", "")).startswith("privatemode-")]
+        }
+        rep_vox_default = compute_privatemode_catalog_drift(
+            pm_only_catalog, "v1.64.0", disk_map, dep_data, observed_date="2026-11-21"
+        )
+        self.assertEqual(rep_vox_default.new_models, [])
+        rep_vox_all = compute_privatemode_catalog_drift(
+            pm_only_catalog,
+            "v1.64.0",
+            disk_map,
+            dep_data,
+            observed_date="2026-11-21",
+            ignored_served_ids=set(),
+        )
+        self.assertEqual([m["repo"] for m in rep_vox_all.new_models], ["voxtral-mini-3b"])
+
+    def test_privatemode_drift_merge_committed_manifest_and_safety_only_apply(self) -> None:
+        import hashlib
+        import shutil
+        import subprocess
+        from local_assist.catalog_sync import (
+            CatalogDriftReport,
+            FeedDisagreementItem,
+            ModelDriftItem,
+            compute_privatemode_catalog_drift,
+            merge_drift_reports,
+            parse_privatemode_deployment_yaml,
+            parse_privatemode_models_yaml,
+        )
+
+        fix_dir = ROOT / "tests" / "fixtures" / "privatemode_v1_64_0"
+        prov = json.loads((fix_dir / "PROVENANCE.json").read_text(encoding="utf-8"))
+        v164_commit = prov["commit_sha"]
+        disk_map = parse_privatemode_models_yaml((fix_dir / "models.yaml").read_text(encoding="utf-8"))
+        dep_data = parse_privatemode_deployment_yaml((fix_dir / "deployment.yaml").read_text(encoding="utf-8"))
+
+        real_models_data = safe_load((ROOT / "models.yaml").read_text(encoding="utf-8"))
+        pm_entries = [
+            copy.deepcopy(m)
+            for m in real_models_data["models"]
+            if str(m.get("id", "")).startswith("privatemode-")
+        ]
+        # Pin flash as default_private_attested for testing default clearance removal
+        for m in pm_entries:
+            if m["id"] == "privatemode-glm-5-3-flash":
+                m["routing"]["default_private_attested"] = True
+
+        # 1. Clean pinned v1.64.0 state -> has_drift=False & non-null base_catalog_sha256
+        clean_pm_data = {"models": copy.deepcopy(pm_entries)}
+        for m in clean_pm_data["models"]:
+            m["enclave_tag"] = "v1.64.0"
+            m["serve_command"] = m["serve_command"].replace("v1.63.0", "v1.64.0")
+        rep_clean = compute_privatemode_catalog_drift(
+            clean_pm_data,
+            "v1.64.0",
+            disk_map,
+            dep_data,
+            observed_date="2026-11-21",
+            provenance={"tag": "v1.64.0", "commit_sha": v164_commit},
+        )
+        self.assertFalse(rep_clean.has_drift)
+        self.assertIsNotNone(rep_clean.base_catalog_sha256)
+        self.assertEqual(rep_clean.providers, ["privatemode"])
+
+        # 2. Release-tag drift v1.63.0 -> v1.64.0 projects serve_command + mandatory clearance demotion
+        v163_pm_data = {"models": copy.deepcopy(pm_entries)}
+        rep_upgrade = compute_privatemode_catalog_drift(
+            v163_pm_data,
+            "v1.64.0",
+            disk_map,
+            dep_data,
+            observed_date="2026-11-21",
+            provenance={"tag": "v1.64.0", "commit_sha": v164_commit},
+        )
+        self.assertTrue(rep_upgrade.has_drift)
+        self.assertEqual(len(rep_upgrade.updated_models), 3)
+        flash_upd = next(u for u in rep_upgrade.updated_models if u.model_id == "privatemode-glm-5-3-flash")
+        self.assertEqual(flash_upd.action, "manifest_upgrade_required")
+        self.assertEqual(flash_upd.changes["enclave_tag"], {"from": "v1.63.0", "to": "v1.64.0"})
+        self.assertIn("config/privatemode-manifest-v1.64.0.json", flash_upd.changes["serve_command"]["to"])
+        self.assertEqual(flash_upd.changes["routing.private_attested"], {"from": "cleared", "to": "blocked"})
+        self.assertEqual(flash_upd.changes["routing.default_private_attested"], {"from": True, "to": False})
+
+        # 3. Committed-manifest proof when git is available (dedicated test_privatemode_committed_manifest_git_proof also covers full git flow)
+        if shutil.which("git"):
+            with tempfile.TemporaryDirectory() as td:
+                repo_dir = Path(td)
+                subprocess.run(["git", "init", "-q", str(repo_dir)], check=True)
+                subprocess.run(["git", "-C", str(repo_dir), "config", "user.email", "test@example.com"], check=True)
+                subprocess.run(["git", "-C", str(repo_dir), "config", "user.name", "Test"], check=True)
+                (repo_dir / "config").mkdir()
+                (repo_dir / "scripts").mkdir()
+                models_p = repo_dir / "models.yaml"
+                models_p.write_text(dump_models_yaml(v163_pm_data), encoding="utf-8")
+                orig_bytes = models_p.read_bytes()
+
+                # (a) Missing v1.64.0 manifest/builder -> fails closed
+                with self.assertRaises(CatalogSyncError):
+                    apply_catalog_healing(models_p, rep_upgrade)
+                self.assertEqual(models_p.read_bytes(), orig_bytes)
+
+                # (b) Untracked v1.64.0 manifest & builder -> fails closed
+                manifest_bytes = json.dumps({"ReferenceValues": {"a": 1}, "Policies": {"b": 2}}, indent=2).encode("utf-8")
+                manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
+                manifest_p = repo_dir / "config" / "privatemode-manifest-v1.64.0.json"
+                manifest_p.write_bytes(manifest_bytes)
+                builder_p = repo_dir / "scripts" / "build-privatemode-proxy"
+
+                def _write_builder(*, ver: str = "1.64.0", commit: str = v164_commit, sha: str = manifest_sha, fname: str = "privatemode-manifest-v1.64.0.json") -> None:
+                    builder_p.write_text(
+                        "from pathlib import Path\n"
+                        "ROOT = Path(__file__).resolve().parents[1]\n"
+                        f'COMMITTED_MANIFEST_PATH = ROOT / "config" / "{fname}"\n'
+                        f'PRIVATEMODE_VERSION = "{ver}"\n'
+                        f'PRIVATEMODE_SOURCE_COMMIT = "{commit}"\n'
+                        f'EXPECTED_MANIFEST_SHA256 = "{sha}"\n',
+                        encoding="utf-8",
+                    )
+
+                _write_builder()
+                with self.assertRaises(CatalogSyncError) as ctx_untracked:
+                    apply_catalog_healing(models_p, rep_upgrade)
+                self.assertIn("uncommitted or untracked", str(ctx_untracked.exception))
+                self.assertEqual(models_p.read_bytes(), orig_bytes)
+
+                # Commit manifest and builder
+                subprocess.run(
+                    ["git", "-C", str(repo_dir), "add", "config/privatemode-manifest-v1.64.0.json", "scripts/build-privatemode-proxy"],
+                    check=True,
+                )
+                subprocess.run(["git", "-C", str(repo_dir), "commit", "-q", "-m", "commit v1.64.0 pins"], check=True)
+
+                # (c) Locally modified manifest -> fails closed
+                manifest_p.write_bytes(manifest_bytes + b"\n")
+                with self.assertRaises(CatalogSyncError):
+                    apply_catalog_healing(models_p, rep_upgrade)
+                manifest_p.write_bytes(manifest_bytes)
+
+                # (d) Symlinked manifest -> fails closed
+                outside_p = repo_dir / "outside.json"
+                outside_p.write_bytes(manifest_bytes)
+                manifest_p.unlink()
+                manifest_p.symlink_to(outside_p)
+                with self.assertRaises(CatalogSyncError):
+                    apply_catalog_healing(models_p, rep_upgrade)
+                manifest_p.unlink()
+                manifest_p.write_bytes(manifest_bytes)
+
+                # (e) Tampered projected serve_command (duplicate --manifest-path or post-`--` option) -> fails closed
+                rep_dup_opt = copy.deepcopy(rep_upgrade)
+                rep_dup_opt.updated_models[0].changes["serve_command"]["to"] += " --manifest-path config/privatemode-manifest-v1.64.0.json"
+                with self.assertRaises(CatalogSyncError):
+                    apply_catalog_healing(models_p, rep_dup_opt)
+                rep_post_dd = copy.deepcopy(rep_upgrade)
+                rep_post_dd.updated_models[0].changes["serve_command"]["to"] += " -- --manifest-path config/privatemode-manifest-v1.64.0.json"
+                with self.assertRaises(CatalogSyncError):
+                    apply_catalog_healing(models_p, rep_post_dd)
+
+                # (f) Wrong PRIVATEMODE_SOURCE_COMMIT -> fails closed
+                _write_builder(commit="0" * 40)
+                subprocess.run(["git", "-C", str(repo_dir), "commit", "-qam", "wrong commit pin"], check=True)
+                with self.assertRaises(CatalogSyncError) as ctx_bad_commit:
+                    apply_catalog_healing(models_p, rep_upgrade)
+                self.assertIn("PRIVATEMODE_SOURCE_COMMIT", str(ctx_bad_commit.exception))
+
+                # (g) Restore matching pins and commit -> atomic apply succeeds AND demotes cleared flash model
+                _write_builder()
+                subprocess.run(["git", "-C", str(repo_dir), "commit", "-qam", "correct v1.64.0 pins"], check=True)
+                healed = apply_catalog_healing(models_p, rep_upgrade)
+                flash_after = next(m for m in healed["models"] if m["id"] == "privatemode-glm-5-3-flash")
+                self.assertEqual(flash_after["enclave_tag"], "v1.64.0")
+                self.assertIn("config/privatemode-manifest-v1.64.0.json", flash_after["serve_command"])
+                self.assertEqual(flash_after["status"], "candidate")
+                self.assertEqual(flash_after["routing"]["private_attested"], "blocked")
+                self.assertNotIn("default_private_attested", flash_after["routing"])
+                self.assertEqual(flash_after["stale_eval_evidence_artifact"], "docs/evals/privatemode-glm-5-3-flash.json")
+
+        # 4. Real producer -> merge_drift_reports -> apply + strict rejection checks
+        combined_catalog = _make_base_models_fixture()
+        combined_catalog["models"].extend(copy.deepcopy(pm_entries))
+        enclaves_base = {
+            "tinfoilsh/confidential-deepseek-v4-1-flash@v0.0.10+b200": parse_tinfoil_config_yaml(DEEPSEEK_V4_1_FLASH_YAML),
+            "tinfoilsh/confidential-kimi-k3@v0.0.16": parse_tinfoil_config_yaml(KIMI_K3_V0_0_16_YAML),
+            "tinfoilsh/confidential-kimi-k3-1-pro@v0.0.3": parse_tinfoil_config_yaml(KIMI_K3_1_PRO_V0_0_3_YAML),
+        }
+        rep_tf = compute_catalog_drift(
+            combined_catalog,
+            _make_router_manifest_fixture(),
+            _make_openai_models_fixture(),
+            enclaves_base,
+            observed_date="2026-11-21",
+        )
+        rep_pm = compute_privatemode_catalog_drift(
+            combined_catalog,
+            "v1.64.0",
+            disk_map,
+            dep_data,
+            observed_date="2026-11-21",
+            provenance={"tag": "v1.64.0", "commit_sha": v164_commit},
+        )
+        merged = merge_drift_reports([rep_tf, rep_pm])
+        self.assertEqual(merged.providers, ["tinfoil", "privatemode"])
+        self.assertEqual(merged.base_catalog_sha256, rep_tf.base_catalog_sha256)
+        self.assertEqual(merged.base_catalog_sha256, rep_pm.base_catalog_sha256)
+
+        # Merge rejects null/mismatched digest, mismatched date, duplicate proposed repo/id, duplicate target
+        rep_no_sha = copy.deepcopy(rep_pm)
+        rep_no_sha.base_catalog_sha256 = None
+        with self.assertRaises(CatalogSyncError):
+            merge_drift_reports([rep_tf, rep_no_sha])
+        rep_bad_date = copy.deepcopy(rep_pm)
+        rep_bad_date.observed_date = "2026-11-22"
+        with self.assertRaises(CatalogSyncError):
+            merge_drift_reports([rep_tf, rep_bad_date])
+        rep_dup_repo = copy.deepcopy(rep_pm)
+        rep_dup_repo.new_models.append({"id": "privatemode-dup", "repo": "kimi-k3-1-pro"})
+        with self.assertRaises(CatalogSyncError):
+            merge_drift_reports([rep_tf, rep_dup_repo])
+
+        # Direct apply_catalog_healing rejects null digest on Privatemode report, duplicate target in bucket, wrong provider quarantine
+        with tempfile.TemporaryDirectory() as td_rej:
+            p_rej = Path(td_rej) / "models.yaml"
+            p_rej.write_text(dump_models_yaml(combined_catalog), encoding="utf-8")
+            with self.assertRaises(CatalogSyncError):
+                apply_catalog_healing(p_rej, rep_no_sha)
+
+            rep_dup_target = copy.deepcopy(rep_pm)
+            rep_dup_target.updated_models.append(copy.deepcopy(rep_dup_target.updated_models[0]))
+            with self.assertRaises(CatalogSyncError):
+                apply_catalog_healing(p_rej, rep_dup_target)
+
+            rep_wrong_prov_q = CatalogDriftReport(
+                observed_date="2026-11-21",
+                base_catalog_sha256=compute_models_data_digest(combined_catalog),
+                providers=["privatemode"],
+                disagreements=[
+                    FeedDisagreementItem(
+                        model_id="tinfoil-deepseek-v4-1-flash",
+                        served_model_id="deepseek-v4-1-flash",
+                        in_router_manifest=None,
+                        in_openai_models=None,
+                        router_healthy=None,
+                        reason="wrong provider quarantine",
+                        registered=True,
+                        provider="privatemode",
+                    )
+                ],
+            )
+            with self.assertRaises(CatalogSyncError):
+                apply_catalog_healing(p_rej, rep_wrong_prov_q, quarantine_disagreements=True)
+
+        # 5. Mixed-provider safety-only transactions (with/without quarantine, unregistered disagreements, demotion-only, no-write)
+        with tempfile.TemporaryDirectory() as td_safe:
+            # Build mixed report:
+            # - privatemode-glm-5-3-flash: weights changed across v1.63.0 -> v1.64.0 (active/cleared/default)
+            # - privatemode-glm-5-3: registered disagreement
+            # - unregistered disagreement (privatemode-ghost)
+            # - unpriced manual Privatemode candidate (privatemode-nova-2)
+            base_mix = copy.deepcopy(combined_catalog)
+            for m in base_mix["models"]:
+                if m["id"] == "privatemode-glm-5-3":
+                    m["status"] = "active"
+                    m["routing"]["private_attested"] = "blocked"
+            p_mix = Path(td_safe) / "models.yaml"
+            p_mix.write_text(dump_models_yaml(base_mix), encoding="utf-8")
+            orig_mix = p_mix.read_bytes()
+
+            mix_sha = compute_models_data_digest(base_mix)
+            flash_orig = next(m for m in base_mix["models"] if m["id"] == "privatemode-glm-5-3-flash")
+            mixed_rep = CatalogDriftReport(
+                observed_date="2026-11-21",
+                base_catalog_sha256=mix_sha,
+                providers=["tinfoil", "privatemode"],
+                provenance={"privatemode": {"tag": "v1.64.0", "commit_sha": v164_commit}},
+                updated_models=[
+                    ModelDriftItem(
+                        model_id="privatemode-glm-5-3-flash",
+                        served_model_id="glm-5.3-flash",
+                        action="demote_weights_changed",
+                        weights_changed=True,
+                        provider="privatemode",
+                        changes={
+                            "enclave_tag": {"from": "v1.63.0", "to": "v1.64.0"},
+                            "serve_command": {
+                                "from": flash_orig["serve_command"],
+                                "to": flash_orig["serve_command"].replace("v1.63.0", "v1.64.0"),
+                            },
+                            "remote_trust.provider_manifest_weights_hash": {
+                                "from": flash_orig["remote_trust"]["provider_manifest_weights_hash"],
+                                "to": "dmverity:sha256:" + ("9" * 64),
+                            },
+                            "status": {"from": "active", "to": "candidate"},
+                            "routing.private_attested": {"from": "cleared", "to": "blocked"},
+                            "routing.default_private_attested": {"from": True, "to": False},
+                            "eval_evidence_artifact": {
+                                "from": "docs/evals/privatemode-glm-5-3-flash.json",
+                                "to": None,
+                            },
+                        },
+                    )
+                ],
+                new_models=[
+                    {
+                        "id": "privatemode-nova-2",
+                        "provider": "privatemode",
+                        "manual_onboarding_required": True,
+                        "repo": "nova-2",
+                        "upstream": "acme/Nova-2-NVFP4",
+                        "status": "candidate",
+                        "remote_trust": {
+                            "tier": "enclave_runtime_attested",
+                            "attestation_method": "privatemode-proxy-contrast",
+                            "pricing_per_m_tokens": None,
+                        },
+                    }
+                ],
+                disagreements=[
+                    FeedDisagreementItem(
+                        model_id="privatemode-glm-5-3",
+                        served_model_id="glm-5.3",
+                        in_router_manifest=None,
+                        in_openai_models=None,
+                        router_healthy=None,
+                        reason="missing deployment for glm-5.3",
+                        registered=True,
+                        provider="privatemode",
+                        feed_summary="deployment.yaml vs models.yaml",
+                    ),
+                    FeedDisagreementItem(
+                        model_id="privatemode-ghost",
+                        served_model_id="ghost-1",
+                        in_router_manifest=None,
+                        in_openai_models=None,
+                        router_healthy=None,
+                        reason="unregistered ghost workload missing disk",
+                        registered=False,
+                        provider="privatemode",
+                        feed_summary="deployment.yaml vs models.yaml",
+                    ),
+                ],
+            )
+
+            # (a) Ordinary full apply fails closed leaving models.yaml byte-identical
+            with self.assertRaises(CatalogSyncError):
+                apply_catalog_healing(p_mix, mixed_rep)
+            self.assertEqual(p_mix.read_bytes(), orig_mix)
+
+            # (b) safety_only=True WITHOUT quarantine: demotes flash ONLY (no v1.64.0, no new hash, no new candidate), defers disagreements
+            summary_no_q: dict[str, Any] = {}
+            res_no_q = apply_catalog_healing(
+                p_mix,
+                mixed_rep,
+                quarantine_disagreements=False,
+                safety_only=True,
+                apply_summary_out=summary_no_q,
+            )
+            self.assertTrue(summary_no_q["wrote_file"])
+            self.assertEqual(len(summary_no_q["applied_actions"]), 1)
+            self.assertEqual(len(summary_no_q["outstanding_disagreements"]), 2)
+            self.assertEqual(summary_no_q["deferred_new_models"], ["privatemode-nova-2"])
+            f_no_q = next(m for m in res_no_q["models"] if m["id"] == "privatemode-glm-5-3-flash")
+            self.assertEqual(f_no_q["status"], "candidate")
+            self.assertEqual(f_no_q["routing"]["private_attested"], "blocked")
+            self.assertNotIn("default_private_attested", f_no_q["routing"])
+            self.assertEqual(f_no_q["stale_eval_evidence_artifact"], "docs/evals/privatemode-glm-5-3-flash.json")
+            self.assertEqual(f_no_q["enclave_tag"], "v1.63.0")
+            self.assertEqual(
+                f_no_q["remote_trust"]["provider_manifest_weights_hash"],
+                flash_orig["remote_trust"]["provider_manifest_weights_hash"],
+            )
+            self.assertFalse(any(m["id"] == "privatemode-nova-2" for m in res_no_q["models"]))
+            g_no_q = next(m for m in res_no_q["models"] if m["id"] == "privatemode-glm-5-3")
+            self.assertEqual(g_no_q["status"], "active")
+            self.assertEqual(g_no_q["routing"]["private_attested"], "blocked")
+
+            # (c) safety_only=True WITH quarantine on fresh copy: quarantines glm-5-3 AND retains unregistered ghost in outstanding_disagreements
+            p_mix2 = Path(td_safe) / "models2.yaml"
+            p_mix2.write_bytes(orig_mix)
+            summary_with_q: dict[str, Any] = {}
+            res_with_q = apply_catalog_healing(
+                p_mix2,
+                mixed_rep,
+                quarantine_disagreements=True,
+                safety_only=True,
+                apply_summary_out=summary_with_q,
+            )
+            self.assertTrue(summary_with_q["wrote_file"])
+            self.assertEqual(len(summary_with_q["quarantined_disagreements"]), 1)
+            self.assertEqual(len(summary_with_q["outstanding_disagreements"]), 1)
+            self.assertFalse(summary_with_q["outstanding_disagreements"][0]["registered"])
+            g_with_q = next(m for m in res_with_q["models"] if m["id"] == "privatemode-glm-5-3")
+            self.assertEqual(g_with_q["routing"]["private_attested"], "blocked")
+            self.assertEqual(g_with_q["status"], "candidate")
+
+            # (d) No-write disagreement-only case (unregistered only) leaves file untouched (wrote_file=False)
+            p_mix3 = Path(td_safe) / "models3.yaml"
+            p_mix3.write_bytes(orig_mix)
+            unreg_only_rep = CatalogDriftReport(
+                observed_date="2026-11-21",
+                base_catalog_sha256=mix_sha,
+                providers=["privatemode"],
+                disagreements=[mixed_rep.disagreements[1]],
+            )
+            summary_nowrite: dict[str, Any] = {}
+            apply_catalog_healing(
+                p_mix3,
+                unreg_only_rep,
+                quarantine_disagreements=True,
+                safety_only=True,
+                apply_summary_out=summary_nowrite,
+            )
+            self.assertFalse(summary_nowrite["wrote_file"])
+            self.assertEqual(p_mix3.read_bytes(), orig_mix)
+            self.assertEqual(len(summary_nowrite["outstanding_disagreements"]), 1)
+
+            # (e) Failed full apply with quarantine leaves both catalog AND report unchanged, so retry succeeds
+            p_retry = Path(td_safe) / "models_retry.yaml"
+            p_retry.write_bytes(orig_mix)
+            retry_rep = CatalogDriftReport(
+                observed_date="2026-11-21",
+                base_catalog_sha256=mix_sha,
+                providers=["privatemode"],
+                disagreements=[
+                    FeedDisagreementItem(
+                        model_id="privatemode-glm-5-3-flash",
+                        served_model_id="glm-5.3-flash",
+                        in_router_manifest=None,
+                        in_openai_models=None,
+                        router_healthy=None,
+                        reason="transient write failure retry test",
+                        registered=True,
+                        provider="privatemode",
+                        feed_summary="deployment.yaml vs models.yaml",
+                    )
+                ],
+            )
+            with patch("local_assist.catalog_sync.os.replace", side_effect=OSError("simulated replace EIO")):
+                with self.assertRaises(OSError):
+                    apply_catalog_healing(p_retry, retry_rep, quarantine_disagreements=True)
+            self.assertEqual(p_retry.read_bytes(), orig_mix)
+            self.assertEqual(retry_rep.updated_models, [])
+            # Replay same report after transient failure clears -> succeeds cleanly!
+            healed_retry = apply_catalog_healing(p_retry, retry_rep, quarantine_disagreements=True)
+            self.assertEqual(len(retry_rep.updated_models), 1)
+            self.assertEqual(retry_rep.updated_models[0].action, "quarantine_disagreement")
+            flash_retried = next(m for m in healed_retry["models"] if m["id"] == "privatemode-glm-5-3-flash")
+            self.assertEqual(flash_retried["status"], "candidate")
+            self.assertEqual(flash_retried["routing"]["private_attested"], "blocked")
+            self.assertEqual(flash_retried["stale_eval_evidence_artifact"], "docs/evals/privatemode-glm-5-3-flash.json")
+
+    def test_privatemode_and_all_provider_cli_and_workflow(self) -> None:
+        import contextlib
+        import importlib.machinery
+        import importlib.util
+        import io
+        from local_assist.catalog_sync import (
+            parse_privatemode_deployment_yaml,
+            parse_privatemode_models_yaml,
+        )
+
+        script_path = ROOT / "scripts" / "sync-model-catalog"
+        loader = importlib.machinery.SourceFileLoader("sync_model_catalog_cli_pm_all", str(script_path))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        assert spec is not None and spec.loader is not None
+        cli_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cli_mod)
+
+        fix_dir = ROOT / "tests" / "fixtures" / "privatemode_v1_64_0"
+        prov = json.loads((fix_dir / "PROVENANCE.json").read_text(encoding="utf-8"))
+        v164_commit = prov["commit_sha"]
+        disk_map = parse_privatemode_models_yaml((fix_dir / "models.yaml").read_text(encoding="utf-8"))
+        dep_data = parse_privatemode_deployment_yaml((fix_dir / "deployment.yaml").read_text(encoding="utf-8"))
+        rel_fixture = {
+            "repo": "edgelesssys/privatemode-public",
+            "tag_name": "v1.64.0",
+            "published_at": "2026-11-14T16:36:05Z",
+            "manifest_asset_name": "manifest.json",
+            "manifest_asset_size": 12345,
+            "manifest_asset_url": "https://github.com/edgelesssys/privatemode-public/releases/download/v1.64.0/manifest.json",
+            "manifest_asset_digest": None,
+        }
+
+        real_models_data = safe_load((ROOT / "models.yaml").read_text(encoding="utf-8"))
+        combined_models = _make_base_models_fixture()
+        combined_models["models"].extend(
+            copy.deepcopy(m) for m in real_models_data["models"] if str(m.get("id", "")).startswith("privatemode-")
+        )
+        enclaves_base = {
+            "tinfoilsh/confidential-deepseek-v4-1-flash@v0.0.10+b200": parse_tinfoil_config_yaml(DEEPSEEK_V4_1_FLASH_YAML),
+            "tinfoilsh/confidential-kimi-k3@v0.0.16": parse_tinfoil_config_yaml(KIMI_K3_V0_0_16_YAML),
+            "tinfoilsh/confidential-kimi-k3-1-pro@v0.0.3": parse_tinfoil_config_yaml(KIMI_K3_1_PRO_V0_0_3_YAML),
+        }
+
+        with tempfile.TemporaryDirectory() as td:
+            p_models = Path(td) / "models.yaml"
+            p_models.write_text(dump_models_yaml(combined_models), encoding="utf-8")
+            j_out = Path(td) / "out.json"
+            m_out = Path(td) / "out.md"
+
+            # 1. --provider privatemode --check --json agrees across stdout JSON, file JSON, and Markdown
+            buf = io.StringIO()
+            with (
+                patch.object(cli_mod, "fetch_privatemode_latest_release", return_value=rel_fixture),
+                patch.object(cli_mod, "fetch_privatemode_tag_commit", return_value=v164_commit),
+                patch.object(cli_mod, "fetch_privatemode_models_yaml", return_value=disk_map),
+                patch.object(cli_mod, "fetch_privatemode_deployment_yaml", return_value=dep_data),
+                contextlib.redirect_stdout(buf),
+            ):
+                rc_pm = cli_mod.main(
+                    [
+                        "--check",
+                        "--provider",
+                        "privatemode",
+                        "--json",
+                        "--models-path",
+                        str(p_models),
+                        "--json-out",
+                        str(j_out),
+                        "--markdown-out",
+                        str(m_out),
+                    ]
+                )
+            self.assertEqual(rc_pm, 2)
+            stdout_obj = json.loads(buf.getvalue())
+            file_obj = json.loads(j_out.read_text(encoding="utf-8"))
+            md_text = m_out.read_text(encoding="utf-8")
+            self.assertEqual(stdout_obj["providers"], ["privatemode"])
+            self.assertEqual(file_obj["providers"], ["privatemode"])
+            self.assertEqual(stdout_obj["provenance"]["privatemode"]["commit_sha"], v164_commit)
+            self.assertEqual(file_obj["provenance"]["privatemode"]["commit_sha"], v164_commit)
+            self.assertTrue(all(u["provider"] == "privatemode" for u in stdout_obj["updated_models"]))
+            self.assertIn("**Providers**: `privatemode`", md_text)
+            self.assertIn("[privatemode]", md_text)
+
+            # 2. --provider all with partial-provider failure (Tinfoil healthy, Privatemode fails):
+            # exits 1, unlinks outputs, reconciler refuses with 0 gh calls
+            gh_calls: list[list[str]] = []
+            with (
+                patch.object(cli_mod, "fetch_tinfoil_router_manifest", return_value=_make_router_manifest_fixture()),
+                patch.object(cli_mod, "fetch_tinfoil_openai_models", return_value=_make_openai_models_fixture()),
+                patch.object(
+                    cli_mod,
+                    "fetch_tinfoil_enclave_config",
+                    side_effect=lambda r, t, **kw: enclaves_base[f"{r}@{t}"],
+                ),
+                patch.object(
+                    cli_mod,
+                    "fetch_privatemode_latest_release",
+                    side_effect=CatalogSyncError("Privatemode GitHub API 503"),
+                ),
+            ):
+                rc_fail = cli_mod.main(
+                    [
+                        "--check",
+                        "--provider",
+                        "all",
+                        "--models-path",
+                        str(p_models),
+                        "--json-out",
+                        str(j_out),
+                        "--markdown-out",
+                        str(m_out),
+                    ]
+                )
+            self.assertEqual(rc_fail, 1)
+            self.assertFalse(j_out.exists())
+            self.assertFalse(m_out.exists())
+            with self.assertRaises(CatalogSyncError):
+                reconcile_github_drift_issue(
+                    repo="HakAl/free-inference",
+                    exit_code=rc_fail,
+                    json_report_path=j_out,
+                    markdown_body_path=m_out,
+                    is_default_branch=True,
+                    run_gh_fn=lambda a: (gh_calls.append(a), "[]")[1],
+                )
+            self.assertEqual(gh_calls, [])
+
+            # 3. Demotion-only --apply --safety-only (zero quarantines, zero deferred items, zero disagreements) -> safety_applied + exit 0
+            pm_same_tag_weight_drift = {
+                "models": [
+                    copy.deepcopy(m)
+                    for m in real_models_data["models"]
+                    if m.get("id") == "privatemode-glm-5-3-flash"
+                ]
+            }
+            pm_same_tag_weight_drift["models"][0]["enclave_tag"] = "v1.64.0"
+            pm_same_tag_weight_drift["models"][0]["serve_command"] = (
+                pm_same_tag_weight_drift["models"][0]["serve_command"].replace("v1.63.0", "v1.64.0")
+            )
+            p_demote = Path(td) / "models_demote.yaml"
+            p_demote.write_text(dump_models_yaml(pm_same_tag_weight_drift), encoding="utf-8")
+            j_demote = Path(td) / "demote.json"
+            # Remove flash from both deployment.yaml and models.yaml -> pure archive_removed (zero deferred items!)
+            dep_no_flash = copy.deepcopy(dep_data)
+            dep_no_flash["workloads"].pop("glm-5.3-flash")
+            disk_no_flash = {
+                k: v for k, v in disk_map.items() if v["disk_key"] != "nvidia-glm-5-3-flash-nvfp4"
+            }
+            with (
+                patch.object(cli_mod, "fetch_privatemode_latest_release", return_value=rel_fixture),
+                patch.object(cli_mod, "fetch_privatemode_tag_commit", return_value=v164_commit),
+                patch.object(cli_mod, "fetch_privatemode_models_yaml", return_value=disk_no_flash),
+                patch.object(cli_mod, "fetch_privatemode_deployment_yaml", return_value=dep_no_flash),
+            ):
+                rc_dem = cli_mod.main(
+                    [
+                        "--apply",
+                        "--safety-only",
+                        "--no-discover-new",
+                        "--provider",
+                        "privatemode",
+                        "--models-path",
+                        str(p_demote),
+                        "--json-out",
+                        str(j_demote),
+                    ]
+                )
+            self.assertEqual(rc_dem, 0)
+            dem_payload = json.loads(j_demote.read_text(encoding="utf-8"))
+            self.assertEqual(dem_payload["check_status"], "safety_applied")
+            self.assertTrue(dem_payload["apply_summary"]["wrote_file"])
+            self.assertEqual(dem_payload["apply_summary"]["deferred_updates"], [])
+            self.assertEqual(dem_payload["apply_summary"]["outstanding_disagreements"], [])
+
+            # 4. --apply --safety-only --quarantine-disagreements with surviving unregistered disagreement returns exit 1
+            p_unreg = Path(td) / "models_unreg.yaml"
+            p_unreg.write_text(dump_models_yaml(pm_same_tag_weight_drift), encoding="utf-8")
+            j_unreg = Path(td) / "unreg.json"
+            dep_with_orphan = copy.deepcopy(dep_no_flash)
+            dep_with_orphan["partial_deployments"] = [
+                {
+                    "deployment_name": "workload-orphan",
+                    "container_name": None,
+                    "served_model_id": "orphan-1",
+                    "disk_name": "orphan-1",
+                    "root_hash": "e" * 64,
+                    "reason": "unregistered orphan disk-mounter",
+                }
+            ]
+            with (
+                patch.object(cli_mod, "fetch_privatemode_latest_release", return_value=rel_fixture),
+                patch.object(cli_mod, "fetch_privatemode_tag_commit", return_value=v164_commit),
+                patch.object(cli_mod, "fetch_privatemode_models_yaml", return_value=disk_no_flash),
+                patch.object(cli_mod, "fetch_privatemode_deployment_yaml", return_value=dep_with_orphan),
+            ):
+                rc_unreg = cli_mod.main(
+                    [
+                        "--apply",
+                        "--safety-only",
+                        "--quarantine-disagreements",
+                        "--no-discover-new",
+                        "--provider",
+                        "privatemode",
+                        "--models-path",
+                        str(p_unreg),
+                        "--json-out",
+                        str(j_unreg),
+                    ]
+                )
+            self.assertEqual(rc_unreg, 1)
+            unreg_payload = json.loads(j_unreg.read_text(encoding="utf-8"))
+            self.assertEqual(unreg_payload["check_status"], "safety_applied_with_disagreements")
+            self.assertEqual(len(unreg_payload["apply_summary"]["outstanding_disagreements"]), 1)
+
+            # 5. CLI --provider all Pass 2 concurrent-edit digest recomputation across both providers
+            p_pass2 = Path(td) / "models_pass2.yaml"
+            cat_pass2 = _make_base_models_fixture()
+            pm_clean_entry = copy.deepcopy(pm_same_tag_weight_drift["models"][0])
+            cat_pass2["models"].append(pm_clean_entry)
+            p_pass2.write_text(dump_models_yaml(cat_pass2), encoding="utf-8")
+
+            cat_mutated = copy.deepcopy(cat_pass2)
+            cat_mutated["models"][-1]["verified_date"] = "2026-11-19"
+            triggered = [False]
+
+            def _mutating_enclave_fetch(repo: str, tag: str, **_kw: object) -> dict[str, Any]:
+                if not triggered[0]:
+                    triggered[0] = True
+                    p_pass2.write_text(dump_models_yaml(cat_mutated), encoding="utf-8")
+                return enclaves_base[f"{repo}@{tag}"]
+
+            with (
+                patch.object(cli_mod, "fetch_tinfoil_router_manifest", return_value=_make_router_manifest_fixture()),
+                patch.object(cli_mod, "fetch_tinfoil_openai_models", return_value=_make_openai_models_fixture()),
+                patch.object(cli_mod, "fetch_tinfoil_enclave_config", side_effect=_mutating_enclave_fetch),
+                patch.object(cli_mod, "fetch_privatemode_latest_release", return_value=rel_fixture),
+                patch.object(cli_mod, "fetch_privatemode_tag_commit", return_value=v164_commit),
+                patch.object(cli_mod, "fetch_privatemode_models_yaml", return_value=disk_map),
+                patch.object(cli_mod, "fetch_privatemode_deployment_yaml", return_value=dep_data),
+            ):
+                rc_p2 = cli_mod.main(
+                    [
+                        "--apply",
+                        "--no-discover-new",
+                        "--provider",
+                        "all",
+                        "--models-path",
+                        str(p_pass2),
+                    ]
+                )
+            self.assertEqual(rc_p2, 0)
+            self.assertTrue(triggered[0])
+
+        # 6. Workflow structural check: --provider all and zero GH_TOKEN in check step
+        wf_data = safe_load((ROOT / ".github" / "workflows" / "catalog-sync.yml").read_text(encoding="utf-8"))
+        steps = wf_data["jobs"]["check-catalog-drift"]["steps"]
+        self.assertIn("--provider all", steps[2]["run"])
+        self.assertNotIn("GH_TOKEN", steps[2].get("env") or {})
+        self.assertIn("GH_TOKEN", steps[3].get("env") or {})
+
+    def test_lookout_track3_r1_fixes_partial_attribution_builder_toctou_json_strict_and_markdown(self) -> None:
+        """Regression tests for FREE-INFERENCE-TRACK3-001 F1, F2, F3, Minor 1, and Minor 2."""
+        import hashlib
+        import shutil
+        import subprocess
+        from local_assist import catalog_sync as cs_mod
+        from local_assist._miniyaml import parse_yaml_with_flow_sequences
+        from local_assist.catalog_sync import (
+            compute_privatemode_catalog_drift,
+            parse_privatemode_models_yaml,
+        )
+
+        # --- F1: Partial deployment attribution must not quarantine unrelated models sharing a leaf ---
+        h_good = "1" * 64
+        h_other = "2" * 64
+        h_unknown = "3" * 64
+        h_gpt = "4" * 64
+        disk_map = {
+            h_good: {
+                "disk_key": "acme-shared-leaf",
+                "upstream": "acme/shared-leaf",
+                "commit_hash": "a" * 40,
+                "weights_source": f"acme/shared-leaf@{'a' * 40}",
+                "root_hash": h_good,
+                "weights_hash": f"dmverity:sha256:{h_good}",
+                "file_size_bytes": 10_000_000_000,
+                "disk_gb_estimate": 10.0,
+            },
+            h_other: {
+                "disk_key": "rival-shared-leaf",
+                "upstream": "rival/shared-leaf",
+                "commit_hash": "b" * 40,
+                "weights_source": f"rival/shared-leaf@{'b' * 40}",
+                "root_hash": h_other,
+                "weights_hash": f"dmverity:sha256:{h_other}",
+                "file_size_bytes": 10_000_000_000,
+                "disk_gb_estimate": 10.0,
+            },
+            h_gpt: {
+                "disk_key": "openai-gpt-oss-120b",
+                "upstream": "openai/gpt-oss-120b",
+                "commit_hash": "c" * 40,
+                "weights_source": f"openai/gpt-oss-120b@{'c' * 40}",
+                "root_hash": h_gpt,
+                "weights_hash": f"dmverity:sha256:{h_gpt}",
+                "file_size_bytes": 65_000_000_000,
+                "disk_gb_estimate": 65.0,
+            },
+        }
+        base_pm = {
+            "models": [
+                {
+                    "id": "privatemode-acme-shared-leaf",
+                    "repo": "acme/shared-leaf",
+                    "runtime": "proxy",
+                    "host": "127.0.0.1",
+                    "port": 8082,
+                    "endpoint_url": "http://127.0.0.1:8082/v1",
+                    "status": "active",
+                    "data_control_rung": "enclave_runtime_attested",
+                    "usage_policy": "enclave_no_inspection",
+                    "enclave_repo": "edgelesssys/privatemode-public",
+                    "enclave_tag": "v1.64.0",
+                    "serve_command": "./bin/privatemode-proxy --listen-address {host} --port {port} --api-key-fallback=never --manifest-path config/privatemode-manifest-v1.64.0.json --workspace .home/privatemode-proxy --nvidia-ocsp-allow-unknown=false --nvidia-ocsp-revoked-grace-period=0",
+                    "promptfoo_provider": {"apiKeyKeychainService": "free-inference.privatemode"},
+                    "routing": {"private_local": "blocked", "private_attested": "blocked"},
+                    "remote_trust": {
+                        "tier": "enclave_runtime_attested",
+                        "attestation_method": "privatemode-proxy-contrast",
+                        "usage_policy": "enclave_no_inspection",
+                        "provider_manifest_weights_hash": f"dmverity:sha256:{h_good}",
+                        "provider_manifest_weights_source": f"acme/shared-leaf@{'a' * 40}",
+                    },
+                    "verified_date": "2026-11-21",
+                },
+                {
+                    "id": "privatemode-unqual-shared-leaf",
+                    "repo": "shared-leaf",
+                    "runtime": "proxy",
+                    "host": "127.0.0.1",
+                    "port": 8082,
+                    "endpoint_url": "http://127.0.0.1:8082/v1",
+                    "status": "active",
+                    "data_control_rung": "enclave_runtime_attested",
+                    "usage_policy": "enclave_no_inspection",
+                    "enclave_repo": "edgelesssys/privatemode-public",
+                    "enclave_tag": "v1.64.0",
+                    "serve_command": "./bin/privatemode-proxy --listen-address {host} --port {port} --api-key-fallback=never --manifest-path config/privatemode-manifest-v1.64.0.json --workspace .home/privatemode-proxy --nvidia-ocsp-allow-unknown=false --nvidia-ocsp-revoked-grace-period=0",
+                    "promptfoo_provider": {"apiKeyKeychainService": "free-inference.privatemode"},
+                    "routing": {"private_local": "blocked", "private_attested": "blocked"},
+                    "remote_trust": {
+                        "tier": "enclave_runtime_attested",
+                        "attestation_method": "privatemode-proxy-contrast",
+                        "usage_policy": "enclave_no_inspection",
+                        "provider_manifest_weights_hash": f"dmverity:sha256:{h_good}",
+                        "provider_manifest_weights_source": f"acme/shared-leaf@{'a' * 40}",
+                    },
+                    "verified_date": "2026-11-21",
+                },
+                {
+                    "id": "privatemode-gpt-oss-120b",
+                    "repo": "openai/gpt-oss-120b",
+                    "runtime": "proxy",
+                    "host": "127.0.0.1",
+                    "port": 8082,
+                    "endpoint_url": "http://127.0.0.1:8082/v1",
+                    "status": "active",
+                    "data_control_rung": "enclave_runtime_attested",
+                    "usage_policy": "enclave_no_inspection",
+                    "enclave_repo": "edgelesssys/privatemode-public",
+                    "enclave_tag": "v1.64.0",
+                    "serve_command": "./bin/privatemode-proxy --listen-address {host} --port {port} --api-key-fallback=never --manifest-path config/privatemode-manifest-v1.64.0.json --workspace .home/privatemode-proxy --nvidia-ocsp-allow-unknown=false --nvidia-ocsp-revoked-grace-period=0",
+                    "promptfoo_provider": {"apiKeyKeychainService": "free-inference.privatemode"},
+                    "routing": {"private_local": "blocked", "private_attested": "blocked"},
+                    "remote_trust": {
+                        "tier": "enclave_runtime_attested",
+                        "attestation_method": "privatemode-proxy-contrast",
+                        "usage_policy": "enclave_no_inspection",
+                        "provider_manifest_weights_hash": f"dmverity:sha256:{h_gpt}",
+                        "provider_manifest_weights_source": f"openai/gpt-oss-120b@{'c' * 40}",
+                    },
+                    "verified_date": "2026-11-21",
+                },
+            ]
+        }
+        dep_f1 = {
+            "workloads": {
+                "acme/shared-leaf": {
+                    "served_model_id": "acme/shared-leaf",
+                    "aliases": [],
+                    "deployment_name": "dep-acme",
+                    "container_name": "workload-acme",
+                    "disk_name": "shared-leaf",
+                    "k8s_slug": "shared-leaf",
+                    "root_hash": h_good,
+                    "weights_hash": f"dmverity:sha256:{h_good}",
+                    "max_model_len": 32768,
+                    "tool_call_parser": None,
+                    "reasoning_parser": None,
+                    "kv_cache_dtype": None,
+                    "enable_auto_tool_choice": False,
+                    "tool_calling_hint": None,
+                },
+                "shared-leaf": {
+                    "served_model_id": "shared-leaf",
+                    "aliases": [],
+                    "deployment_name": "dep-unqual",
+                    "container_name": "workload-unqual",
+                    "disk_name": "shared-leaf",
+                    "k8s_slug": "shared-leaf",
+                    "root_hash": h_good,
+                    "weights_hash": f"dmverity:sha256:{h_good}",
+                    "max_model_len": 32768,
+                    "tool_call_parser": None,
+                    "reasoning_parser": None,
+                    "kv_cache_dtype": None,
+                    "enable_auto_tool_choice": False,
+                    "tool_calling_hint": None,
+                },
+            },
+            "partial_deployments": [
+                # 1) Zero-replica unregistered rival/shared-leaf shares leaf 'shared-leaf': must stay unregistered
+                {
+                    "kind": "zero_replicas",
+                    "deployment_name": "dep-rival-zero",
+                    "container_name": "workload-rival",
+                    "served_model_id": "rival/shared-leaf",
+                    "disk_name": "shared-leaf",
+                    "k8s_slug": "shared-leaf",
+                    "root_hash": h_other,
+                    "reason": "zero replicas for rival/shared-leaf",
+                },
+                # 2) Orphan disk-mounter for rival/shared-leaf (different upstream org): must NOT match unqualified shared-leaf
+                {
+                    "kind": "orphan_disk_mounter",
+                    "deployment_name": "dep-rival-orphan",
+                    "container_name": None,
+                    "served_model_id": None,
+                    "disk_name": "shared-leaf",
+                    "k8s_slug": "shared-leaf",
+                    "root_hash": h_other,
+                    "reason": "orphan disk-mounter for rival/shared-leaf",
+                },
+                # 3) Orphan disk-mounter with unknown root_hash: must stay unregistered
+                {
+                    "kind": "orphan_disk_mounter",
+                    "deployment_name": "dep-unknown-orphan",
+                    "container_name": None,
+                    "served_model_id": None,
+                    "disk_name": "shared-leaf",
+                    "k8s_slug": "shared-leaf",
+                    "root_hash": h_unknown,
+                    "reason": "orphan disk-mounter with unknown root_hash",
+                },
+                # 4) Orphan disk-mounter matching BOTH registered shared-leaf models (acme/shared-leaf + shared-leaf): ambiguous -> unregistered
+                {
+                    "kind": "orphan_disk_mounter",
+                    "deployment_name": "dep-ambig-orphan",
+                    "container_name": None,
+                    "served_model_id": None,
+                    "disk_name": "shared-leaf",
+                    "k8s_slug": "shared-leaf",
+                    "root_hash": h_good,
+                    "reason": "orphan disk-mounter for acme/shared-leaf",
+                },
+                # 5) Orphan disk-mounter uniquely supported by authoritative disk identity (openai/gpt-oss-120b): registered=True
+                {
+                    "kind": "orphan_disk_mounter",
+                    "deployment_name": "dep-gpt-orphan",
+                    "container_name": None,
+                    "served_model_id": None,
+                    "disk_name": "gpt-oss-120b",
+                    "k8s_slug": "gpt-oss-120b",
+                    "root_hash": h_gpt,
+                    "reason": "orphan disk-mounter for openai/gpt-oss-120b",
+                },
+            ],
+        }
+        rep_f1 = compute_privatemode_catalog_drift(
+            base_pm,
+            release_tag="v1.64.0",
+            models_disk_map=disk_map,
+            deployment_data=dep_f1,
+            observed_date="2026-11-21",
+        )
+        reg_dis = [d for d in rep_f1.disagreements if d.registered]
+        unreg_dis = [d for d in rep_f1.disagreements if not d.registered]
+        self.assertEqual([d.model_id for d in reg_dis], ["privatemode-gpt-oss-120b"])
+        self.assertEqual(len(unreg_dis), 4)
+        self.assertTrue(any("coherent primary workload exists" in d.reason for d in unreg_dis))
+        self.assertTrue(all(d.model_id not in ("privatemode-acme-shared-leaf", "privatemode-unqual-shared-leaf") for d in reg_dis))
+
+        # Ambiguous orphan when TWO registered models share disk identity and NEITHER has a coherent primary workload
+        dep_f1_ambig = copy.deepcopy(dep_f1)
+        dep_f1_ambig["workloads"] = {}
+        rep_f1_ambig = compute_privatemode_catalog_drift(
+            base_pm,
+            release_tag="v1.64.0",
+            models_disk_map=disk_map,
+            deployment_data=dep_f1_ambig,
+            observed_date="2026-11-21",
+        )
+        self.assertTrue(
+            any(not d.registered and "ambiguous across registered models" in d.reason for d in rep_f1_ambig.disagreements)
+        )
+
+        # Apply with --safety-only --quarantine-disagreements: healthy shared-leaf models remain untouched (status='active')
+        with tempfile.TemporaryDirectory() as td:
+            mpath = Path(td) / "models.yaml"
+            mpath.write_text(dump_models_yaml(base_pm), encoding="utf-8")
+            summary_f1: dict[str, Any] = {}
+            after_f1 = apply_catalog_healing(
+                mpath,
+                rep_f1,
+                quarantine_disagreements=True,
+                append_new_models=False,
+                safety_only=True,
+                apply_summary_out=summary_f1,
+            )
+            by_id_after = {m["id"]: m for m in after_f1["models"]}
+            self.assertEqual(by_id_after["privatemode-acme-shared-leaf"]["status"], "active")
+            self.assertEqual(by_id_after["privatemode-unqual-shared-leaf"]["status"], "active")
+            self.assertEqual(by_id_after["privatemode-gpt-oss-120b"]["status"], "candidate")
+            self.assertEqual(len(summary_f1["outstanding_disagreements"]), 4)
+
+        # --- F2: Single-read builder proof + concurrent builder/HEAD mutation aborts before os.replace ---
+        if shutil.which("git"):
+            with tempfile.TemporaryDirectory() as td:
+                repo = Path(td) / "pm_toctou_repo"
+                (repo / "config").mkdir(parents=True)
+                (repo / "scripts").mkdir(parents=True)
+                subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+                subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test User"], check=True)
+                subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+
+                manifest_bytes = json.dumps({"ReferenceValues": {"a": 1}, "Policies": {"b": 2}}, indent=2).encode("utf-8")
+                manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
+                commit_sha = "d" * 40
+                (repo / "config" / "privatemode-manifest-v1.64.0.json").write_bytes(manifest_bytes)
+                builder_path = repo / "scripts" / "build-privatemode-proxy"
+                builder_good = (
+                    "from pathlib import Path\n"
+                    "ROOT = Path(__file__).resolve().parents[1]\n"
+                    'PRIVATEMODE_VERSION = "1.64.0"\n'
+                    f'PRIVATEMODE_SOURCE_COMMIT = "{commit_sha}"\n'
+                    'COMMITTED_MANIFEST_PATH = ROOT / "config" / "privatemode-manifest-v1.64.0.json"\n'
+                    f'EXPECTED_MANIFEST_SHA256 = "{manifest_sha}"\n'
+                )
+                builder_path.write_text(builder_good, encoding="utf-8")
+
+                pm_upgrade_cat = {
+                    "models": [
+                        {
+                            "id": "privatemode-gpt-oss-120b",
+                            "repo": "openai/gpt-oss-120b",
+                            "runtime": "proxy",
+                            "host": "127.0.0.1",
+                            "port": 8082,
+                            "endpoint_url": "http://127.0.0.1:8082/v1",
+                            "status": "active",
+                            "data_control_rung": "enclave_runtime_attested",
+                            "usage_policy": "enclave_no_inspection",
+                            "enclave_repo": "edgelesssys/privatemode-public",
+                            "enclave_tag": "v1.63.0",
+                            "serve_command": "./bin/privatemode-proxy --listen-address {host} --port {port} --api-key-fallback=never --manifest-path config/privatemode-manifest-v1.63.0.json --workspace .home/privatemode-proxy --nvidia-ocsp-allow-unknown=false --nvidia-ocsp-revoked-grace-period=0",
+                            "promptfoo_provider": {"apiKeyKeychainService": "free-inference.privatemode"},
+                            "routing": {"private_local": "blocked", "private_attested": "blocked"},
+                            "remote_trust": {
+                                "tier": "enclave_runtime_attested",
+                                "attestation_method": "privatemode-proxy-contrast",
+                                "usage_policy": "enclave_no_inspection",
+                                "provider_manifest_weights_hash": f"dmverity:sha256:{h_gpt}",
+                                "provider_manifest_weights_source": f"openai/gpt-oss-120b@{'c' * 40}",
+                            },
+                            "verified_date": "2026-11-20",
+                        }
+                    ]
+                }
+                models_path = repo / "models.yaml"
+                models_path.write_text(dump_models_yaml(pm_upgrade_cat), encoding="utf-8")
+                subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+                subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "init"], check=True)
+
+                dep_gpt = {
+                    "workloads": {
+                        "openai/gpt-oss-120b": {
+                            "served_model_id": "openai/gpt-oss-120b",
+                            "aliases": [],
+                            "deployment_name": "dep-gpt",
+                            "container_name": "workload-gpt",
+                            "disk_name": "gpt-oss-120b",
+                            "k8s_slug": "gpt-oss-120b",
+                            "root_hash": h_gpt,
+                            "weights_hash": f"dmverity:sha256:{h_gpt}",
+                            "max_model_len": 131072,
+                            "tool_call_parser": "openai",
+                            "reasoning_parser": "openai_gptoss",
+                            "kv_cache_dtype": None,
+                            "enable_auto_tool_choice": True,
+                            "tool_calling_hint": "vLLM tool_call_parser=openai",
+                        }
+                    },
+                    "partial_deployments": [],
+                }
+                rep_f2 = compute_privatemode_catalog_drift(
+                    pm_upgrade_cat,
+                    release_tag="v1.64.0",
+                    models_disk_map=disk_map,
+                    deployment_data=dep_gpt,
+                    observed_date="2026-11-21",
+                    provenance={"tag": "v1.64.0", "commit_sha": commit_sha},
+                )
+                before_bytes = models_path.read_bytes()
+
+                # Simulate concurrent in-place builder edit between initial proof and os.replace
+                orig_dump = cs_mod.dump_models_yaml
+
+                def _race_dirty_edit_during_dump(*a: Any, **kw: Any) -> str:
+                    builder_path.write_text(
+                        builder_good.replace('PRIVATEMODE_VERSION = "1.64.0"', 'PRIVATEMODE_VERSION = "1.63.0"'),
+                        encoding="utf-8",
+                    )
+                    return orig_dump(*a, **kw)
+
+                with patch.object(cs_mod, "dump_models_yaml", side_effect=_race_dirty_edit_during_dump):
+                    with self.assertRaises(CatalogSyncError) as ctx_dirty:
+                        apply_catalog_healing(models_path, rep_f2, append_new_models=False)
+                self.assertIn("became dirty concurrently", str(ctx_dirty.exception))
+                self.assertEqual(models_path.read_bytes(), before_bytes)
+
+                # Restore clean builder, then simulate concurrent commit advancing HEAD before os.replace
+                builder_path.write_text(builder_good, encoding="utf-8")
+
+                def _race_commit_during_dump(*a: Any, **kw: Any) -> str:
+                    builder_path.write_text(
+                        builder_good.replace('PRIVATEMODE_VERSION = "1.64.0"', 'PRIVATEMODE_VERSION = "1.63.0"'),
+                        encoding="utf-8",
+                    )
+                    subprocess.run(["git", "-C", str(repo), "add", "scripts/build-privatemode-proxy"], check=True)
+                    subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "concurrent builder swap"], check=True)
+                    return orig_dump(*a, **kw)
+
+                with patch.object(cs_mod, "dump_models_yaml", side_effect=_race_commit_during_dump):
+                    with self.assertRaises(CatalogSyncError) as ctx_race:
+                        apply_catalog_healing(models_path, rep_f2, append_new_models=False)
+                self.assertIn("HEAD changed concurrently", str(ctx_race.exception))
+                self.assertEqual(models_path.read_bytes(), before_bytes)
+
+                # Reset to the good commit and test mutations injected DURING final reverification:
+                # (a) outside-lock models.yaml mutation during _reverify_committed_privatemode_proof
+                subprocess.run(["git", "-C", str(repo), "reset", "--hard", "-q", "HEAD~1"], check=True)
+                before_bytes_reverify = models_path.read_bytes()
+                orig_reverify = cs_mod._reverify_committed_privatemode_proof
+
+                def _mutate_models_during_reverify(proof: dict[str, Any]) -> None:
+                    orig_reverify(proof)
+                    models_path.write_bytes(before_bytes_reverify + b"# outside-lock concurrent edit\n")
+
+                with patch.object(
+                    cs_mod, "_reverify_committed_privatemode_proof", side_effect=_mutate_models_during_reverify
+                ):
+                    with self.assertRaises(CatalogSyncError) as ctx_cat_race:
+                        apply_catalog_healing(models_path, rep_f2, append_new_models=False)
+                self.assertIn("modified concurrently outside catalog_file_lock", str(ctx_cat_race.exception))
+                self.assertEqual(
+                    models_path.read_bytes(),
+                    before_bytes_reverify + b"# outside-lock concurrent edit\n",
+                )
+
+                # (b) HEAD advance during git status inside final reverification (leaving proof paths clean/unchanged)
+                models_path.write_bytes(before_bytes_reverify)
+                orig_subproc_run = cs_mod.subprocess.run
+                status_calls = [0]
+
+                def _advance_head_during_reverify_status(cmd: list[str], *a: Any, **kw: Any) -> Any:
+                    res = orig_subproc_run(cmd, *a, **kw)
+                    if len(cmd) >= 4 and cmd[3] == "status":
+                        status_calls[0] += 1
+                        if status_calls[0] == 2:
+                            # Second status call is inside _reverify_committed_privatemode_proof
+                            (repo / "unrelated.txt").write_text("concurrent commit\n", encoding="utf-8")
+                            orig_subproc_run(["git", "-C", str(repo), "add", "unrelated.txt"], check=True)
+                            orig_subproc_run(
+                                ["git", "-C", str(repo), "commit", "-q", "-m", "advance HEAD during status"],
+                                check=True,
+                            )
+                    return res
+
+                with patch.object(cs_mod.subprocess, "run", side_effect=_advance_head_during_reverify_status):
+                    with self.assertRaises(CatalogSyncError) as ctx_head_during_status:
+                        apply_catalog_healing(models_path, rep_f2, append_new_models=False)
+                self.assertIn("HEAD changed concurrently", str(ctx_head_during_status.exception))
+                self.assertEqual(models_path.read_bytes(), before_bytes_reverify)
+
+        # --- F3: Strict models.yaml rejects top-level JSON ConfigMap (including 1e3) on both stdlib & PyYAML ---
+        json_configmap = json.dumps(
+            {
+                "apiVersion": "v1",
+                "kind": "ConfigMap",
+                "metadata": {"name": "model-disks", "extra_num": 1000},
+                "data": {
+                    "openai-gpt-oss-120b": json.dumps(
+                        {
+                            "model_source": f"https://huggingface.co/openai/gpt-oss-120b/tree/{'c' * 40}",
+                            "root_hash": h_gpt,
+                            "file_size_bytes": 65000000000,
+                        }
+                    )
+                },
+            }
+        ).replace("1000", "1e3")
+        with self.assertRaises(CatalogSyncError) as ctx_json_cm:
+            parse_privatemode_models_yaml(json_configmap)
+        self.assertIn("Strict YAML mode rejects top-level flow/JSON", str(ctx_json_cm.exception))
+        # Legacy non-strict path still parses JSON documents (Tinfoil models.yaml compatibility)
+        legacy_parsed = parse_yaml_with_flow_sequences('{"a": 1, "b": [2, 3]}', strict_plain_scalars=False)
+        self.assertEqual(legacy_parsed, {"a": 1, "b": [2, 3]})
+
+        # --- Minor 1 & Minor 2: Deferred safety-only Markdown heading & provider-matched remediation commands ---
+        deferred_md = render_github_issue_body(
+            {
+                "check_status": "safety_applied",
+                "observed_date": "2026-11-21",
+                "providers": ["privatemode"],
+                "has_drift": True,
+                "apply_summary": {
+                    "safety_only": True,
+                    "wrote_file": False,
+                    "applied_actions": [],
+                    "deferred_updates": [{"model_id": "privatemode-gpt-oss-120b", "changes": ["enclave_tag"]}],
+                    "deferred_new_models": [],
+                    "outstanding_disagreements": [],
+                },
+            },
+            human_output="deferred only",
+            exit_code=0,
+        )
+        self.assertIn("## Safety-Only Catalog Check: Updates Deferred (No File Written)", deferred_md)
+        self.assertNotIn("Demotions Applied", deferred_md)
+        self.assertIn("./scripts/sync-model-catalog --provider privatemode --check", deferred_md)
+        self.assertIn("./scripts/sync-model-catalog --provider privatemode --apply --safety-only", deferred_md)
+
+        applied_md = render_github_issue_body(
+            {
+                "check_status": "safety_applied",
+                "observed_date": "2026-11-21",
+                "providers": ["tinfoil", "privatemode"],
+                "has_drift": True,
+                "apply_summary": {
+                    "safety_only": True,
+                    "wrote_file": True,
+                    "applied_actions": [{"model_id": "privatemode-gpt-oss-120b", "action": "demote_weights_changed"}],
+                    "deferred_updates": [],
+                    "deferred_new_models": [],
+                    "outstanding_disagreements": [],
+                },
+            },
+            human_output="demotion applied",
+            exit_code=0,
+        )
+        self.assertIn("## Safety-Only Catalog Demotions Applied", applied_md)
+        self.assertIn("./scripts/sync-model-catalog --provider all --check", applied_md)
+        self.assertIn("./scripts/sync-model-catalog --provider all --apply --safety-only", applied_md)
+        self.assertIn("./scripts/sync-model-catalog --provider tinfoil --apply", applied_md)
+
+    def test_lookout_track3_r2_fixes_detached_glm_orphan_last_git_edit_and_nbsp_strict_parity(self) -> None:
+        """Regression tests for FREE-INFERENCE-TRACK3-001 Round 2 F1, F2, and F3."""
+        import hashlib
+        import shutil
+        import subprocess
+        from local_assist import catalog_sync as cs_mod
+        from local_assist._miniyaml import parse_yaml_with_flow_sequences
+        from local_assist.catalog_sync import (
+            compute_privatemode_catalog_drift,
+            parse_privatemode_deployment_yaml,
+            parse_privatemode_models_yaml,
+        )
+
+        fixture_dir = ROOT / "tests" / "fixtures" / "privatemode_v1_64_0"
+        models_yaml_text = (fixture_dir / "models.yaml").read_text(encoding="utf-8")
+        dep_yaml_text = (fixture_dir / "deployment.yaml").read_text(encoding="utf-8")
+        disk_map_v164 = parse_privatemode_models_yaml(models_yaml_text)
+        dep_v164 = parse_privatemode_deployment_yaml(dep_yaml_text)
+
+        # --- R2-F1: Healthy NVIDIA glm-5.3-flash primary + detached orphan on alternate Z.ai root ---
+        glm_wl = dep_v164["workloads"]["glm-5.3-flash"]
+        nvidia_root = glm_wl["root_hash"]
+        nvidia_disk = disk_map_v164[nvidia_root]
+        self.assertEqual(nvidia_disk["disk_key"], "nvidia-glm-5-3-flash-nvfp4")
+        zai_disks = [d for d in disk_map_v164.values() if d["disk_key"] == "zai-org-glm-5-3-flash"]
+        self.assertEqual(len(zai_disks), 1)
+        zai_root = zai_disks[0]["root_hash"]
+        self.assertNotEqual(zai_root, nvidia_root)
+
+        glm_cat = {
+            "models": [
+                {
+                    "id": "privatemode-glm-5-3-flash",
+                    "repo": "glm-5.3-flash",
+                    "runtime": "proxy",
+                    "host": "127.0.0.1",
+                    "port": 8082,
+                    "endpoint_url": "http://127.0.0.1:8082/v1",
+                    "status": "active",
+                    "data_control_rung": "enclave_runtime_attested",
+                    "usage_policy": "enclave_no_inspection",
+                    "enclave_repo": "edgelesssys/privatemode-public",
+                    "enclave_tag": "v1.64.0",
+                    "serve_command": "./bin/privatemode-proxy --listen-address {host} --port {port} --api-key-fallback=never --manifest-path config/privatemode-manifest-v1.64.0.json --workspace .home/privatemode-proxy --nvidia-ocsp-allow-unknown=false --nvidia-ocsp-revoked-grace-period=0",
+                    "promptfoo_provider": {"apiKeyKeychainService": "free-inference.privatemode"},
+                    "routing": {"private_local": "blocked", "private_attested": "blocked"},
+                    "remote_trust": {
+                        "tier": "enclave_runtime_attested",
+                        "attestation_method": "privatemode-proxy-contrast",
+                        "usage_policy": "enclave_no_inspection",
+                        "provider_manifest_weights_hash": nvidia_disk["weights_hash"],
+                        "provider_manifest_weights_source": nvidia_disk["weights_source"],
+                    },
+                    "verified_date": "2026-11-21",
+                }
+            ]
+        }
+        dep_with_zai_orphan = copy.deepcopy(dep_v164)
+        dep_with_zai_orphan["partial_deployments"].append(
+            {
+                "kind": "orphan_disk_mounter",
+                "deployment_name": "workload-glm-zai-orphan",
+                "container_name": None,
+                "served_model_id": None,
+                "disk_name": "glm-5.3-flash",
+                "k8s_slug": "glm-5-3-flash",
+                "root_hash": zai_root,
+                "reason": "orphan disk-mounter mounting alternate Z.ai glm-5.3-flash root",
+            }
+        )
+        rep_r2f1 = compute_privatemode_catalog_drift(
+            glm_cat,
+            release_tag="v1.64.0",
+            models_disk_map=disk_map_v164,
+            deployment_data=dep_with_zai_orphan,
+            observed_date="2026-11-21",
+            discover_new_coding_models=False,
+        )
+        self.assertEqual([d for d in rep_r2f1.disagreements if d.registered], [])
+        self.assertEqual(len(rep_r2f1.disagreements), 1)
+        self.assertFalse(rep_r2f1.disagreements[0].registered)
+        self.assertIn("coherent primary workload exists", rep_r2f1.disagreements[0].reason)
+        with tempfile.TemporaryDirectory() as td:
+            mpath = Path(td) / "models.yaml"
+            mpath.write_text(dump_models_yaml(glm_cat), encoding="utf-8")
+            before_glm = mpath.read_bytes()
+            summary_r2f1: dict[str, Any] = {}
+            after_glm = apply_catalog_healing(
+                mpath,
+                rep_r2f1,
+                quarantine_disagreements=True,
+                append_new_models=False,
+                safety_only=True,
+                apply_summary_out=summary_r2f1,
+            )
+            self.assertEqual(after_glm["models"][0]["status"], "active")
+            self.assertFalse(summary_r2f1["wrote_file"])
+            self.assertEqual(mpath.read_bytes(), before_glm)
+            self.assertEqual(len(summary_r2f1["outstanding_disagreements"]), 1)
+
+        # Normal Step B registered-workload checks STILL run alongside the unscoped orphan (e.g. primary weight drift)
+        glm_cat_stale_hash = copy.deepcopy(glm_cat)
+        glm_cat_stale_hash["models"][0]["remote_trust"]["provider_manifest_weights_hash"] = "dmverity:sha256:" + ("f" * 64)
+        rep_r2f1_drift = compute_privatemode_catalog_drift(
+            glm_cat_stale_hash,
+            release_tag="v1.64.0",
+            models_disk_map=disk_map_v164,
+            deployment_data=dep_with_zai_orphan,
+            observed_date="2026-11-21",
+            discover_new_coding_models=False,
+        )
+        self.assertEqual([u.model_id for u in rep_r2f1_drift.updated_models], ["privatemode-glm-5-3-flash"])
+        self.assertTrue(rep_r2f1_drift.updated_models[0].weights_changed)
+
+        # --- R2-F2: Proof-file edit during the LAST git rev-parse subprocess is caught before os.replace ---
+        if shutil.which("git"):
+            with tempfile.TemporaryDirectory() as td:
+                repo = Path(td) / "pm_r2f2_repo"
+                (repo / "config").mkdir(parents=True)
+                (repo / "scripts").mkdir(parents=True)
+                subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+                subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test User"], check=True)
+                subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+
+                manifest_bytes = json.dumps({"ReferenceValues": {"a": 1}, "Policies": {"b": 2}}, indent=2).encode("utf-8")
+                manifest_sha = hashlib.sha256(manifest_bytes).hexdigest()
+                commit_sha = "d" * 40
+                (repo / "config" / "privatemode-manifest-v1.64.0.json").write_bytes(manifest_bytes)
+                builder_path = repo / "scripts" / "build-privatemode-proxy"
+                builder_good = (
+                    "from pathlib import Path\n"
+                    "ROOT = Path(__file__).resolve().parents[1]\n"
+                    'PRIVATEMODE_VERSION = "1.64.0"\n'
+                    f'PRIVATEMODE_SOURCE_COMMIT = "{commit_sha}"\n'
+                    'COMMITTED_MANIFEST_PATH = ROOT / "config" / "privatemode-manifest-v1.64.0.json"\n'
+                    f'EXPECTED_MANIFEST_SHA256 = "{manifest_sha}"\n'
+                )
+                builder_path.write_text(builder_good, encoding="utf-8")
+                cat_r2f2 = copy.deepcopy(glm_cat)
+                cat_r2f2["models"][0]["enclave_tag"] = "v1.63.0"
+                cat_r2f2["models"][0]["serve_command"] = cat_r2f2["models"][0]["serve_command"].replace(
+                    "v1.64.0", "v1.63.0"
+                )
+                models_path = repo / "models.yaml"
+                models_path.write_text(dump_models_yaml(cat_r2f2), encoding="utf-8")
+                subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+                subprocess.run(["git", "-C", str(repo), "commit", "-q", "-m", "init"], check=True)
+
+                rep_r2f2 = compute_privatemode_catalog_drift(
+                    cat_r2f2,
+                    release_tag="v1.64.0",
+                    models_disk_map=disk_map_v164,
+                    deployment_data=dep_v164,
+                    observed_date="2026-11-21",
+                    provenance={"tag": "v1.64.0", "commit_sha": commit_sha},
+                    discover_new_coding_models=False,
+                )
+                before_r2f2 = models_path.read_bytes()
+                orig_subproc_run = cs_mod.subprocess.run
+                rev_parse_calls = [0]
+
+                def _dirty_builder_during_final_rev_parse(cmd: list[str], *a: Any, **kw: Any) -> Any:
+                    res = orig_subproc_run(cmd, *a, **kw)
+                    if len(cmd) >= 4 and cmd[3] == "rev-parse":
+                        rev_parse_calls[0] += 1
+                        # Call 1: initial proof; Call 2: reverify pre-status; Call 3: reverify final post-status
+                        if rev_parse_calls[0] == 3:
+                            builder_path.write_text(builder_good + "# dirty edit during final git rev-parse\n", encoding="utf-8")
+                    return res
+
+                with patch.object(cs_mod.subprocess, "run", side_effect=_dirty_builder_during_final_rev_parse):
+                    with self.assertRaises(CatalogSyncError) as ctx_last_git:
+                        apply_catalog_healing(models_path, rep_r2f2, append_new_models=False)
+                self.assertEqual(rev_parse_calls[0], 3)
+                self.assertIn("changed concurrently before catalog replacement", str(ctx_last_git.exception))
+                self.assertEqual(models_path.read_bytes(), before_r2f2)
+
+        # --- R2-F3: Strict block YAML preserves trailing U+00A0 (matching PyYAML 6.0.3) ---
+        nbsp_models_yaml = models_yaml_text.replace("  name: model-disks\n", "  name: model-disks\u00a0\n", 1)
+        self.assertNotEqual(nbsp_models_yaml, models_yaml_text)
+        parsed_nbsp = parse_yaml_with_flow_sequences(
+            nbsp_models_yaml, reject_duplicate_keys=True, strict_plain_scalars=True
+        )
+        self.assertEqual(parsed_nbsp["metadata"]["name"], "model-disks\u00a0")
+        try:
+            import yaml as _pyyaml  # type: ignore
+        except ImportError:
+            _pyyaml = None
+        if _pyyaml is not None:
+            self.assertEqual(parsed_nbsp, _pyyaml.safe_load(nbsp_models_yaml))
+        with self.assertRaises(CatalogSyncError) as ctx_nbsp:
+            parse_privatemode_models_yaml(nbsp_models_yaml)
+        self.assertIn("metadata.name='model-disks'", str(ctx_nbsp.exception))
+        # Strict anchor splitting must NOT consume U+00A0 in mapping, sequence, or flow-start anchors
+        nbsp_anchor_models = models_yaml_text.replace("  name: model-disks\n", "  name: &a\u00a0model-disks\n", 1)
+        self.assertNotEqual(nbsp_anchor_models, models_yaml_text)
+        with self.assertRaises(CatalogSyncError):
+            parse_privatemode_models_yaml(nbsp_anchor_models)
+        if _pyyaml is not None:
+            with self.assertRaises(_pyyaml.YAMLError):
+                _pyyaml.safe_load(nbsp_anchor_models)
+        for bad_anchor_yaml in (
+            "items:\n  - &a\u00a0foo\n",
+            "items: &a\u00a0[1, 2]\n",
+        ):
+            with self.assertRaises(ValueError, msg=bad_anchor_yaml):
+                parse_yaml_with_flow_sequences(bad_anchor_yaml, strict_plain_scalars=True)
+            if _pyyaml is not None:
+                with self.assertRaises(_pyyaml.YAMLError, msg=bad_anchor_yaml):
+                    _pyyaml.safe_load(bad_anchor_yaml)
+        # Strict alias lookup: valid adjacent *a succeeds with PyYAML parity; spaced '* a' rejected on both runners
+        adjacent_alias_models = models_yaml_text.replace(
+            "  name: model-disks\n",
+            "  note: &a model-disks\n  name: *a\n",
+            1,
+        )
+        spaced_alias_models = models_yaml_text.replace(
+            "  name: model-disks\n",
+            "  note: &a model-disks\n  name: * a\n",
+            1,
+        )
+        self.assertEqual(parse_privatemode_models_yaml(adjacent_alias_models), disk_map_v164)
+        with self.assertRaises(CatalogSyncError):
+            parse_privatemode_models_yaml(spaced_alias_models)
+        if _pyyaml is not None:
+            with self.assertRaises(_pyyaml.YAMLError):
+                _pyyaml.safe_load(spaced_alias_models)
+        # Legacy non-strict path remains intact
+        self.assertEqual(
+            parse_yaml_with_flow_sequences("name: legacy\u00a0\n", strict_plain_scalars=False),
+            {"name": "legacy"},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

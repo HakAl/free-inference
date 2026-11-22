@@ -1,0 +1,31 @@
+#!/bin/sh
+""":"
+# Disable inherited shell tracing (e.g., SHELLOPTS=xtrace:verbose) before expanding caller args.
+set +x +v 2>/dev/null
+# Resolve Python only from fixed trusted prefixes (never caller PATH, zero shell variable writes) and run isolated (-I -B).
+if [ -f /opt/homebrew/bin/python3 ] && [ -x /opt/homebrew/bin/python3 ]; then
+    exec /opt/homebrew/bin/python3 -I -B "$0" "$@"
+fi
+if [ -f /usr/local/bin/python3 ] && [ -x /usr/local/bin/python3 ]; then
+    exec /usr/local/bin/python3 -I -B "$0" "$@"
+fi
+if [ -f /usr/bin/python3 ] && [ -x /usr/bin/python3 ]; then
+    exec /usr/bin/python3 -I -B "$0" "$@"
+fi
+echo "Error: no trusted python3 binary found in /opt/homebrew/bin, /usr/local/bin, or /usr/bin." >&2
+exit 1
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from local_assist.cli import main
+
+if __name__ == "__main__":
+    raise SystemExit(main())

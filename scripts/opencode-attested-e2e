@@ -460,12 +460,13 @@ def run_offline_checks() -> dict[str, Any]:
         text=True,
         timeout=15,
     )
-    proc_deprecated = subprocess.run(
+    proc_archived = subprocess.run(
         [
             launcher,
             "--model",
             "tinfoil-kimi-k3",
             "--allow-uncleared-model",
+            "--allow-deprecated-model",
             "--no-serve",
             "--print-config",
         ],
@@ -489,8 +490,8 @@ def run_offline_checks() -> dict[str, Any]:
         and all_blocked_refused
         and proc_uncleared.returncode == 1
         and "not cleared for private-attested routing" in proc_uncleared.stderr
-        and proc_deprecated.returncode == 1
-        and "Refusing to launch deprecated model 'tinfoil-kimi-k3'" in proc_deprecated.stderr
+        and proc_archived.returncode == 1
+        and "Refusing to launch archived model 'tinfoil-kimi-k3'" in proc_archived.stderr
     )
 
     # Check 2: Port 8081 occupancy mismatch across Rung 3 proxy models (live + starting + duplicate .serve.pid)

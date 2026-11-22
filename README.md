@@ -48,7 +48,7 @@ Every endpoint in [`models.yaml`](models.yaml) is ordered along five explicit da
 
 ### 1. Bootstrap environment and verified proxy binaries
 
-Requires macOS on Apple Silicon (`Darwin arm64`; with Touch ID for Rung 2/3, while Rung 1 local inference works on all Apple Silicon Macs), `python3` (`>= 3.11`), `curl`, `unzip`, Xcode Command Line Tools (`swiftc`, `codesign`), and [`opencode`](https://opencode.ai) (`v2.0.32+`). Optional: `uv` (required for `--local-only` and full setup), `node` (`^20.20.0 || >=22.22.0`) and `npm` (required only for full evaluation setup), and `gh` CLI (authenticated via `gh auth login`) for GitHub Sigstore SLSA provenance verification of `tinfoil-proxy`.
+Requires macOS on Apple Silicon (`Darwin arm64`; with Touch ID for Rung 2/3, while Rung 1 local inference works on all Apple Silicon Macs), `python3` (`>= 3.11`), `curl`, `unzip`, Xcode Command Line Tools (`swiftc`, `codesign`), and [`opencode`](https://opencode.ai) (`v2.3.2` tested; unattended worker mode enforces exact `2.3.2` by default and refuses older versions such as `2.0.32` unless `--allow-opencode-version-drift` is explicitly passed). Optional: `uv` (required for `--local-only` and full setup), `node` (`^20.20.0 || >=22.22.0`) and `npm` (required only for full evaluation setup), and `gh` CLI (authenticated via `gh auth login`) for GitHub Sigstore SLSA provenance verification of `tinfoil-proxy`.
 
 Choose the setup mode matching your workflow:
 

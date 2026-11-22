@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import hashlib
 import json
 import os
 import sys
 import tempfile
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
@@ -21,23 +23,39 @@ from local_assist.catalog_sync import (
     DEFAULT_GITHUB_RAW_BASE_URL,
     DEFAULT_IGNORED_SERVED_IDS,
     DEFAULT_OPENAI_MODELS_URL,
+    DEFAULT_PRIVATEMODE_API_BASE_URL,
+    DEFAULT_PRIVATEMODE_IGNORED_SERVED_IDS,
+    DEFAULT_PRIVATEMODE_RELEASE_URL,
+    DEFAULT_PRIVATEMODE_REPO,
     DEFAULT_ROUTER_MANIFEST_URL,
+    PRIVATEMODE_TAG_RE,
     CatalogDriftReport,
     CatalogSyncError,
     apply_catalog_healing,
     compute_catalog_drift,
     compute_models_data_digest,
+    compute_privatemode_catalog_drift,
+    fetch_privatemode_deployment_yaml,
+    fetch_privatemode_latest_release,
+    fetch_privatemode_models_yaml,
+    fetch_privatemode_tag_commit,
     fetch_tinfoil_enclave_config,
     fetch_tinfoil_openai_models,
     fetch_tinfoil_router_manifest,
     format_human_drift_report,
+    merge_drift_reports,
     render_github_issue_body,
 )
 from local_assist.registry import DEFAULT_MODELS_PATH
 
 
-def _print_human_report(report: CatalogDriftReport, *, applied: bool = False) -> None:
-    print(format_human_drift_report(report, applied=applied))
+def _print_human_report(
+    report: CatalogDriftReport,
+    *,
+    applied: bool = False,
+    apply_summary: dict[str, Any] | None = None,
+) -> None:
+    print(format_human_drift_report(report, applied=applied, apply_summary=apply_summary))
 
 
 def _atomic_write_text(path: Path, text: str) -> None:
@@ -61,6 +79,31 @@ def _atomic_write_text(path: Path, text: str) -> None:
                 pass
 
 
+def _build_report_payload(
+    report: CatalogDriftReport,
+    *,
+    check_status: str,
+    applied: bool,
+    checked_ref: str | None,
+    checked_sha: str | None,
+    attempt_id: str | None = None,
+    apply_summary: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    report_dict = report.to_dict()
+    report_dict["check_status"] = check_status
+    if applied:
+        report_dict["applied"] = True
+    if apply_summary is not None:
+        report_dict["apply_summary"] = apply_summary
+    if checked_ref:
+        report_dict["checked_ref"] = checked_ref
+    if checked_sha:
+        report_dict["checked_sha"] = checked_sha
+    if attempt_id:
+        report_dict["attempt_id"] = attempt_id
+    return report_dict
+
+
 def _write_optional_outputs(
     report: CatalogDriftReport,
     *,
@@ -73,18 +116,18 @@ def _write_optional_outputs(
     checked_ref: str | None,
     checked_sha: str | None,
     attempt_id: str | None = None,
-) -> dict:
-    report_dict = report.to_dict()
-    report_dict["check_status"] = check_status
-    if applied:
-        report_dict["applied"] = True
-    if checked_ref:
-        report_dict["checked_ref"] = checked_ref
-    if checked_sha:
-        report_dict["checked_sha"] = checked_sha
-    if attempt_id:
-        report_dict["attempt_id"] = attempt_id
-    human_text = format_human_drift_report(report, applied=applied)
+    apply_summary: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    report_dict = _build_report_payload(
+        report,
+        check_status=check_status,
+        applied=applied,
+        checked_ref=checked_ref,
+        checked_sha=checked_sha,
+        attempt_id=attempt_id,
+        apply_summary=apply_summary,
+    )
+    human_text = format_human_drift_report(report, applied=applied, apply_summary=apply_summary)
     md_body = render_github_issue_body(
         dict(report_dict),
         exit_code=exit_code,
@@ -149,7 +192,7 @@ def main(argv: list[str] | None = None) -> int:
     pre_output_paths = _extract_output_paths_from_argv(raw_argv)
 
     parser = argparse.ArgumentParser(
-        description="Check and self-heal Tinfoil attested enclave models in models.yaml."
+        description="Check and self-heal attested enclave models (Tinfoil / Privatemode) in models.yaml."
     )
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument(
@@ -163,6 +206,12 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         default=False,
         help="Apply self-healing updates and scaffold new coding candidates in models.yaml.",
+    )
+    parser.add_argument(
+        "--provider",
+        choices=("tinfoil", "privatemode", "all"),
+        default="tinfoil",
+        help="Upstream provider(s) to check (default: tinfoil).",
     )
     parser.add_argument(
         "--models-path",
@@ -183,7 +232,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--github-raw-base-url",
         default=DEFAULT_GITHUB_RAW_BASE_URL,
-        help=f"Base URL for fetching tinfoil-config.yml manifests (default: {DEFAULT_GITHUB_RAW_BASE_URL}).",
+        help=f"Base URL for fetching GitHub raw manifest files (default: {DEFAULT_GITHUB_RAW_BASE_URL}).",
+    )
+    parser.add_argument(
+        "--privatemode-release-url",
+        default=DEFAULT_PRIVATEMODE_RELEASE_URL,
+        help=f"URL for Privatemode latest release metadata (default: {DEFAULT_PRIVATEMODE_RELEASE_URL}).",
+    )
+    parser.add_argument(
+        "--privatemode-api-base-url",
+        default=DEFAULT_PRIVATEMODE_API_BASE_URL,
+        help=f"Base URL for Privatemode GitHub commits API (default: {DEFAULT_PRIVATEMODE_API_BASE_URL}).",
+    )
+    parser.add_argument(
+        "--privatemode-tag",
+        default=None,
+        help="Read-only historical/pinned Privatemode release tag override (refused with --apply).",
     )
     parser.add_argument(
         "--timeout",
@@ -243,6 +307,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Conservatively demote routing to blocked on feed disagreements instead of failing.",
     )
     parser.add_argument(
+        "--safety-only",
+        action="store_true",
+        default=False,
+        help="With --apply, commit only safety demotions/archives (and optional quarantines) without admitting new tags, unadmitted metadata, or new candidates.",
+    )
+    parser.add_argument(
         "--no-discover-new",
         action="store_true",
         default=False,
@@ -252,7 +322,7 @@ def main(argv: list[str] | None = None) -> int:
         "--include-all-chat",
         action="store_true",
         default=False,
-        help="Include all chat+tool_calling models without filtering DEFAULT_IGNORED_SERVED_IDS.",
+        help="Include all chat+tool_calling models without filtering default ignored served IDs.",
     )
     try:
         args = parser.parse_args(raw_argv)
@@ -264,24 +334,35 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         _unlink_paths([args.json_out, args.markdown_out], raise_on_failure=True)
+
+        if args.safety_only and not args.apply:
+            raise CatalogSyncError("--safety-only may only be used together with --apply")
+        if args.privatemode_tag is not None:
+            if not PRIVATEMODE_TAG_RE.match(args.privatemode_tag) or ".." in args.privatemode_tag:
+                raise CatalogSyncError(f"Invalid --privatemode-tag value: {args.privatemode_tag!r}")
+            if args.apply:
+                raise CatalogSyncError(
+                    "Refusing --apply with --privatemode-tag: historical/pinned tag override is read-only"
+                )
+
         if not args.models_path.exists():
             raise CatalogSyncError(f"models.yaml not found at {args.models_path}")
         models_data = safe_load(args.models_path.read_text(encoding="utf-8"))
         if not isinstance(models_data, dict):
             raise CatalogSyncError(f"Invalid top-level mapping in {args.models_path}")
 
-        router_manifest = fetch_tinfoil_router_manifest(
-            args.router_manifest_url, timeout=args.timeout
-        )
-        openai_models = fetch_tinfoil_openai_models(
-            args.openai_models_url, timeout=args.timeout
-        )
+        run_tinfoil = args.provider in ("tinfoil", "all")
+        run_privatemode = args.provider in ("privatemode", "all")
+        shared_observed_date = datetime.date.today().isoformat()
 
-        ignored_ids = set() if args.include_all_chat else set(DEFAULT_IGNORED_SERVED_IDS)
-        enclave_cfg_cache: dict[str, dict] = {}
+        # Fetch Tinfoil feeds once when active
+        router_manifest: dict[str, Any] | None = None
+        openai_models: dict[str, Any] | None = None
+        enclave_cfg_cache: dict[str, dict[str, Any]] = {}
         invocation_fetch_budget = [0]
+        tinfoil_ignored_ids = set() if args.include_all_chat else set(DEFAULT_IGNORED_SERVED_IDS)
 
-        def _fetch_enclave_cfg(repo: str, tag: str) -> dict:
+        def _fetch_enclave_cfg(repo: str, tag: str) -> dict[str, Any]:
             key = f"{repo}@{tag}"
             if key not in enclave_cfg_cache:
                 enclave_cfg_cache[key] = fetch_tinfoil_enclave_config(
@@ -292,35 +373,116 @@ def main(argv: list[str] | None = None) -> int:
                 )
             return enclave_cfg_cache[key]
 
-        report = compute_catalog_drift(
-            models_data,
-            router_manifest,
-            openai_models,
-            enclave_cfg_cache,
-            enclave_config_fetcher=_fetch_enclave_cfg,
-            discover_new_coding_models=not args.no_discover_new,
-            ignored_served_ids=ignored_ids,
-            fetch_budget=invocation_fetch_budget,
+        if run_tinfoil:
+            router_manifest = fetch_tinfoil_router_manifest(
+                args.router_manifest_url, timeout=args.timeout
+            )
+            openai_models = fetch_tinfoil_openai_models(
+                args.openai_models_url, timeout=args.timeout
+            )
+
+        # Fetch Privatemode snapshot once when active (tag -> immutable commit_sha -> models.yaml + deployment.yaml)
+        pm_release_tag: str | None = None
+        pm_disk_map: dict[str, dict[str, Any]] | None = None
+        pm_deployment_data: dict[str, Any] | None = None
+        pm_provenance: dict[str, Any] | None = None
+        pm_ignored_ids = (
+            set() if args.include_all_chat else set(DEFAULT_PRIVATEMODE_IGNORED_SERVED_IDS)
         )
+
+        if run_privatemode:
+            if args.privatemode_tag is not None:
+                pm_release_tag = args.privatemode_tag
+                pm_commit_sha = fetch_privatemode_tag_commit(
+                    pm_release_tag,
+                    api_base_url=args.privatemode_api_base_url,
+                    timeout=args.timeout,
+                )
+                pm_provenance = {
+                    "repo": DEFAULT_PRIVATEMODE_REPO,
+                    "tag": pm_release_tag,
+                    "commit_sha": pm_commit_sha,
+                    "tag_override": True,
+                }
+            else:
+                rel_meta = fetch_privatemode_latest_release(
+                    args.privatemode_release_url,
+                    timeout=args.timeout,
+                )
+                pm_release_tag = str(rel_meta["tag_name"])
+                pm_commit_sha = fetch_privatemode_tag_commit(
+                    pm_release_tag,
+                    api_base_url=args.privatemode_api_base_url,
+                    timeout=args.timeout,
+                )
+                pm_provenance = {
+                    "repo": DEFAULT_PRIVATEMODE_REPO,
+                    "tag": pm_release_tag,
+                    "commit_sha": pm_commit_sha,
+                    "published_at": rel_meta.get("published_at"),
+                    "manifest_asset_name": rel_meta.get("manifest_asset_name"),
+                    "manifest_asset_size": rel_meta.get("manifest_asset_size"),
+                    "manifest_asset_digest": rel_meta.get("manifest_asset_digest"),
+                }
+            pm_disk_map = fetch_privatemode_models_yaml(
+                pm_commit_sha,
+                raw_base_url=args.github_raw_base_url,
+                timeout=args.timeout,
+            )
+            pm_deployment_data = fetch_privatemode_deployment_yaml(
+                pm_commit_sha,
+                raw_base_url=args.github_raw_base_url,
+                timeout=args.timeout,
+            )
+
+        def _compute_for_catalog(catalog_data: dict[str, Any]) -> CatalogDriftReport:
+            reports: list[CatalogDriftReport] = []
+            if run_tinfoil:
+                if router_manifest is None or openai_models is None:
+                    raise CatalogSyncError("Internal error: Tinfoil feeds were not fetched")
+                tf_rep = compute_catalog_drift(
+                    catalog_data,
+                    router_manifest,
+                    openai_models,
+                    enclave_cfg_cache,
+                    enclave_config_fetcher=_fetch_enclave_cfg,
+                    observed_date=shared_observed_date,
+                    discover_new_coding_models=not args.no_discover_new,
+                    ignored_served_ids=tinfoil_ignored_ids,
+                    fetch_budget=invocation_fetch_budget,
+                )
+                reports.append(tf_rep)
+            if run_privatemode:
+                if pm_release_tag is None or pm_disk_map is None or pm_deployment_data is None:
+                    raise CatalogSyncError("Internal error: Privatemode snapshot was not fetched")
+                pm_rep = compute_privatemode_catalog_drift(
+                    catalog_data,
+                    pm_release_tag,
+                    pm_disk_map,
+                    pm_deployment_data,
+                    observed_date=shared_observed_date,
+                    discover_new_coding_models=not args.no_discover_new,
+                    ignored_served_ids=pm_ignored_ids,
+                    provenance=pm_provenance,
+                )
+                reports.append(pm_rep)
+            if len(reports) == 1:
+                return reports[0]
+            return merge_drift_reports(reports)
+
+        report = _compute_for_catalog(models_data)
 
         if args.apply:
             fresh_data = safe_load(args.models_path.read_text(encoding="utf-8"))
             if not isinstance(fresh_data, dict):
                 raise CatalogSyncError(f"Invalid top-level mapping in {args.models_path}")
             if compute_models_data_digest(fresh_data) != report.base_catalog_sha256:
-                report = compute_catalog_drift(
-                    fresh_data,
-                    router_manifest,
-                    openai_models,
-                    enclave_cfg_cache,
-                    enclave_config_fetcher=_fetch_enclave_cfg,
-                    discover_new_coding_models=not args.no_discover_new,
-                    ignored_served_ids=ignored_ids,
-                    fetch_budget=invocation_fetch_budget,
-                )
+                report = _compute_for_catalog(fresh_data)
 
-        if report.disagreements and not (args.apply and args.quarantine_disagreements):
-            _write_optional_outputs(
+        if report.disagreements and not (
+            args.apply and (args.quarantine_disagreements or args.safety_only)
+        ):
+            payload = _write_optional_outputs(
                 report,
                 check_status="disagreement",
                 exit_code=1,
@@ -333,7 +495,9 @@ def main(argv: list[str] | None = None) -> int:
                 attempt_id=args.attempt_id,
             )
             if args.json_output:
-                print(json.dumps(report.to_dict(), indent=2))
+                stdout_payload = dict(payload)
+                stdout_payload.pop("markdown_sha256", None)
+                print(json.dumps(stdout_payload, indent=2))
             else:
                 _print_human_report(report, applied=False)
             reasons = "; ".join(d.reason for d in report.disagreements)
@@ -341,6 +505,75 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
         if args.apply:
+            if args.safety_only:
+                apply_summary: dict[str, Any] = {}
+                if report.has_drift:
+                    apply_catalog_healing(
+                        args.models_path,
+                        report,
+                        quarantine_disagreements=args.quarantine_disagreements,
+                        append_new_models=False,
+                        safety_only=True,
+                        apply_summary_out=apply_summary,
+                    )
+                else:
+                    apply_summary = {
+                        "safety_only": True,
+                        "wrote_file": False,
+                        "applied_actions": [],
+                        "quarantined_disagreements": [],
+                        "deferred_updates": [],
+                        "deferred_new_models": [],
+                        "outstanding_disagreements": [],
+                    }
+                outstanding = apply_summary.get("outstanding_disagreements") or []
+                wrote_file = bool(apply_summary.get("wrote_file"))
+                applied_actions = apply_summary.get("applied_actions") or []
+                quarantined_items = apply_summary.get("quarantined_disagreements") or []
+                deferred_updates = apply_summary.get("deferred_updates") or []
+                deferred_new = apply_summary.get("deferred_new_models") or []
+                if outstanding:
+                    safety_status = (
+                        "safety_applied_with_disagreements" if wrote_file else "disagreement"
+                    )
+                    safety_rc = 1
+                elif applied_actions or deferred_updates or deferred_new:
+                    safety_status = "safety_applied"
+                    safety_rc = 0
+                elif quarantined_items:
+                    safety_status = "quarantined"
+                    safety_rc = 0
+                else:
+                    safety_status = "clean"
+                    safety_rc = 0
+
+                payload = _write_optional_outputs(
+                    report,
+                    check_status=safety_status,
+                    exit_code=safety_rc,
+                    applied=wrote_file,
+                    json_out=args.json_out,
+                    markdown_out=args.markdown_out,
+                    run_url=args.run_url,
+                    checked_ref=args.checked_ref,
+                    checked_sha=args.checked_sha,
+                    attempt_id=args.attempt_id,
+                    apply_summary=apply_summary,
+                )
+                if args.json_output:
+                    stdout_payload = dict(payload)
+                    stdout_payload.pop("markdown_sha256", None)
+                    print(json.dumps(stdout_payload, indent=2))
+                else:
+                    _print_human_report(report, applied=wrote_file, apply_summary=apply_summary)
+                if safety_rc != 0:
+                    reasons = "; ".join(str(d.get("reason") or "") for d in outstanding)
+                    print(
+                        f"ERROR: Outstanding catalog feed disagreements remain: {reasons}",
+                        file=sys.stderr,
+                    )
+                return safety_rc
+
             if report.has_drift:
                 apply_catalog_healing(
                     args.models_path,
@@ -353,7 +586,7 @@ def main(argv: list[str] | None = None) -> int:
                 if (report.disagreements and args.quarantine_disagreements)
                 else "clean"
             )
-            _write_optional_outputs(
+            payload = _write_optional_outputs(
                 report,
                 check_status=applied_status,
                 exit_code=0,
@@ -366,17 +599,16 @@ def main(argv: list[str] | None = None) -> int:
                 attempt_id=args.attempt_id,
             )
             if args.json_output:
-                out = report.to_dict()
-                out["check_status"] = applied_status
-                out["applied"] = True
-                print(json.dumps(out, indent=2))
+                stdout_payload = dict(payload)
+                stdout_payload.pop("markdown_sha256", None)
+                print(json.dumps(stdout_payload, indent=2))
             else:
                 _print_human_report(report, applied=True)
             return 0
 
         check_status = "drift" if report.has_drift else "clean"
         raw_rc = 2 if report.has_drift else 0
-        _write_optional_outputs(
+        payload = _write_optional_outputs(
             report,
             check_status=check_status,
             exit_code=raw_rc,
@@ -390,7 +622,9 @@ def main(argv: list[str] | None = None) -> int:
         )
 
         if args.json_output:
-            print(json.dumps(report.to_dict(), indent=2))
+            stdout_payload = dict(payload)
+            stdout_payload.pop("markdown_sha256", None)
+            print(json.dumps(stdout_payload, indent=2))
         else:
             _print_human_report(report, applied=False)
 

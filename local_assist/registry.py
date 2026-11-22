@@ -701,13 +701,21 @@ def resolve_endpoint(
             token_path_str = pid_record.get("session_token_file")
             if isinstance(token_path_str, str) and token_path_str.strip():
                 token_path = Path(token_path_str)
-                if token_path.is_file():
-                    try:
-                        raw_tok = parse_session_token_raw(token_path.read_text(encoding="utf-8"))
+                try:
+                    from .custody import get_pinned_runs_dir_fd_for, runs_store_read_text
+
+                    if get_pinned_runs_dir_fd_for(token_path.parent) is not None:
+                        raw_text = runs_store_read_text(token_path.parent, token_path.name)
+                    elif token_path.is_file():
+                        raw_text = token_path.read_text(encoding="utf-8")
+                    else:
+                        raw_text = None
+                    if raw_text is not None:
+                        raw_tok = parse_session_token_raw(raw_text)
                         if raw_tok is not None:
                             session_token = raw_tok
-                    except (OSError, ValueError, TypeError, AttributeError):
-                        session_token = None
+                except (OSError, ValueError, TypeError, AttributeError):
+                    session_token = None
 
         if session_token is not None:
             api_key = session_token
@@ -1092,12 +1100,85 @@ def validate_custom_command_localhost(
     return None
 
 
+def _pid_identity_is_matched(pid: Any, expected_lstart: Any) -> bool:
+    if (
+        not isinstance(pid, int)
+        or isinstance(pid, bool)
+        or pid <= 0
+        or not pid_is_alive(pid)
+        or pid_is_zombie(pid)
+    ):
+        return False
+    if not isinstance(expected_lstart, str) or not expected_lstart.strip():
+        return False
+    actual_lstart = get_process_lstart(pid)
+    if not isinstance(actual_lstart, str) or not actual_lstart.strip():
+        return False
+    return " ".join(actual_lstart.split()) == " ".join(expected_lstart.split())
+
+
+def _store_has_live_pid_record(store: Path) -> bool:
+    from .custody import runs_store_list_names, runs_store_read_text
+
+    names = runs_store_list_names(store, prefix=".serve", suffix=".pid")
+    for name in names:
+        raw_txt = runs_store_read_text(store, name)
+        if raw_txt is None:
+            continue
+        try:
+            rec = json.loads(raw_txt)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        if _pid_identity_is_matched(rec.get("pid"), rec.get("pid_lstart")):
+            return True
+        if _pid_identity_is_matched(rec.get("upstream_pid"), rec.get("upstream_pid_lstart")):
+            return True
+    return False
+
+
 def _effective_runs_dir(runs_dir: Path | None = None) -> Path:
     if runs_dir is not None:
         return runs_dir
+    from .custody import (
+        get_active_bootstrap_state,
+        is_custody_tree,
+        read_active_runs_pointer,
+        validate_creatable_runs_dir,
+    )
+
+    state = get_active_bootstrap_state()
+    if state is not None:
+        if state.cli_runs_dir is not None:
+            return state.cli_runs_dir
+        if state.pinned_runs_dir is not None:
+            return state.pinned_runs_dir
+        if state.custody_mode:
+            ptr = read_active_runs_pointer()
+            return ptr if ptr is not None else DEFAULT_RUNS_DIR
+        if state.worker_or_reap_cli:
+            if _store_has_live_pid_record(DEFAULT_RUNS_DIR):
+                return DEFAULT_RUNS_DIR
+            ptr = read_active_runs_pointer()
+            if ptr is not None and _store_has_live_pid_record(ptr):
+                return ptr
+            return DEFAULT_RUNS_DIR
+
+    if is_custody_tree(ROOT):
+        ptr = read_active_runs_pointer()
+        return ptr if ptr is not None else DEFAULT_RUNS_DIR
+
     raw_env = os.environ.get("FREE_INFERENCE_RUNS_DIR", "").strip()
     if raw_env:
-        return Path(raw_env).expanduser().resolve()
+        env_res, env_err = validate_creatable_runs_dir(
+            raw_env,
+            allow_tilde=True,
+            label="FREE_INFERENCE_RUNS_DIR",
+        )
+        if env_err is not None or env_res is None:
+            raise RegistryError(env_err or f"Invalid FREE_INFERENCE_RUNS_DIR: {raw_env!r}")
+        return env_res.path
     return DEFAULT_RUNS_DIR
 
 
@@ -1129,17 +1210,20 @@ def legacy_pid_file(runs_dir: Path | None = None) -> Path:
 def read_pid_record_for_model(
     model_id: str, runs_dir: Path | None = None
 ) -> dict[str, Any] | None:
+    from .custody import runs_store_read_text
+
     base = _effective_runs_dir(runs_dir)
     for candidate in (
         pid_file_for_model(model_id, base),
         _legacy_unhashed_pid_file(model_id, base),
     ):
         try:
-            if candidate.exists():
-                record = json.loads(candidate.read_text())
+            raw_txt = runs_store_read_text(base, candidate.name)
+            if raw_txt is not None:
+                record = json.loads(raw_txt)
                 if isinstance(record, dict) and record.get("model_id") == model_id:
                     return record
-        except (OSError, json.JSONDecodeError):
+        except (OSError, ValueError, json.JSONDecodeError):
             pass
 
     for _, record in list_pid_records(base):
@@ -1148,30 +1232,31 @@ def read_pid_record_for_model(
 
     legacy = legacy_pid_file(base)
     try:
-        if legacy.exists():
-            record = json.loads(legacy.read_text())
+        raw_leg = runs_store_read_text(base, legacy.name)
+        if raw_leg is not None:
+            record = json.loads(raw_leg)
             if isinstance(record, dict) and record.get("model_id") == model_id:
                 return record
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError, json.JSONDecodeError):
         pass
     return None
 
 
 def list_pid_records(runs_dir: Path | None = None) -> list[tuple[Path, dict[str, Any]]]:
+    from .custody import runs_store_list_names, runs_store_read_text
+
     base = _effective_runs_dir(runs_dir)
-    try:
-        if not base.exists():
-            return []
-        paths = sorted(base.glob(".serve*.pid"))
-    except OSError:
-        return []
+    names = runs_store_list_names(base, prefix=".serve", suffix=".pid")
     records: list[tuple[Path, dict[str, Any]]] = []
-    for path in paths:
+    for fname in names:
         try:
-            data = json.loads(path.read_text())
+            raw_txt = runs_store_read_text(base, fname)
+            if raw_txt is None:
+                continue
+            data = json.loads(raw_txt)
             if isinstance(data, dict):
-                records.append((path, data))
-        except (OSError, json.JSONDecodeError):
+                records.append((base / fname, data))
+        except (OSError, ValueError, json.JSONDecodeError):
             continue
     return records
 

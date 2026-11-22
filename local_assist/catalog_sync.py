@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import contextlib
 import copy
 import datetime
@@ -9,6 +10,7 @@ import json
 import math
 import os
 import re
+import shlex
 import stat
 import subprocess
 import tempfile
@@ -19,10 +21,17 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from ._miniyaml import _MiniYamlParser, parse_yaml_with_flow_sequences, safe_load
+from ._miniyaml import (
+    _MiniYamlParser,
+    parse_yaml_documents,
+    parse_yaml_with_flow_sequences,
+    safe_load,
+    yaml_values_strictly_equal,
+)
 from .registry import (
     DEFAULT_MODELS_PATH,
     ISO_DATE_RE,
+    LOCAL_HOSTS,
     WEIGHTS_HASH_RE,
     WEIGHTS_SOURCE_RE,
     RegistryError,
@@ -33,7 +42,13 @@ from .registry import (
 DEFAULT_ROUTER_MANIFEST_URL = "https://inference.tinfoil.sh/.well-known/tinfoil-proxy"
 DEFAULT_OPENAI_MODELS_URL = "https://inference.tinfoil.sh/v1/models"
 DEFAULT_GITHUB_RAW_BASE_URL = "https://raw.githubusercontent.com"
+DEFAULT_PRIVATEMODE_REPO = "edgelesssys/privatemode-public"
+DEFAULT_PRIVATEMODE_API_BASE_URL = "https://api.github.com"
+DEFAULT_PRIVATEMODE_RELEASE_URL = (
+    f"{DEFAULT_PRIVATEMODE_API_BASE_URL}/repos/{DEFAULT_PRIVATEMODE_REPO}/releases/latest"
+)
 TINFOIL_ATTESTATION_METHOD = "tinfoil-proxy-sigstore"
+PRIVATEMODE_ATTESTATION_METHOD = "privatemode-proxy-contrast"
 TINFOIL_SERVE_COMMAND = (
     "./bin/tinfoil-proxy --bind {host} --port {port} "
     "-e inference.tinfoil.sh --repo tinfoilsh/confidential-model-router"
@@ -41,6 +56,42 @@ TINFOIL_SERVE_COMMAND = (
 TINFOIL_KEYCHAIN_SERVICE = "free-inference.tinfoil"
 TINFOIL_API_BASE_URL = "http://127.0.0.1:8081/v1"
 DEFAULT_IGNORED_SERVED_IDS: frozenset[str] = frozenset({"gemma4-31b", "llama3-3-70b"})
+# Non-chat enclaves listed in /.well-known/tinfoil-proxy that Tinfoil intentionally
+# omits from /v1/models (e.g., qwen3-tts-base under tinfoilsh/confidential-small-models,
+# paired with /v1/models qwen3-tts type='tts'). Applied only to unregistered router-only
+# entries so /v1/models chat discovery and registered-model checks remain unaffected.
+DEFAULT_IGNORED_ROUTER_ONLY_NONCHAT_IDS: frozenset[str] = frozenset({"qwen3-tts-base"})
+# Audio/speech workload in Privatemode deployment.yaml that passes --tool-call-parser
+# in vLLM despite not being a coding model.
+DEFAULT_PRIVATEMODE_IGNORED_SERVED_IDS: frozenset[str] = frozenset({"voxtral-mini-3b"})
+
+# Explicit authoritative served-ID-to-ConfigMap-disk-key bindings for Privatemode workloads
+# (upstream models.yaml does not carry a served_model_id or PVC field).
+PRIVATEMODE_AUTHORITATIVE_DISK_KEYS: dict[str, frozenset[str]] = {
+    "glm-5.3-flash": frozenset({"nvidia-glm-5-3-flash-nvfp4", "zai-org-glm-5-3-flash"}),
+    "glm-5.3": frozenset({"nvidia-glm-5-3-nvfp4", "libertaidai-glm-5-3-nvfp4"}),
+    "openai/gpt-oss-120b": frozenset({"openai-gpt-oss-120b"}),
+    "deepseek-ocr-2": frozenset({"deepseek-ai-deepseek-ocr-2"}),
+    "openai/whisper-large-v3": frozenset({"openai-whisper-large-v3"}),
+    "qwen3-embedding-4b": frozenset({"boboliu-qwen3-embedding-4b-w4a16-g128"}),
+    "voxtral-mini-3b": frozenset({"mistralai-voxtral-mini-3b-2507"}),
+}
+_PRIVATEMODE_QUANT_SUFFIX_TOKENS: frozenset[str] = frozenset(
+    {
+        "nvfp4",
+        "fp8",
+        "fp4",
+        "mxfp4",
+        "bf16",
+        "fp16",
+        "w4a16",
+        "g128",
+        "int4",
+        "int8",
+        "awq",
+        "gptq",
+    }
+)
 
 MPK_DESCRIPTOR_RE = re.compile(
     r"^(?P<sha256>[0-9a-f]{64})_(?P<size_bytes>\d+)_[0-9a-fA-F-]{36}$"
@@ -48,6 +99,18 @@ MPK_DESCRIPTOR_RE = re.compile(
 ENCLAVE_REPO_RE = re.compile(r"^tinfoilsh/[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 ENCLAVE_TAG_RE = re.compile(r"^[A-Za-z0-9_+-][A-Za-z0-9_.+-]{0,63}$")
 SERVED_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+PRIVATEMODE_SERVED_ID_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,63})?$"
+)
+PRIVATEMODE_TAG_RE = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+(?:[A-Za-z0-9._-]{0,32})?$")
+PRIVATEMODE_DISK_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+HF_MODEL_SOURCE_URL_RE = re.compile(
+    r"^https://huggingface\.co/(?P<repo>[A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9][A-Za-z0-9._-]{0,99})/?$"
+)
+HEX40_RE = re.compile(r"^[0-9a-f]{40}$")
+HEX64_RE = re.compile(r"^[0-9a-f]{64}$")
+POS_ASCII_INT_RE = re.compile(r"^[1-9][0-9]*$", re.ASCII)
+NONNEG_ASCII_INT_RE = re.compile(r"^[0-9]+$", re.ASCII)
 
 MAX_HOST_CODE_TAGS_PER_MODEL = 8
 MAX_ENCLAVE_CONFIG_FETCHES = 32
@@ -70,21 +133,24 @@ class CatalogSyncError(Exception):
 class ModelDriftItem:
     model_id: str
     served_model_id: str
-    action: str  # "update", "demote_weights_changed", "demote_zero_health", "archive_removed", "quarantine_disagreement"
+    action: str  # "update", "demote_weights_changed", "demote_zero_health", "archive_removed", "quarantine_disagreement", "manifest_upgrade_required"
     changes: dict[str, dict[str, Any]] = field(default_factory=dict)
     notes: list[str] = field(default_factory=list)
     weights_changed: bool = False
+    provider: str = "tinfoil"
 
 
 @dataclass
 class FeedDisagreementItem:
     model_id: str
     served_model_id: str
-    in_router_manifest: bool
-    in_openai_models: bool
+    in_router_manifest: bool | None
+    in_openai_models: bool | None
     router_healthy: int | None
     reason: str
     registered: bool = True
+    provider: str = "tinfoil"
+    feed_summary: str | None = None
 
 
 @dataclass
@@ -95,6 +161,8 @@ class CatalogDriftReport:
     removed_models: list[ModelDriftItem] = field(default_factory=list)
     disagreements: list[FeedDisagreementItem] = field(default_factory=list)
     base_catalog_sha256: str | None = None
+    providers: list[str] | None = None
+    provenance: dict[str, Any] | None = None
 
     @property
     def has_drift(self) -> bool:
@@ -106,55 +174,82 @@ class CatalogDriftReport:
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        provider_aware = self.providers is not None
+
+        def _upd_dict(item: ModelDriftItem) -> dict[str, Any]:
+            d: dict[str, Any] = {
+                "model_id": item.model_id,
+                "served_model_id": item.served_model_id,
+                "action": item.action,
+                "weights_changed": item.weights_changed,
+                "changes": item.changes,
+                "notes": item.notes,
+            }
+            if provider_aware:
+                d["provider"] = item.provider
+            return d
+
+        def _new_dict(m: dict[str, Any]) -> dict[str, Any]:
+            d: dict[str, Any] = {
+                "id": m.get("id"),
+                "repo": m.get("repo"),
+                "upstream": m.get("upstream"),
+                "status": m.get("status"),
+                "remote_trust": m.get("remote_trust"),
+                "context_window": m.get("context_window"),
+            }
+            if provider_aware:
+                rt = m.get("remote_trust") or {}
+                att = rt.get("attestation_method") if isinstance(rt, dict) else None
+                d["provider"] = m.get("provider") or (
+                    "privatemode" if att == PRIVATEMODE_ATTESTATION_METHOD else "tinfoil"
+                )
+                if m.get("manual_onboarding_required") is True:
+                    d["manual_onboarding_required"] = True
+            return d
+
+        def _rem_dict(item: ModelDriftItem) -> dict[str, Any]:
+            d: dict[str, Any] = {
+                "model_id": item.model_id,
+                "served_model_id": item.served_model_id,
+                "action": item.action,
+                "changes": item.changes,
+                "notes": item.notes,
+            }
+            if provider_aware:
+                d["provider"] = item.provider
+            return d
+
+        def _dis_dict(d_item: FeedDisagreementItem) -> dict[str, Any]:
+            d: dict[str, Any] = {
+                "model_id": d_item.model_id,
+                "served_model_id": d_item.served_model_id,
+                "registered": d_item.registered,
+                "in_router_manifest": d_item.in_router_manifest,
+                "in_openai_models": d_item.in_openai_models,
+                "router_healthy": d_item.router_healthy,
+                "reason": d_item.reason,
+            }
+            if provider_aware:
+                d["provider"] = d_item.provider
+                if d_item.feed_summary is not None:
+                    d["feed_summary"] = d_item.feed_summary
+            return d
+
+        out: dict[str, Any] = {
             "observed_date": self.observed_date,
             "base_catalog_sha256": self.base_catalog_sha256,
             "has_drift": self.has_drift,
-            "updated_models": [
-                {
-                    "model_id": item.model_id,
-                    "served_model_id": item.served_model_id,
-                    "action": item.action,
-                    "weights_changed": item.weights_changed,
-                    "changes": item.changes,
-                    "notes": item.notes,
-                }
-                for item in self.updated_models
-            ],
-            "new_models": [
-                {
-                    "id": m.get("id"),
-                    "repo": m.get("repo"),
-                    "upstream": m.get("upstream"),
-                    "status": m.get("status"),
-                    "remote_trust": m.get("remote_trust"),
-                    "context_window": m.get("context_window"),
-                }
-                for m in self.new_models
-            ],
-            "removed_models": [
-                {
-                    "model_id": item.model_id,
-                    "served_model_id": item.served_model_id,
-                    "action": item.action,
-                    "changes": item.changes,
-                    "notes": item.notes,
-                }
-                for item in self.removed_models
-            ],
-            "disagreements": [
-                {
-                    "model_id": d.model_id,
-                    "served_model_id": d.served_model_id,
-                    "registered": d.registered,
-                    "in_router_manifest": d.in_router_manifest,
-                    "in_openai_models": d.in_openai_models,
-                    "router_healthy": d.router_healthy,
-                    "reason": d.reason,
-                }
-                for d in self.disagreements
-            ],
+            "updated_models": [_upd_dict(item) for item in self.updated_models],
+            "new_models": [_new_dict(m) for m in self.new_models],
+            "removed_models": [_rem_dict(item) for item in self.removed_models],
+            "disagreements": [_dis_dict(d) for d in self.disagreements],
         }
+        if provider_aware:
+            out["providers"] = list(self.providers or [])
+            if self.provenance is not None:
+                out["provenance"] = copy.deepcopy(self.provenance)
+        return out
 
 
 def parse_tinfoil_config_yaml(text: str) -> dict[str, Any]:
@@ -289,10 +384,49 @@ ALLOWED_CATALOG_HOSTS = frozenset(
     {
         "inference.tinfoil.sh",
         "raw.githubusercontent.com",
+        "api.github.com",
         "127.0.0.1",
         "localhost",
     }
 )
+
+
+def _validate_catalog_url(
+    url: str,
+    *,
+    expected_https_host: str,
+    expected_path: str,
+    allow_loopback_fixture: bool = False,
+) -> str:
+    if not isinstance(url, str) or not url.strip():
+        raise CatalogSyncError(f"Empty or non-string catalog URL: {url!r}")
+    parsed = urllib.parse.urlparse(url)
+    if parsed.username is not None or parsed.password is not None:
+        raise CatalogSyncError(f"Refusing URL userinfo in catalog URL: {url!r}")
+    if parsed.params or parsed.query or parsed.fragment:
+        raise CatalogSyncError(f"Refusing URL params/query/fragment in catalog URL: {url!r}")
+    if ".." in parsed.path or "//" in parsed.path or "\\" in parsed.path:
+        raise CatalogSyncError(f"Refusing path traversal or double slash in catalog URL: {url!r}")
+    if parsed.path != expected_path:
+        raise CatalogSyncError(
+            f"Refusing unexpected catalog URL path {parsed.path!r} (expected {expected_path!r}): {url!r}"
+        )
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme == "https":
+        if host != expected_https_host.lower():
+            raise CatalogSyncError(
+                f"Refusing unexpected HTTPS host {host!r} (expected {expected_https_host!r}): {url!r}"
+            )
+        if parsed.port is not None:
+            raise CatalogSyncError(f"Refusing explicit port in HTTPS catalog URL: {url!r}")
+        return url
+    if parsed.scheme == "http":
+        if not allow_loopback_fixture or host not in ("127.0.0.1", "localhost"):
+            raise CatalogSyncError(
+                f"Refusing plaintext HTTP catalog URL (allow_loopback_fixture={allow_loopback_fixture}): {url!r}"
+            )
+        return url
+    raise CatalogSyncError(f"Refusing unsupported URL scheme {parsed.scheme!r} in catalog URL: {url!r}")
 
 
 class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -353,12 +487,28 @@ def _ensure_all_numbers_finite(obj: Any, *, context: str) -> None:
             _ensure_all_numbers_finite(item, context=context)
 
 
-def _strict_json_loads(text: str, *, context: str) -> Any:
+def _strict_json_loads(
+    text: str,
+    *,
+    context: str,
+    reject_duplicate_keys: bool = False,
+) -> Any:
     def _reject_constant(val: str) -> Any:
         raise ValueError(f"Non-standard JSON constant {val!r} is not allowed")
 
+    def _no_dup_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        for k, v in pairs:
+            if k in out:
+                raise ValueError(f"Duplicate JSON object key {k!r} is not allowed")
+            out[k] = v
+        return out
+
     try:
-        data = json.loads(text, parse_constant=_reject_constant)
+        kwargs: dict[str, Any] = {"parse_constant": _reject_constant}
+        if reject_duplicate_keys:
+            kwargs["object_pairs_hook"] = _no_dup_pairs
+        data = json.loads(text, **kwargs)
     except Exception as exc:
         raise CatalogSyncError(f"Invalid JSON from {context}: {exc}") from exc
     _ensure_all_numbers_finite(data, context=context)
@@ -523,6 +673,1199 @@ def is_tinfoil_managed_model(model: dict[str, Any]) -> bool:
     if not isinstance(rt, dict):
         return False
     return rt.get("attestation_method") == TINFOIL_ATTESTATION_METHOD
+
+
+def is_privatemode_managed_model(model: dict[str, Any]) -> bool:
+    if not isinstance(model, dict):
+        return False
+    if model.get("runtime") != "proxy":
+        return False
+    rt = model.get("remote_trust")
+    if not isinstance(rt, dict):
+        return False
+    return rt.get("attestation_method") == PRIVATEMODE_ATTESTATION_METHOD
+
+
+def _pyyaml_load_no_duplicate_keys(text: str, *, multi_document: bool = False) -> tuple[bool, Any]:
+    try:
+        import yaml as pyyaml  # type: ignore[import-untyped]
+    except ImportError:
+        return False, None
+
+    class _StrictSafeLoader(pyyaml.SafeLoader):
+        pass
+
+    def _construct_mapping(loader: Any, node: Any, deep: bool = False) -> dict[Any, Any]:
+        loader.flatten_mapping(node)
+        mapping: dict[Any, Any] = {}
+        seen_typed: set[tuple[type, Any]] = set()
+        for key_node, value_node in node.value:
+            key = loader.construct_object(key_node, deep=deep)
+            val = loader.construct_object(value_node, deep=deep)
+            tkey = (type(key), key)
+            if tkey in seen_typed or key in mapping:
+                raise ValueError(f"Duplicate YAML mapping key: {key!r}")
+            seen_typed.add(tkey)
+            mapping[key] = val
+        return mapping
+
+    _StrictSafeLoader.add_constructor(
+        pyyaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+        _construct_mapping,
+    )
+    if multi_document:
+        return True, list(pyyaml.load_all(text, Loader=_StrictSafeLoader))
+    return True, pyyaml.load(text, Loader=_StrictSafeLoader)
+
+
+def _canonical_privatemode_disk_key(upstream_repo: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", upstream_repo.lower()).strip("-")
+
+
+def _privatemode_candidate_id(served_id: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", served_id.lower()).strip("-")
+    if slug.startswith("privatemode-"):
+        return slug
+    return f"privatemode-{slug}"
+
+
+def _privatemode_expected_disk_name(served_id: str) -> str:
+    return served_id.split("/", 1)[1] if "/" in served_id else served_id
+
+
+def _strip_privatemode_repo_quant_suffixes(repo_name: str) -> str:
+    tokens = [tok for tok in re.sub(r"[^a-z0-9]+", "-", repo_name.lower()).strip("-").split("-") if tok]
+    while len(tokens) > 1:
+        tail = tokens[-1]
+        if tail in _PRIVATEMODE_QUANT_SUFFIX_TOKENS or re.fullmatch(r"[0-9]{4}", tail, re.ASCII):
+            tokens.pop()
+            continue
+        break
+    return "-".join(tokens)
+
+
+def _privatemode_disk_identity_matches(
+    served_id: str,
+    k8s_slug: str,
+    disk_entry: dict[str, Any],
+) -> bool:
+    disk_key = disk_entry.get("disk_key")
+    upstream = disk_entry.get("upstream")
+    if not isinstance(disk_key, str) or not isinstance(upstream, str) or "/" not in upstream:
+        return False
+    if served_id in PRIVATEMODE_AUTHORITATIVE_DISK_KEYS:
+        return disk_key in PRIVATEMODE_AUTHORITATIVE_DISK_KEYS[served_id]
+    expected_disk_name = _privatemode_expected_disk_name(served_id)
+    normalized_served_slug = re.sub(r"[^a-z0-9]+", "-", expected_disk_name.lower()).strip("-")
+    if k8s_slug.lower() != normalized_served_slug:
+        return False
+    repo_basename = upstream.split("/", 1)[1]
+    stripped_repo_slug = _strip_privatemode_repo_quant_suffixes(repo_basename)
+    return stripped_repo_slug == normalized_served_slug
+
+
+def fetch_privatemode_latest_release(
+    url: str = DEFAULT_PRIVATEMODE_RELEASE_URL,
+    *,
+    timeout: float = 15.0,
+    http_get: Callable[[str], str] | None = None,
+    allow_loopback_fixture: bool = False,
+) -> dict[str, Any]:
+    validated_url = _validate_catalog_url(
+        url,
+        expected_https_host="api.github.com",
+        expected_path=f"/repos/{DEFAULT_PRIVATEMODE_REPO}/releases/latest",
+        allow_loopback_fixture=allow_loopback_fixture,
+    )
+    getter = http_get or (lambda u: _http_get_text(u, timeout=timeout))
+    text = getter(validated_url)
+    data = _strict_json_loads(
+        text,
+        context=f"Privatemode latest release {validated_url}",
+        reject_duplicate_keys=True,
+    )
+    if not isinstance(data, dict):
+        raise CatalogSyncError("Privatemode latest release response must be a JSON object")
+    if data.get("draft") is not False:
+        raise CatalogSyncError(
+            f"Privatemode latest release requires literal draft=false, got {data.get('draft')!r}"
+        )
+    if data.get("prerelease") is not False:
+        raise CatalogSyncError(
+            f"Privatemode latest release requires literal prerelease=false, got {data.get('prerelease')!r}"
+        )
+    tag_name = data.get("tag_name")
+    if not isinstance(tag_name, str) or ".." in tag_name or not PRIVATEMODE_TAG_RE.match(tag_name):
+        raise CatalogSyncError(f"Privatemode latest release has invalid tag_name: {tag_name!r}")
+    assets = data.get("assets")
+    if not isinstance(assets, list):
+        raise CatalogSyncError("Privatemode latest release is missing 'assets' list")
+    expected_dl_url = (
+        f"https://github.com/{DEFAULT_PRIVATEMODE_REPO}/releases/download/{tag_name}/manifest.json"
+    )
+    manifest_assets = [
+        a for a in assets if isinstance(a, dict) and a.get("name") == "manifest.json"
+    ]
+    if len(manifest_assets) != 1:
+        raise CatalogSyncError(
+            f"Privatemode release '{tag_name}' must have exactly one 'manifest.json' asset "
+            f"(found {len(manifest_assets)})"
+        )
+    m_asset = manifest_assets[0]
+    m_size = m_asset.get("size")
+    if isinstance(m_size, bool) or not isinstance(m_size, int) or m_size <= 0:
+        raise CatalogSyncError(
+            f"Privatemode release '{tag_name}' manifest.json asset has invalid size: {m_size!r}"
+        )
+    m_dl = m_asset.get("browser_download_url")
+    if not isinstance(m_dl, str) or m_dl != expected_dl_url:
+        raise CatalogSyncError(
+            f"Privatemode release '{tag_name}' manifest.json asset has unexpected browser_download_url: {m_dl!r}"
+        )
+    published_at = data.get("published_at")
+    if published_at is not None and not isinstance(published_at, str):
+        raise CatalogSyncError(f"Privatemode release '{tag_name}' has non-string published_at")
+    digest_val = m_asset.get("digest")
+    if digest_val is not None and not isinstance(digest_val, str):
+        digest_val = None
+    return {
+        "repo": DEFAULT_PRIVATEMODE_REPO,
+        "tag_name": tag_name,
+        "published_at": published_at,
+        "manifest_asset_name": "manifest.json",
+        "manifest_asset_size": m_size,
+        "manifest_asset_url": m_dl,
+        "manifest_asset_digest": digest_val,
+    }
+
+
+def fetch_privatemode_tag_commit(
+    tag: str,
+    *,
+    api_base_url: str = DEFAULT_PRIVATEMODE_API_BASE_URL,
+    timeout: float = 15.0,
+    http_get: Callable[[str], str] | None = None,
+    allow_loopback_fixture: bool = False,
+) -> str:
+    if not isinstance(tag, str) or ".." in tag or not PRIVATEMODE_TAG_RE.match(tag):
+        raise CatalogSyncError(f"Invalid Privatemode release tag: {tag!r}")
+    url = f"{api_base_url.rstrip('/')}/repos/{DEFAULT_PRIVATEMODE_REPO}/commits/{tag}"
+    validated_url = _validate_catalog_url(
+        url,
+        expected_https_host="api.github.com",
+        expected_path=f"/repos/{DEFAULT_PRIVATEMODE_REPO}/commits/{tag}",
+        allow_loopback_fixture=allow_loopback_fixture,
+    )
+    getter = http_get or (lambda u: _http_get_text(u, timeout=timeout))
+    text = getter(validated_url)
+    data = _strict_json_loads(
+        text,
+        context=f"Privatemode tag commit {validated_url}",
+        reject_duplicate_keys=True,
+    )
+    if not isinstance(data, dict):
+        raise CatalogSyncError(f"Privatemode commit response for '{tag}' must be a JSON object")
+    sha = data.get("sha")
+    if not isinstance(sha, str) or not HEX40_RE.match(sha):
+        raise CatalogSyncError(
+            f"Privatemode commit response for '{tag}' is missing valid 40-hex commit sha: {sha!r}"
+        )
+    return sha
+
+
+def parse_privatemode_models_yaml(text: str) -> dict[str, dict[str, Any]]:
+    """Parse Privatemode models.yaml ConfigMap with strict stdlib/PyYAML parity and disk-key validation."""
+    if not isinstance(text, str) or not text.strip():
+        raise CatalogSyncError("Empty Privatemode models.yaml content")
+    try:
+        parsed = parse_yaml_with_flow_sequences(
+            text,
+            reject_duplicate_keys=True,
+            strict_plain_scalars=True,
+        )
+    except Exception as exc:
+        raise CatalogSyncError(f"Failed to parse Privatemode models.yaml with stdlib parser: {exc}") from exc
+
+    has_pyyaml, py_parsed = _pyyaml_load_no_duplicate_keys(text, multi_document=False)
+    if has_pyyaml and not yaml_values_strictly_equal(parsed, py_parsed):
+        raise CatalogSyncError(
+            "Stdlib strict YAML parser and PyYAML produced different structures on Privatemode models.yaml"
+        )
+
+    if not isinstance(parsed, dict):
+        raise CatalogSyncError("Privatemode models.yaml must parse to a top-level mapping")
+    if parsed.get("kind") != "ConfigMap":
+        raise CatalogSyncError(
+            f"Privatemode models.yaml must have kind='ConfigMap', got {parsed.get('kind')!r}"
+        )
+    meta = parsed.get("metadata")
+    if not isinstance(meta, dict) or meta.get("name") != "model-disks":
+        raise CatalogSyncError("Privatemode models.yaml must have metadata.name='model-disks'")
+    raw_data = parsed.get("data")
+    if not isinstance(raw_data, dict) or not raw_data:
+        raise CatalogSyncError("Privatemode models.yaml is missing non-empty 'data' mapping")
+
+    by_root_hash: dict[str, dict[str, Any]] = {}
+    for disk_key, raw_val in raw_data.items():
+        if not isinstance(disk_key, str) or not disk_key.strip():
+            raise CatalogSyncError(f"Privatemode models.yaml contains invalid disk key: {disk_key!r}")
+        if not isinstance(raw_val, str) or not raw_val.strip():
+            raise CatalogSyncError(
+                f"Privatemode models.yaml disk '{disk_key}' must map to a JSON string"
+            )
+        entry = _strict_json_loads(
+            raw_val,
+            context=f"Privatemode models.yaml disk '{disk_key}'",
+            reject_duplicate_keys=True,
+        )
+        if not isinstance(entry, dict):
+            raise CatalogSyncError(f"Privatemode models.yaml disk '{disk_key}' JSON must be an object")
+
+        model_source = entry.get("model_source")
+        if not isinstance(model_source, str) or ".." in model_source:
+            raise CatalogSyncError(
+                f"Privatemode models.yaml disk '{disk_key}' has invalid model_source: {model_source!r}"
+            )
+        src_match = HF_MODEL_SOURCE_URL_RE.match(model_source.strip())
+        if not src_match:
+            raise CatalogSyncError(
+                f"Privatemode models.yaml disk '{disk_key}' has non-HuggingFace or malformed model_source: {model_source!r}"
+            )
+        upstream = src_match.group("repo")
+        expected_key = _canonical_privatemode_disk_key(upstream)
+        if disk_key != expected_key:
+            raise CatalogSyncError(
+                f"Privatemode models.yaml disk key '{disk_key}' does not match canonical model_source key '{expected_key}'"
+            )
+
+        commit_hash = entry.get("commit_hash")
+        if not isinstance(commit_hash, str) or not HEX40_RE.match(commit_hash):
+            raise CatalogSyncError(
+                f"Privatemode models.yaml disk '{disk_key}' has invalid commit_hash: {commit_hash!r}"
+            )
+        root_hash = entry.get("root_hash")
+        if not isinstance(root_hash, str) or not HEX64_RE.match(root_hash):
+            raise CatalogSyncError(
+                f"Privatemode models.yaml disk '{disk_key}' has invalid root_hash: {root_hash!r}"
+            )
+        file_size = entry.get("file_size_bytes")
+        if isinstance(file_size, bool) or not isinstance(file_size, int) or file_size <= 0:
+            raise CatalogSyncError(
+                f"Privatemode models.yaml disk '{disk_key}' has invalid file_size_bytes: {file_size!r}"
+            )
+
+        weights_source = f"{upstream}@{commit_hash}"
+        if not WEIGHTS_SOURCE_RE.match(weights_source):
+            raise CatalogSyncError(
+                f"Privatemode models.yaml disk '{disk_key}' produced invalid weights_source: {weights_source!r}"
+            )
+        weights_hash = f"dmverity:sha256:{root_hash}"
+        if not WEIGHTS_HASH_RE.match(weights_hash):
+            raise CatalogSyncError(
+                f"Privatemode models.yaml disk '{disk_key}' produced invalid weights_hash: {weights_hash!r}"
+            )
+        if root_hash in by_root_hash:
+            prev = by_root_hash[root_hash]
+            raise CatalogSyncError(
+                f"Privatemode models.yaml has duplicate root_hash {root_hash} shared by "
+                f"'{prev['disk_key']}' and '{disk_key}'"
+            )
+        by_root_hash[root_hash] = {
+            "disk_key": disk_key,
+            "upstream": upstream,
+            "commit_hash": commit_hash,
+            "weights_source": weights_source,
+            "root_hash": root_hash,
+            "weights_hash": weights_hash,
+            "file_size_bytes": file_size,
+            "disk_gb_estimate": round(file_size / 1_000_000_000, 1),
+        }
+
+    return by_root_hash
+
+
+def _parse_privatemode_vllm_flags(
+    flag_args: list[str],
+    *,
+    context: str,
+) -> dict[str, Any]:
+    """Strict single-pass vLLM flag parser rejecting duplicate/conflicting flags and invalid arity."""
+    served_names: list[str] | None = None
+    max_model_len: int | None = None
+    tool_call_parser: str | None = None
+    reasoning_parser: str | None = None
+    kv_cache_dtype: str | None = None
+    enable_auto_tool_choice = False
+
+    seen_flags: set[str] = set()
+    idx = 0
+    n = len(flag_args)
+    while idx < n:
+        tok = flag_args[idx]
+        if tok == "--served-model-name":
+            if "--served-model-name" in seen_flags:
+                raise CatalogSyncError(f"{context}: duplicate --served-model-name flag")
+            seen_flags.add("--served-model-name")
+            vals: list[str] = []
+            j = idx + 1
+            while j < n and not flag_args[j].startswith("--"):
+                vals.append(flag_args[j])
+                j += 1
+            if not vals:
+                raise CatalogSyncError(f"{context}: --served-model-name requires at least one model name")
+            served_names = vals
+            idx = j
+            continue
+        if tok.startswith("--served-model-name="):
+            if "--served-model-name" in seen_flags:
+                raise CatalogSyncError(f"{context}: duplicate --served-model-name flag")
+            seen_flags.add("--served-model-name")
+            val = tok.split("=", 1)[1]
+            if not val:
+                raise CatalogSyncError(f"{context}: empty --served-model-name= value")
+            served_names = [val]
+            idx += 1
+            continue
+
+        if tok == "--max-model-len" or tok.startswith("--max-model-len="):
+            if "--max-model-len" in seen_flags:
+                raise CatalogSyncError(f"{context}: duplicate --max-model-len flag")
+            seen_flags.add("--max-model-len")
+            if tok == "--max-model-len":
+                if idx + 1 >= n or flag_args[idx + 1].startswith("--"):
+                    raise CatalogSyncError(f"{context}: --max-model-len requires a positive integer value")
+                raw_len = flag_args[idx + 1]
+                idx += 2
+            else:
+                raw_len = tok.split("=", 1)[1]
+                idx += 1
+            if not POS_ASCII_INT_RE.fullmatch(raw_len):
+                raise CatalogSyncError(f"{context}: invalid --max-model-len value {raw_len!r}")
+            max_model_len = int(raw_len)
+            continue
+
+        if tok == "--enable-auto-tool-choice":
+            if "--enable-auto-tool-choice" in seen_flags:
+                raise CatalogSyncError(f"{context}: duplicate --enable-auto-tool-choice flag")
+            seen_flags.add("--enable-auto-tool-choice")
+            enable_auto_tool_choice = True
+            idx += 1
+            continue
+        if tok.startswith("--enable-auto-tool-choice="):
+            raise CatalogSyncError(f"{context}: unexpected value on boolean flag {tok!r}")
+
+        matched_single = False
+        for flag_name in ("--tool-call-parser", "--reasoning-parser", "--kv-cache-dtype"):
+            if tok == flag_name or tok.startswith(f"{flag_name}="):
+                if flag_name in seen_flags:
+                    raise CatalogSyncError(f"{context}: duplicate {flag_name} flag")
+                seen_flags.add(flag_name)
+                if tok == flag_name:
+                    if idx + 1 >= n or flag_args[idx + 1].startswith("--"):
+                        raise CatalogSyncError(f"{context}: {flag_name} requires a non-empty value")
+                    fval = flag_args[idx + 1]
+                    idx += 2
+                else:
+                    fval = tok.split("=", 1)[1]
+                    idx += 1
+                if not fval.strip():
+                    raise CatalogSyncError(f"{context}: {flag_name} requires a non-empty value")
+                if flag_name == "--tool-call-parser":
+                    tool_call_parser = fval
+                elif flag_name == "--reasoning-parser":
+                    reasoning_parser = fval
+                else:
+                    kv_cache_dtype = fval
+                matched_single = True
+                break
+        if matched_single:
+            continue
+
+        idx += 1
+
+    if not served_names:
+        raise CatalogSyncError(f"{context}: missing --served-model-name")
+    seen_in_flag: set[str] = set()
+    for name in served_names:
+        if not isinstance(name, str) or ".." in name or not PRIVATEMODE_SERVED_ID_RE.match(name):
+            raise CatalogSyncError(f"{context}: invalid served model name {name!r}")
+        if name in seen_in_flag:
+            raise CatalogSyncError(f"{context}: duplicate served model name {name!r} in --served-model-name")
+        seen_in_flag.add(name)
+
+    return {
+        "primary_served_id": served_names[0],
+        "aliases": served_names[1:],
+        "max_model_len": max_model_len,
+        "tool_call_parser": tool_call_parser,
+        "reasoning_parser": reasoning_parser,
+        "kv_cache_dtype": kv_cache_dtype,
+        "enable_auto_tool_choice": enable_auto_tool_choice,
+        "tool_calling_hint": bool(tool_call_parser or enable_auto_tool_choice),
+    }
+
+
+def parse_privatemode_deployment_yaml(text: str) -> dict[str, Any]:
+    """Parse Privatemode multi-document deployment.yaml validating pod volumes, mounts, mounters, and vLLM args."""
+    if not isinstance(text, str) or not text.strip():
+        raise CatalogSyncError("Empty Privatemode deployment.yaml content")
+    try:
+        docs = parse_yaml_documents(
+            text,
+            allow_flow_sequences=True,
+            reject_duplicate_keys=True,
+            strict_plain_scalars=True,
+        )
+    except Exception as exc:
+        raise CatalogSyncError(
+            f"Failed to parse Privatemode deployment.yaml with stdlib parser: {exc}"
+        ) from exc
+
+    has_pyyaml, py_docs = _pyyaml_load_no_duplicate_keys(text, multi_document=True)
+    if has_pyyaml and not yaml_values_strictly_equal(docs, py_docs):
+        raise CatalogSyncError(
+            "Stdlib strict YAML parser and PyYAML produced different structures on Privatemode deployment.yaml"
+        )
+
+    workloads: dict[str, dict[str, Any]] = {}
+    partial_deployments: list[dict[str, Any]] = []
+    global_served_owners: dict[str, str] = {}
+
+    for doc in docs:
+        if not isinstance(doc, dict) or doc.get("kind") != "Deployment":
+            continue
+        meta = doc.get("metadata")
+        if not isinstance(meta, dict) or not isinstance(meta.get("name"), str) or not meta["name"].strip():
+            raise CatalogSyncError("Privatemode Deployment is missing string metadata.name")
+        dep_name = meta["name"].strip()
+        spec = doc.get("spec")
+        if not isinstance(spec, dict):
+            raise CatalogSyncError(f"Privatemode Deployment '{dep_name}' is missing 'spec' mapping")
+
+        raw_replicas = spec.get("replicas")
+        is_zero_replicas = False
+        if raw_replicas is not None:
+            if isinstance(raw_replicas, bool) or not isinstance(raw_replicas, int) or raw_replicas < 0:
+                raise CatalogSyncError(
+                    f"Privatemode Deployment '{dep_name}' has invalid spec.replicas: {raw_replicas!r}"
+                )
+            if raw_replicas == 0:
+                is_zero_replicas = True
+
+        template = spec.get("template")
+        pod_spec = template.get("spec") if isinstance(template, dict) else None
+        if not isinstance(pod_spec, dict):
+            raise CatalogSyncError(
+                f"Privatemode Deployment '{dep_name}' is missing spec.template.spec mapping"
+            )
+
+        # Index Pod volumes (PVC claims and shared emptyDir mount-dir)
+        raw_volumes = pod_spec.get("volumes")
+        if raw_volumes is not None and not isinstance(raw_volumes, list):
+            raise CatalogSyncError(f"Privatemode Deployment '{dep_name}' has non-list spec.volumes")
+        pvc_by_vol_name: dict[str, str] = {}
+        has_mount_dir_emptydir = False
+        seen_vol_names: set[str] = set()
+        for vol in raw_volumes or []:
+            if not isinstance(vol, dict) or not isinstance(vol.get("name"), str):
+                raise CatalogSyncError(f"Privatemode Deployment '{dep_name}' has malformed volume entry")
+            vname = vol["name"]
+            if vname in seen_vol_names:
+                raise CatalogSyncError(
+                    f"Privatemode Deployment '{dep_name}' has duplicate volume name '{vname}'"
+                )
+            seen_vol_names.add(vname)
+            if vname == "mount-dir" and isinstance(vol.get("emptyDir"), dict):
+                has_mount_dir_emptydir = True
+            pvc = vol.get("persistentVolumeClaim")
+            if isinstance(pvc, dict) and isinstance(pvc.get("claimName"), str):
+                pvc_by_vol_name[vname] = pvc["claimName"]
+
+        # Parse disk-mounter-* initContainers
+        raw_inits = pod_spec.get("initContainers")
+        if raw_inits is not None and not isinstance(raw_inits, list):
+            raise CatalogSyncError(f"Privatemode Deployment '{dep_name}' has non-list initContainers")
+        mounters_by_suffix: dict[str, dict[str, Any]] = {}
+        for ic in raw_inits or []:
+            if not isinstance(ic, dict):
+                continue
+            iname = ic.get("name")
+            if not isinstance(iname, str) or not iname.startswith("disk-mounter-"):
+                continue
+            ic_args = ic.get("args")
+            if (
+                not isinstance(ic_args, list)
+                or len(ic_args) != 3
+                or not all(isinstance(x, str) for x in ic_args)
+            ):
+                raise CatalogSyncError(
+                    f"Privatemode Deployment '{dep_name}' initContainer '{iname}' must have 3 string args"
+                )
+            disk_name, idx_str, root_hash = ic_args
+            if ".." in disk_name or not PRIVATEMODE_DISK_NAME_RE.match(disk_name):
+                raise CatalogSyncError(
+                    f"Privatemode Deployment '{dep_name}' initContainer '{iname}' has invalid disk_name {disk_name!r}"
+                )
+            if not NONNEG_ASCII_INT_RE.fullmatch(idx_str):
+                raise CatalogSyncError(
+                    f"Privatemode Deployment '{dep_name}' initContainer '{iname}' has invalid index {idx_str!r}"
+                )
+            if not HEX64_RE.match(root_hash):
+                raise CatalogSyncError(
+                    f"Privatemode Deployment '{dep_name}' initContainer '{iname}' has invalid root_hash {root_hash!r}"
+                )
+            k8s_slug = disk_name.replace(".", "-")
+            expected_iname = f"disk-mounter-{k8s_slug}-{idx_str}"
+            if iname != expected_iname:
+                raise CatalogSyncError(
+                    f"Privatemode Deployment '{dep_name}' initContainer name '{iname}' does not match expected '{expected_iname}'"
+                )
+            suffix = f"{k8s_slug}-{idx_str}"
+            if suffix in mounters_by_suffix:
+                raise CatalogSyncError(
+                    f"Privatemode Deployment '{dep_name}' has duplicate disk-mounter suffix '{suffix}'"
+                )
+
+            # Verify volumeDevices -> Pod PVC claim binding
+            vol_devs = ic.get("volumeDevices")
+            expected_dev_path = f"/dev/modelweights-{disk_name}-{idx_str}"
+            expected_vol_name = f"modelweights-{k8s_slug}-{idx_str}"
+            if not isinstance(vol_devs, list):
+                raise CatalogSyncError(
+                    f"Privatemode Deployment '{dep_name}' initContainer '{iname}' is missing volumeDevices"
+                )
+            matching_devs = [
+                vd
+                for vd in vol_devs
+                if isinstance(vd, dict)
+                and vd.get("name") == expected_vol_name
+                and vd.get("devicePath") == expected_dev_path
+            ]
+            if len(matching_devs) != 1:
+                raise CatalogSyncError(
+                    f"Privatemode Deployment '{dep_name}' initContainer '{iname}' must bind "
+                    f"volumeDevice {expected_vol_name!r} at {expected_dev_path!r}"
+                )
+            if pvc_by_vol_name.get(expected_vol_name) != k8s_slug:
+                raise CatalogSyncError(
+                    f"Privatemode Deployment '{dep_name}' volume '{expected_vol_name}' must bind "
+                    f"persistentVolumeClaim.claimName='{k8s_slug}' (got {pvc_by_vol_name.get(expected_vol_name)!r})"
+                )
+
+            # Verify Bidirectional /mnt mount-dir backing volume
+            ic_mounts = ic.get("volumeMounts")
+            has_bidi_mnt = isinstance(ic_mounts, list) and any(
+                isinstance(vm, dict)
+                and vm.get("name") == "mount-dir"
+                and vm.get("mountPath") == "/mnt"
+                and vm.get("mountPropagation") == "Bidirectional"
+                for vm in ic_mounts
+            )
+            if not has_mount_dir_emptydir or not has_bidi_mnt:
+                raise CatalogSyncError(
+                    f"Privatemode Deployment '{dep_name}' initContainer '{iname}' is missing "
+                    "Bidirectional /mnt mount backed by emptyDir volume 'mount-dir'"
+                )
+
+            mounters_by_suffix[suffix] = {
+                "disk_name": disk_name,
+                "k8s_slug": k8s_slug,
+                "index": idx_str,
+                "root_hash": root_hash,
+                "mount_path": f"/mnt/modelweights-{disk_name}-{idx_str}",
+                "init_container": iname,
+            }
+
+        # Parse workload-* containers
+        raw_ctrs = pod_spec.get("containers")
+        if not isinstance(raw_ctrs, list):
+            raise CatalogSyncError(f"Privatemode Deployment '{dep_name}' is missing 'containers' list")
+        matched_suffixes: set[str] = set()
+        for ctr in raw_ctrs:
+            if not isinstance(ctr, dict):
+                continue
+            cname = ctr.get("name")
+            if not isinstance(cname, str) or not cname.startswith("workload-"):
+                continue
+            raw_args = ctr.get("args")
+            if raw_args is not None:
+                if not isinstance(raw_args, list) or not all(isinstance(a, str) for a in raw_args):
+                    raise CatalogSyncError(
+                        f"Privatemode Deployment '{dep_name}' container '{cname}' args must be a list of strings"
+                    )
+            args_list: list[str] = list(raw_args or [])
+
+            # Skip non-vLLM helper containers (e.g., unstructured-api) when pod has no mounters and empty args
+            if not mounters_by_suffix and not args_list:
+                continue
+
+            suffix = cname[len("workload-") :]
+            mounter = mounters_by_suffix.get(suffix)
+            if mounter is None:
+                raise CatalogSyncError(
+                    f"Privatemode Deployment '{dep_name}' container '{cname}' has no matching disk-mounter-{suffix}"
+                )
+            matched_suffixes.add(suffix)
+
+            # Verify HostToContainer /mnt mount-dir backing mount on workload container
+            ctr_mounts = ctr.get("volumeMounts")
+            has_h2c_mnt = isinstance(ctr_mounts, list) and any(
+                isinstance(vm, dict)
+                and vm.get("name") == "mount-dir"
+                and vm.get("mountPath") == "/mnt"
+                and vm.get("mountPropagation") == "HostToContainer"
+                for vm in ctr_mounts
+            )
+            if not has_mount_dir_emptydir or not has_h2c_mnt:
+                raise CatalogSyncError(
+                    f"Privatemode Deployment '{dep_name}' container '{cname}' is missing "
+                    "HostToContainer /mnt mount backed by emptyDir volume 'mount-dir'"
+                )
+
+            if not args_list or args_list[0] != mounter["mount_path"]:
+                raise CatalogSyncError(
+                    f"Privatemode Deployment '{dep_name}' container '{cname}' args[0] must be "
+                    f"{mounter['mount_path']!r} (got {args_list[0] if args_list else None!r})"
+                )
+            extra_mnts = [a for a in args_list[1:] if a.startswith("/mnt/modelweights-")]
+            if extra_mnts:
+                raise CatalogSyncError(
+                    f"Privatemode Deployment '{dep_name}' container '{cname}' contains extra modelweights paths: {extra_mnts!r}"
+                )
+
+            flags = _parse_privatemode_vllm_flags(
+                args_list[1:],
+                context=f"Privatemode Deployment '{dep_name}' container '{cname}'",
+            )
+            primary_id = flags["primary_served_id"]
+            aliases = flags["aliases"]
+
+            # Enforce explicit pod-disk-to-served-ID derivation
+            expected_disk_name = _privatemode_expected_disk_name(primary_id)
+            expected_k8s_slug = expected_disk_name.replace(".", "-")
+            if mounter["disk_name"] != expected_disk_name or mounter["k8s_slug"] != expected_k8s_slug:
+                raise CatalogSyncError(
+                    f"Privatemode Deployment '{dep_name}' container '{cname}' mounts disk "
+                    f"'{mounter['disk_name']}' (slug '{mounter['k8s_slug']}') which does not match "
+                    f"served model '{primary_id}' (expected disk '{expected_disk_name}')"
+                )
+
+            # Global primary & alias collision check across all Deployments
+            for sid in [primary_id, *aliases]:
+                prev_owner = global_served_owners.get(sid)
+                if prev_owner is not None:
+                    raise CatalogSyncError(
+                        f"Privatemode deployment.yaml served model ID/alias '{sid}' collides across "
+                        f"'{prev_owner}' and '{dep_name}/{cname}'"
+                    )
+                global_served_owners[sid] = f"{dep_name}/{cname}"
+
+            if is_zero_replicas:
+                partial_deployments.append(
+                    {
+                        "kind": "zero_replicas",
+                        "deployment_name": dep_name,
+                        "container_name": cname,
+                        "served_model_id": primary_id,
+                        "disk_name": mounter["disk_name"],
+                        "k8s_slug": mounter["k8s_slug"],
+                        "root_hash": mounter["root_hash"],
+                        "reason": f"Privatemode Deployment '{dep_name}' has spec.replicas == 0 for '{primary_id}'",
+                    }
+                )
+                continue
+
+            workloads[primary_id] = {
+                "served_model_id": primary_id,
+                "aliases": aliases,
+                "deployment_name": dep_name,
+                "container_name": cname,
+                "disk_name": mounter["disk_name"],
+                "k8s_slug": mounter["k8s_slug"],
+                "root_hash": mounter["root_hash"],
+                "weights_hash": f"dmverity:sha256:{mounter['root_hash']}",
+                "max_model_len": flags["max_model_len"],
+                "tool_call_parser": flags["tool_call_parser"],
+                "reasoning_parser": flags["reasoning_parser"],
+                "kv_cache_dtype": flags["kv_cache_dtype"],
+                "enable_auto_tool_choice": flags["enable_auto_tool_choice"],
+                "tool_calling_hint": flags["tool_calling_hint"],
+            }
+
+        # Any unmatched disk-mounter-* in a Pod is a partial deployment disagreement
+        for suffix, mounter in sorted(mounters_by_suffix.items()):
+            if suffix not in matched_suffixes:
+                partial_deployments.append(
+                    {
+                        "kind": "orphan_disk_mounter",
+                        "deployment_name": dep_name,
+                        "container_name": None,
+                        "served_model_id": None,
+                        "disk_name": mounter["disk_name"],
+                        "k8s_slug": mounter["k8s_slug"],
+                        "root_hash": mounter["root_hash"],
+                        "reason": (
+                            f"Privatemode Deployment '{dep_name}' has orphan initContainer "
+                            f"'{mounter['init_container']}' without matching container 'workload-{suffix}'"
+                        ),
+                    }
+                )
+
+    if not workloads and not partial_deployments:
+        raise CatalogSyncError("Privatemode deployment.yaml contains no model workloads")
+
+    return {
+        "workloads": workloads,
+        "partial_deployments": partial_deployments,
+    }
+
+
+def fetch_privatemode_models_yaml(
+    commit_sha: str,
+    *,
+    raw_base_url: str = DEFAULT_GITHUB_RAW_BASE_URL,
+    timeout: float = 15.0,
+    http_get: Callable[[str], str] | None = None,
+    allow_loopback_fixture: bool = False,
+) -> dict[str, dict[str, Any]]:
+    if not isinstance(commit_sha, str) or not HEX40_RE.match(commit_sha):
+        raise CatalogSyncError(f"Invalid 40-hex Privatemode commit SHA: {commit_sha!r}")
+    url = f"{raw_base_url.rstrip('/')}/{DEFAULT_PRIVATEMODE_REPO}/{commit_sha}/models.yaml"
+    validated_url = _validate_catalog_url(
+        url,
+        expected_https_host="raw.githubusercontent.com",
+        expected_path=f"/{DEFAULT_PRIVATEMODE_REPO}/{commit_sha}/models.yaml",
+        allow_loopback_fixture=allow_loopback_fixture,
+    )
+    getter = http_get or (lambda u: _http_get_text(u, timeout=timeout))
+    text = getter(validated_url)
+    return parse_privatemode_models_yaml(text)
+
+
+def fetch_privatemode_deployment_yaml(
+    commit_sha: str,
+    *,
+    raw_base_url: str = DEFAULT_GITHUB_RAW_BASE_URL,
+    timeout: float = 15.0,
+    http_get: Callable[[str], str] | None = None,
+    allow_loopback_fixture: bool = False,
+) -> dict[str, Any]:
+    if not isinstance(commit_sha, str) or not HEX40_RE.match(commit_sha):
+        raise CatalogSyncError(f"Invalid 40-hex Privatemode commit SHA: {commit_sha!r}")
+    url = f"{raw_base_url.rstrip('/')}/{DEFAULT_PRIVATEMODE_REPO}/{commit_sha}/deployment.yaml"
+    validated_url = _validate_catalog_url(
+        url,
+        expected_https_host="raw.githubusercontent.com",
+        expected_path=f"/{DEFAULT_PRIVATEMODE_REPO}/{commit_sha}/deployment.yaml",
+        allow_loopback_fixture=allow_loopback_fixture,
+    )
+    getter = http_get or (lambda u: _http_get_text(u, timeout=timeout))
+    text = getter(validated_url)
+    return parse_privatemode_deployment_yaml(text)
+
+
+def _parse_privatemode_launcher_argv(
+    serve_command: Any,
+    *,
+    served_id: str,
+) -> tuple[list[str], list[str]]:
+    """Validate Privatemode serve_command using serve-model's format + shlex.split semantics."""
+    if not isinstance(serve_command, str) or not serve_command.strip():
+        raise CatalogSyncError("Privatemode serve_command must be a non-empty string")
+    try:
+        rendered = serve_command.format(host="127.0.0.1", port=8082, repo=served_id)
+    except Exception as exc:
+        raise CatalogSyncError(f"Privatemode serve_command failed template formatting: {exc}") from exc
+    try:
+        cmd = shlex.split(rendered)
+    except ValueError as exc:
+        raise CatalogSyncError(f"Privatemode serve_command failed shlex.split: {exc}") from exc
+    if not cmd or cmd[0] != "./bin/privatemode-proxy":
+        raise CatalogSyncError(
+            f"Privatemode serve_command executable must be './bin/privatemode-proxy', got {cmd[0] if cmd else None!r}"
+        )
+
+    manifest_paths: list[str] = []
+    listen_hosts: list[str] = []
+    listen_ports: list[str] = []
+    after_double_dash = False
+    idx = 1
+    while idx < len(cmd):
+        tok = cmd[idx]
+        if tok == "--":
+            after_double_dash = True
+            idx += 1
+            continue
+        if after_double_dash:
+            if tok == "--manifest-path" or tok.startswith("--manifest-path="):
+                raise CatalogSyncError(
+                    "Privatemode serve_command places --manifest-path after '--' end-of-options"
+                )
+            idx += 1
+            continue
+        if tok == "--manifest-path":
+            if idx + 1 >= len(cmd):
+                raise CatalogSyncError("Privatemode serve_command has --manifest-path without value")
+            manifest_paths.append(cmd[idx + 1])
+            idx += 2
+            continue
+        if tok.startswith("--manifest-path="):
+            val = tok.split("=", 1)[1]
+            if not val:
+                raise CatalogSyncError("Privatemode serve_command has empty --manifest-path= value")
+            manifest_paths.append(val)
+            idx += 1
+            continue
+        if tok == "--listen-address":
+            if idx + 1 >= len(cmd):
+                raise CatalogSyncError("Privatemode serve_command has --listen-address without value")
+            listen_hosts.append(cmd[idx + 1])
+            idx += 2
+            continue
+        if tok.startswith("--listen-address="):
+            listen_hosts.append(tok.split("=", 1)[1])
+            idx += 1
+            continue
+        if tok == "--port":
+            if idx + 1 >= len(cmd):
+                raise CatalogSyncError("Privatemode serve_command has --port without value")
+            listen_ports.append(cmd[idx + 1])
+            idx += 2
+            continue
+        if tok.startswith("--port="):
+            listen_ports.append(tok.split("=", 1)[1])
+            idx += 1
+            continue
+        idx += 1
+
+    if not listen_hosts or any(h not in LOCAL_HOSTS for h in listen_hosts):
+        raise CatalogSyncError(
+            f"Privatemode serve_command must bind loopback --listen-address, got {listen_hosts!r}"
+        )
+    if listen_ports != ["8082"]:
+        raise CatalogSyncError(
+            f"Privatemode serve_command must bind single --port {{port}}, got {listen_ports!r}"
+        )
+    return cmd, manifest_paths
+
+
+def _project_privatemode_serve_command(
+    serve_command: str,
+    *,
+    old_tag: str,
+    new_tag: str,
+    served_id: str,
+) -> str:
+    _, paths = _parse_privatemode_launcher_argv(serve_command, served_id=served_id)
+    if len(paths) != 1:
+        raise CatalogSyncError(
+            f"Privatemode serve_command must specify exactly one --manifest-path (found {len(paths)})"
+        )
+    old_manifest = f"config/privatemode-manifest-{old_tag}.json"
+    new_manifest = f"config/privatemode-manifest-{new_tag}.json"
+    cur_manifest = paths[0]
+    if cur_manifest == new_manifest:
+        return serve_command
+    if cur_manifest != old_manifest:
+        raise CatalogSyncError(
+            f"Privatemode serve_command pins {cur_manifest!r}, expected {old_manifest!r} for tag '{old_tag}'"
+        )
+    if serve_command.count(old_manifest) != 1:
+        raise CatalogSyncError(
+            f"Privatemode serve_command must contain {old_manifest!r} exactly once for safe projection"
+        )
+    projected = serve_command.replace(old_manifest, new_manifest, 1)
+    _, proj_paths = _parse_privatemode_launcher_argv(projected, served_id=served_id)
+    if proj_paths != [new_manifest]:
+        raise CatalogSyncError(
+            f"Projected Privatemode serve_command failed validation: got manifest paths {proj_paths!r}"
+        )
+    return projected
+
+
+def _check_no_symlinks_under_root(repo_root: Path, rel_parts: tuple[str, ...]) -> Path:
+    resolved_root = repo_root.resolve()
+    cur = repo_root
+    for part in rel_parts:
+        cur = cur / part
+        if cur.is_symlink():
+            raise CatalogSyncError(f"Refusing symlink path component in Privatemode verification: {cur}")
+    if not cur.is_file():
+        raise CatalogSyncError(f"Missing regular file for Privatemode verification: {cur}")
+    resolved_target = cur.resolve()
+    try:
+        resolved_target.relative_to(resolved_root)
+    except ValueError as exc:
+        raise CatalogSyncError(
+            f"Refusing path outside repository root in Privatemode verification: {cur}"
+        ) from exc
+    return cur
+
+
+def _read_privatemode_builder_pins(
+    builder_path: Path,
+    *,
+    raw_bytes: bytes | None = None,
+) -> dict[str, str]:
+    """Read pinned PRIVATEMODE_* constants from scripts/build-privatemode-proxy via AST (no code execution)."""
+    try:
+        source = (
+            raw_bytes.decode("utf-8")
+            if raw_bytes is not None
+            else builder_path.read_text(encoding="utf-8")
+        )
+        tree = ast.parse(source, filename=str(builder_path))
+    except Exception as exc:
+        raise CatalogSyncError(f"Failed to AST-parse {builder_path}: {exc}") from exc
+
+    str_consts: dict[str, str] = {}
+    manifest_relpath: str | None = None
+
+    def _extract_root_div_parts(node: ast.AST) -> list[str] | None:
+        if isinstance(node, ast.Name) and node.id == "ROOT":
+            return []
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+            left_parts = _extract_root_div_parts(node.left)
+            if left_parts is not None and isinstance(node.right, ast.Constant) and isinstance(node.right.value, str):
+                return [*left_parts, node.right.value]
+        return None
+
+    for stmt in tree.body:
+        if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
+            name = stmt.targets[0].id
+            if isinstance(stmt.value, ast.Constant) and isinstance(stmt.value.value, str):
+                str_consts[name] = stmt.value.value
+            elif name == "COMMITTED_MANIFEST_PATH":
+                parts = _extract_root_div_parts(stmt.value)
+                if parts is not None and parts:
+                    manifest_relpath = "/".join(parts)
+
+    version = str_consts.get("PRIVATEMODE_VERSION")
+    source_commit = str_consts.get("PRIVATEMODE_SOURCE_COMMIT")
+    expected_sha = str_consts.get("EXPECTED_MANIFEST_SHA256")
+    if not isinstance(version, str) or not version.strip():
+        raise CatalogSyncError(f"{builder_path} is missing string literal PRIVATEMODE_VERSION")
+    if not isinstance(source_commit, str) or not HEX40_RE.match(source_commit):
+        raise CatalogSyncError(f"{builder_path} is missing valid 40-hex PRIVATEMODE_SOURCE_COMMIT")
+    if not isinstance(expected_sha, str) or not HEX64_RE.match(expected_sha):
+        raise CatalogSyncError(f"{builder_path} is missing valid 64-hex EXPECTED_MANIFEST_SHA256")
+    if not isinstance(manifest_relpath, str) or not manifest_relpath:
+        raise CatalogSyncError(
+            f"{builder_path} is missing literal ROOT / 'config' / ... COMMITTED_MANIFEST_PATH"
+        )
+    return {
+        "PRIVATEMODE_VERSION": version,
+        "PRIVATEMODE_SOURCE_COMMIT": source_commit,
+        "EXPECTED_MANIFEST_SHA256": expected_sha,
+        "COMMITTED_MANIFEST_RELPATH": manifest_relpath,
+    }
+
+
+def _verify_committed_privatemode_manifest(
+    repo_root: Path,
+    *,
+    target_tag: str,
+    expected_commit_sha: str | None,
+    projected_serve_command: str,
+    served_id: str,
+) -> dict[str, Any]:
+    """Prove committed manifest blob, builder pins, non-symlink paths, and projected launcher argv."""
+    if not isinstance(target_tag, str) or ".." in target_tag or not PRIVATEMODE_TAG_RE.match(target_tag):
+        raise CatalogSyncError(f"Invalid target Privatemode tag: {target_tag!r}")
+    if not isinstance(expected_commit_sha, str) or not HEX40_RE.match(expected_commit_sha):
+        raise CatalogSyncError(
+            f"Refusing Privatemode enclave_tag upgrade to '{target_tag}': "
+            "report provenance is missing immutable 40-hex commit_sha"
+        )
+    expected_manifest_rel = f"config/privatemode-manifest-{target_tag}.json"
+    _, manifest_paths = _parse_privatemode_launcher_argv(
+        projected_serve_command,
+        served_id=served_id,
+    )
+    if manifest_paths != [expected_manifest_rel]:
+        raise CatalogSyncError(
+            f"Refusing Privatemode enclave_tag upgrade to '{target_tag}': projected serve_command "
+            f"must specify exactly one --manifest-path={expected_manifest_rel!r} (got {manifest_paths!r})"
+        )
+
+    manifest_path = _check_no_symlinks_under_root(
+        repo_root, ("config", f"privatemode-manifest-{target_tag}.json")
+    )
+    builder_path = _check_no_symlinks_under_root(
+        repo_root, ("scripts", "build-privatemode-proxy")
+    )
+
+    # Capture both files once and bind AST pin extraction, manifest digest, and Git HEAD proof
+    # to those exact captured bytes against a single resolved HEAD commit.
+    builder_bytes = builder_path.read_bytes()
+    manifest_bytes = manifest_path.read_bytes()
+
+    pins = _read_privatemode_builder_pins(builder_path, raw_bytes=builder_bytes)
+    if f"v{pins['PRIVATEMODE_VERSION']}" != target_tag:
+        raise CatalogSyncError(
+            f"Refusing Privatemode enclave_tag upgrade to '{target_tag}': "
+            f"scripts/build-privatemode-proxy pins v{pins['PRIVATEMODE_VERSION']}"
+        )
+    if pins["PRIVATEMODE_SOURCE_COMMIT"] != expected_commit_sha:
+        raise CatalogSyncError(
+            f"Refusing Privatemode enclave_tag upgrade to '{target_tag}': "
+            f"scripts/build-privatemode-proxy PRIVATEMODE_SOURCE_COMMIT={pins['PRIVATEMODE_SOURCE_COMMIT']} "
+            f"does not match snapshot commit_sha={expected_commit_sha}"
+        )
+    if pins["COMMITTED_MANIFEST_RELPATH"] != expected_manifest_rel:
+        raise CatalogSyncError(
+            f"Refusing Privatemode enclave_tag upgrade to '{target_tag}': "
+            f"scripts/build-privatemode-proxy COMMITTED_MANIFEST_PATH is {pins['COMMITTED_MANIFEST_RELPATH']!r}, "
+            f"expected {expected_manifest_rel!r}"
+        )
+
+    actual_sha = hashlib.sha256(manifest_bytes).hexdigest()
+    if actual_sha != pins["EXPECTED_MANIFEST_SHA256"]:
+        raise CatalogSyncError(
+            f"Refusing Privatemode enclave_tag upgrade to '{target_tag}': "
+            f"manifest SHA-256 {actual_sha} does not match builder EXPECTED_MANIFEST_SHA256 {pins['EXPECTED_MANIFEST_SHA256']}"
+        )
+    manifest_obj = _strict_json_loads(
+        manifest_bytes.decode("utf-8"),
+        context=f"committed manifest {expected_manifest_rel}",
+        reject_duplicate_keys=True,
+    )
+    if (
+        not isinstance(manifest_obj, dict)
+        or not manifest_obj.get("ReferenceValues")
+        or not manifest_obj.get("Policies")
+    ):
+        raise CatalogSyncError(
+            f"Refusing Privatemode enclave_tag upgrade to '{target_tag}': "
+            f"{expected_manifest_rel} is missing non-empty ReferenceValues or Policies"
+        )
+
+    # Verify both manifest and builder are tracked, clean in git status, and byte-identical to one resolved HEAD commit
+    builder_rel = "scripts/build-privatemode-proxy"
+    try:
+        status_proc = subprocess.run(
+            ["git", "-C", str(repo_root), "status", "--porcelain", "--", expected_manifest_rel, builder_rel],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except Exception as exc:
+        raise CatalogSyncError(
+            f"Refusing Privatemode enclave_tag upgrade to '{target_tag}': git status check failed in {repo_root}: {exc}"
+        ) from exc
+    if status_proc.stdout.strip():
+        raise CatalogSyncError(
+            f"Refusing Privatemode enclave_tag upgrade to '{target_tag}': "
+            f"{expected_manifest_rel} or {builder_rel} has uncommitted or untracked git changes"
+        )
+
+    try:
+        head_proc = subprocess.run(
+            ["git", "-C", str(repo_root), "rev-parse", "--verify", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except Exception as exc:
+        raise CatalogSyncError(
+            f"Refusing Privatemode enclave_tag upgrade to '{target_tag}': git rev-parse HEAD failed in {repo_root}: {exc}"
+        ) from exc
+    head_sha = head_proc.stdout.strip()
+    if not HEX40_RE.match(head_sha):
+        raise CatalogSyncError(
+            f"Refusing Privatemode enclave_tag upgrade to '{target_tag}': invalid HEAD commit SHA {head_sha!r}"
+        )
+    for rel_path, disk_bytes in (
+        (expected_manifest_rel, manifest_bytes),
+        (builder_rel, builder_bytes),
+    ):
+        try:
+            show_proc = subprocess.run(
+                ["git", "-C", str(repo_root), "show", f"{head_sha}:{rel_path}"],
+                check=True,
+                capture_output=True,
+            )
+        except Exception as exc:
+            raise CatalogSyncError(
+                f"Refusing Privatemode enclave_tag upgrade to '{target_tag}': "
+                f"{rel_path} is not committed in HEAD {head_sha} ({exc})"
+            ) from exc
+        if show_proc.stdout != disk_bytes:
+            raise CatalogSyncError(
+                f"Refusing Privatemode enclave_tag upgrade to '{target_tag}': "
+                f"{rel_path} on disk does not match committed HEAD blob ({head_sha})"
+            )
+
+    return {
+        "repo_root": repo_root,
+        "target_tag": target_tag,
+        "head_sha": head_sha,
+        "manifest_rel": expected_manifest_rel,
+        "builder_rel": builder_rel,
+        "manifest_bytes": manifest_bytes,
+        "builder_bytes": builder_bytes,
+    }
+
+
+def _reverify_committed_privatemode_proof(proof: dict[str, Any]) -> None:
+    """Re-verify captured manifest/builder bytes and resolved HEAD immediately before catalog replacement."""
+    repo_root: Path = proof["repo_root"]
+    target_tag: str = proof["target_tag"]
+    head_sha: str = proof["head_sha"]
+    manifest_rel: str = proof["manifest_rel"]
+    builder_rel: str = proof["builder_rel"]
+
+    def _check_head() -> None:
+        try:
+            head_proc = subprocess.run(
+                ["git", "-C", str(repo_root), "rev-parse", "--verify", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except Exception as exc:
+            raise CatalogSyncError(
+                f"Aborting catalog update: git rev-parse HEAD failed before write ({exc})"
+            ) from exc
+        if head_proc.stdout.strip() != head_sha:
+            raise CatalogSyncError(
+                f"Aborting catalog update: repository HEAD changed concurrently from {head_sha} to {head_proc.stdout.strip()}"
+            )
+
+    _check_head()
+    try:
+        status_proc = subprocess.run(
+            ["git", "-C", str(repo_root), "status", "--porcelain", "--", manifest_rel, builder_rel],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except Exception as exc:
+        raise CatalogSyncError(
+            f"Aborting catalog update: git status check failed before write ({exc})"
+        ) from exc
+    if status_proc.stdout.strip():
+        raise CatalogSyncError(
+            f"Aborting catalog update: {manifest_rel} or {builder_rel} became dirty concurrently before write"
+        )
+    # Re-verify bound HEAD after git status, then verify non-symlink paths and captured proof-file
+    # bytes AFTER the final Git subprocess (immediately before the catalog byte guard and os.replace)
+    # so a working-copy edit during the last Git command cannot slip past.
+    _check_head()
+    manifest_path = _check_no_symlinks_under_root(
+        repo_root, ("config", f"privatemode-manifest-{target_tag}.json")
+    )
+    builder_path = _check_no_symlinks_under_root(
+        repo_root, ("scripts", "build-privatemode-proxy")
+    )
+    if manifest_path.read_bytes() != proof["manifest_bytes"]:
+        raise CatalogSyncError(
+            f"Aborting catalog update: {manifest_rel} changed concurrently before catalog replacement"
+        )
+    if builder_path.read_bytes() != proof["builder_bytes"]:
+        raise CatalogSyncError(
+            f"Aborting catalog update: {builder_rel} changed concurrently before catalog replacement"
+        )
 
 
 def _demote_routing_and_preserve_evidence(model: dict[str, Any], *, new_status: str) -> dict[str, Any]:
@@ -772,6 +2115,7 @@ def compute_catalog_drift(
     observed_date: str | None = None,
     discover_new_coding_models: bool = True,
     ignored_served_ids: set[str] | None = None,
+    ignored_router_only_nonchat_ids: set[str] | frozenset[str] | None = None,
     fetch_budget: list[int] | None = None,
 ) -> CatalogDriftReport:
     """Compare models.yaml against live Tinfoil router, /v1/models, and per-enclave tinfoil-config.yml."""
@@ -939,7 +2283,10 @@ def compute_catalog_drift(
                     )
                 continue
 
-        assert r_entry is not None and o_entry is not None
+        if r_entry is None or o_entry is None:
+            raise CatalogSyncError(
+                f"Internal error: missing router or OpenAI entry for '{served_id}' after disagreement check"
+            )
         enclave_repo = str(r_entry.get("repo") or "").strip()
         enclave_tag = str(r_entry.get("tag") or "").strip()
         if not enclave_tag:
@@ -1157,8 +2504,18 @@ def compute_catalog_drift(
             report.new_models.append(candidate_entry)
 
         # Symmetric discovery disagreement check: unregistered non-ignored model in router_manifest with healthy >= 1 missing from /v1/models
+        router_only_ignore_set = (
+            set(DEFAULT_IGNORED_ROUTER_ONLY_NONCHAT_IDS)
+            if ignored_router_only_nonchat_ids is None
+            else set(ignored_router_only_nonchat_ids)
+        )
         for served_id in sorted(router_map.keys()):
-            if served_id in registered_served_ids or served_id in ignore_set or served_id in oai_map:
+            if (
+                served_id in registered_served_ids
+                or served_id in ignore_set
+                or served_id in router_only_ignore_set
+                or served_id in oai_map
+            ):
                 continue
             r_entry = router_map[served_id]
             healthy_count = int((r_entry.get("verification") or {}).get("healthy") or 0)
@@ -1181,6 +2538,683 @@ def compute_catalog_drift(
                 )
 
     return report
+
+
+def compute_privatemode_catalog_drift(
+    models_data: dict[str, Any],
+    release_tag: str,
+    models_disk_map: dict[str, dict[str, Any]],
+    deployment_data: dict[str, Any],
+    *,
+    observed_date: str | None = None,
+    discover_new_coding_models: bool = True,
+    ignored_served_ids: set[str] | frozenset[str] | None = None,
+    provenance: dict[str, Any] | None = None,
+) -> CatalogDriftReport:
+    """Compare Privatemode models in models.yaml against snapshot-pinned models.yaml and deployment.yaml."""
+    if not isinstance(models_data, dict) or not isinstance(models_data.get("models"), list):
+        raise CatalogSyncError("models_data must be a mapping with a 'models' list")
+    if not isinstance(release_tag, str) or ".." in release_tag or not PRIVATEMODE_TAG_RE.match(release_tag):
+        raise CatalogSyncError(f"Invalid Privatemode release_tag: {release_tag!r}")
+    if not isinstance(models_disk_map, dict) or not models_disk_map:
+        raise CatalogSyncError("Privatemode models_disk_map must be a non-empty mapping")
+    if not isinstance(deployment_data, dict) or not isinstance(deployment_data.get("workloads"), dict):
+        raise CatalogSyncError("Privatemode deployment_data must be a mapping with 'workloads'")
+
+    today_str = observed_date or datetime.date.today().isoformat()
+    if not ISO_DATE_RE.match(today_str):
+        raise CatalogSyncError(f"Invalid observed_date '{today_str}'; expected YYYY-MM-DD")
+
+    workloads: dict[str, dict[str, Any]] = deployment_data["workloads"]
+    partial_deployments: list[dict[str, Any]] = list(deployment_data.get("partial_deployments") or [])
+
+    # Index aliases -> primary served_model_id and models_disk_map by disk_key
+    alias_to_primary: dict[str, str] = {}
+    for primary_id, wl in workloads.items():
+        for alias in wl.get("aliases") or []:
+            alias_to_primary[alias] = primary_id
+
+    disks_by_key: dict[str, dict[str, Any]] = {}
+    for root_hex, d_entry in models_disk_map.items():
+        if isinstance(d_entry, dict) and isinstance(d_entry.get("disk_key"), str):
+            disks_by_key[d_entry["disk_key"]] = d_entry
+
+    report = CatalogDriftReport(
+        observed_date=today_str,
+        base_catalog_sha256=compute_models_data_digest(models_data),
+        providers=["privatemode"],
+        provenance={"privatemode": copy.deepcopy(provenance)} if provenance is not None else None,
+    )
+
+    all_existing_by_id: dict[str, dict[str, Any]] = {}
+    all_existing_by_repo: dict[str, dict[str, Any]] = {}
+    registered_pm_by_served: dict[str, dict[str, Any]] = {}
+    registered_pm_by_disk: dict[str, list[dict[str, Any]]] = {}
+
+    for m in models_data["models"]:
+        if not isinstance(m, dict):
+            continue
+        mid_raw = str(m.get("id") or "").strip()
+        mrepo_raw = str(m.get("repo") or "").strip()
+        if mid_raw:
+            all_existing_by_id[mid_raw] = m
+        if mrepo_raw:
+            all_existing_by_repo[mrepo_raw] = m
+        if is_privatemode_managed_model(m):
+            served_key = mrepo_raw or mid_raw
+            registered_pm_by_served[served_key] = m
+            registered_pm_by_disk.setdefault(_privatemode_expected_disk_name(served_key), []).append(m)
+
+    # Helper: true if served_key already has a coherent active workload in this snapshot
+    def _has_coherent_primary_workload(served_key: str) -> bool:
+        wl = workloads.get(served_key)
+        if wl is None:
+            prim = alias_to_primary.get(served_key)
+            if prim is not None:
+                wl = workloads.get(prim)
+        if wl is None:
+            return False
+        wl_disk = models_disk_map.get(wl["root_hash"])
+        if wl_disk is None:
+            return False
+        return _privatemode_disk_identity_matches(wl["served_model_id"], wl["k8s_slug"], wl_disk)
+
+    # Step A: Partial deployments (spec.replicas == 0 or orphan disk-mounter-*) become disagreements before update/removal checks.
+    # For zero-replica workloads, match ONLY by exact full primary served_model_id (never fall back to disk leaf).
+    # For orphan disk-mounters (no workload primary ID), require a unique registered candidate supported by cross-feed disk identity
+    # that does NOT already have a coherent active primary workload in the same snapshot.
+    disagreed_registered_ids: set[str] = set()
+    for p_dep in partial_deployments:
+        p_kind = str(p_dep.get("kind") or "").strip()
+        if not p_kind:
+            p_kind = "zero_replicas" if p_dep.get("container_name") else "orphan_disk_mounter"
+        p_served = str(p_dep.get("served_model_id") or "").strip()
+        p_disk = str(p_dep.get("disk_name") or "").strip()
+        p_root = str(p_dep.get("root_hash") or "").strip()
+        p_k8s_slug = str(
+            p_dep.get("k8s_slug") or re.sub(r"[^a-z0-9]+", "-", p_disk.lower()).strip("-")
+        )
+        base_reason = str(
+            p_dep.get("reason")
+            or f"Partial Privatemode deployment for '{p_served or p_disk or 'unknown'}'"
+        )
+
+        matched_reg: dict[str, Any] | None = None
+        extra_note = ""
+
+        if p_kind == "zero_replicas":
+            if p_served:
+                matched_reg = registered_pm_by_served.get(p_served)
+        else:
+            disk_candidates = registered_pm_by_disk.get(p_disk) or []
+            disk_entry = models_disk_map.get(p_root) if p_root else None
+            supported: list[dict[str, Any]] = []
+            coherent_primary_ids: list[str] = []
+            if disk_candidates and disk_entry is not None:
+                upstream = str(disk_entry.get("upstream") or "")
+                up_org = upstream.split("/", 1)[0].lower() if "/" in upstream else ""
+                for cand in disk_candidates:
+                    cand_served = str(cand.get("repo") or cand.get("id") or "").strip()
+                    if not _privatemode_disk_identity_matches(cand_served, p_k8s_slug, disk_entry):
+                        continue
+                    if cand_served not in PRIVATEMODE_AUTHORITATIVE_DISK_KEYS:
+                        rt = cand.get("remote_trust") if isinstance(cand.get("remote_trust"), dict) else {}
+                        pinned_src = str(rt.get("provider_manifest_weights_source") or "").strip()
+                        pinned_repo = pinned_src.split("@", 1)[0].lower() if "@" in pinned_src else ""
+                        pinned_whash = str(rt.get("provider_manifest_weights_hash") or "").strip().lower()
+                        expected_whash = f"dmverity:sha256:{p_root}".lower()
+                        if pinned_repo and pinned_repo != upstream.lower():
+                            continue
+                        if "/" in cand_served:
+                            cand_org = cand_served.split("/", 1)[0].lower()
+                            if cand_org != up_org and pinned_repo != upstream.lower() and pinned_whash != expected_whash:
+                                continue
+                        else:
+                            # Unqualified non-authoritative model requires positive upstream or hash pin match
+                            if pinned_repo != upstream.lower() and pinned_whash != expected_whash:
+                                continue
+                    if _has_coherent_primary_workload(cand_served):
+                        coherent_primary_ids.append(str(cand.get("id") or cand_served))
+                        continue
+                    supported.append(cand)
+            if len(supported) == 1 and not coherent_primary_ids:
+                matched_reg = supported[0]
+            elif coherent_primary_ids:
+                ids_str = ", ".join(sorted(set(coherent_primary_ids)))
+                extra_note = (
+                    f" (detached orphan kept unscoped for quarantine because coherent primary workload exists for: {ids_str})"
+                )
+            elif len(supported) > 1:
+                cand_ids = ", ".join(sorted(str(c.get("id") or "") for c in supported))
+                extra_note = f" (ambiguous across registered models: {cand_ids})"
+
+        if matched_reg is not None:
+            reg_id = str(matched_reg.get("id") or "").strip()
+            reg_served = str(matched_reg.get("repo") or reg_id).strip()
+            if reg_id not in disagreed_registered_ids:
+                disagreed_registered_ids.add(reg_id)
+                report.disagreements.append(
+                    FeedDisagreementItem(
+                        model_id=reg_id,
+                        served_model_id=reg_served,
+                        in_router_manifest=None,
+                        in_openai_models=None,
+                        router_healthy=None,
+                        reason=base_reason,
+                        registered=True,
+                        provider="privatemode",
+                        feed_summary="deployment.yaml vs models.yaml",
+                    )
+                )
+        else:
+            unreg_served = p_served if p_kind == "zero_replicas" and p_served else (p_disk or p_served or "unknown")
+            cand_id = _privatemode_candidate_id(unreg_served)
+            report.disagreements.append(
+                FeedDisagreementItem(
+                    model_id=cand_id,
+                    served_model_id=unreg_served,
+                    in_router_manifest=None,
+                    in_openai_models=None,
+                    router_healthy=None,
+                    reason=f"{base_reason}{extra_note}",
+                    registered=False,
+                    provider="privatemode",
+                    feed_summary="deployment.yaml vs models.yaml",
+                )
+            )
+
+    registered_served_ids: set[str] = set()
+
+    # Step B: Registered Privatemode models
+    for model in models_data["models"]:
+        if not is_privatemode_managed_model(model):
+            continue
+        model_id = str(model.get("id") or "").strip()
+        served_id = str(model.get("repo") or model_id).strip()
+        registered_served_ids.add(served_id)
+
+        if model_id in disagreed_registered_ids:
+            continue
+
+        # Validate local serve_command launcher argv
+        serve_cmd = model.get("serve_command")
+        try:
+            _, manifest_paths = _parse_privatemode_launcher_argv(serve_cmd, served_id=served_id)
+            if len(manifest_paths) != 1:
+                raise CatalogSyncError(
+                    f"Privatemode model '{model_id}' serve_command must specify exactly one --manifest-path "
+                    f"(found {len(manifest_paths)})"
+                )
+        except CatalogSyncError as exc:
+            report.disagreements.append(
+                FeedDisagreementItem(
+                    model_id=model_id,
+                    served_model_id=served_id,
+                    in_router_manifest=None,
+                    in_openai_models=None,
+                    router_healthy=None,
+                    reason=str(exc),
+                    registered=True,
+                    provider="privatemode",
+                    feed_summary="deployment.yaml vs models.yaml",
+                )
+            )
+            continue
+        cur_manifest_path = manifest_paths[0]
+
+        wl = workloads.get(served_id)
+        if wl is None:
+            # Check if primary served_id moved to an alias of another workload
+            alias_primary = alias_to_primary.get(served_id)
+            if alias_primary is not None:
+                report.disagreements.append(
+                    FeedDisagreementItem(
+                        model_id=model_id,
+                        served_model_id=served_id,
+                        in_router_manifest=None,
+                        in_openai_models=None,
+                        router_healthy=None,
+                        reason=(
+                            f"Privatemode model '{served_id}' is no longer a primary --served-model-name "
+                            f"(now an alias of '{alias_primary}' at {release_tag})"
+                        ),
+                        registered=True,
+                        provider="privatemode",
+                        feed_summary="deployment.yaml vs models.yaml",
+                    )
+                )
+                continue
+
+            # Check whether the model's disk is still provisioned in models.yaml (one-sided disagreement vs confirmed removal)
+            rt = model.get("remote_trust") or {}
+            old_wh = str(rt.get("provider_manifest_weights_hash") or "")
+            old_root = old_wh.removeprefix("dmverity:sha256:") if old_wh.startswith("dmverity:sha256:") else ""
+            old_upstream = str(model.get("upstream") or "").strip()
+            old_disk_key = _canonical_privatemode_disk_key(old_upstream) if old_upstream else ""
+            still_in_disks = (bool(old_root) and old_root in models_disk_map) or (
+                bool(old_disk_key) and old_disk_key in disks_by_key
+            )
+            if still_in_disks:
+                report.disagreements.append(
+                    FeedDisagreementItem(
+                        model_id=model_id,
+                        served_model_id=served_id,
+                        in_router_manifest=None,
+                        in_openai_models=None,
+                        router_healthy=None,
+                        reason=(
+                            f"Privatemode model '{served_id}' is absent from deployment.yaml ({release_tag}) "
+                            "but its model disk is still present in models.yaml"
+                        ),
+                        registered=True,
+                        provider="privatemode",
+                        feed_summary="deployment.yaml vs models.yaml",
+                    )
+                )
+                continue
+
+            # Absent from BOTH deployment.yaml and models.yaml -> confirmed removal
+            if (
+                model.get("status") != "archived"
+                or (model.get("routing") or {}).get("private_attested") != "blocked"
+            ):
+                sim_model = copy.deepcopy(model)
+                changes = _demote_routing_and_preserve_evidence(sim_model, new_status="archived")
+                report.removed_models.append(
+                    ModelDriftItem(
+                        model_id=model_id,
+                        served_model_id=served_id,
+                        action="archive_removed",
+                        changes=changes,
+                        notes=[
+                            f"Absent from both edgelesssys/privatemode-public deployment.yaml and models.yaml at {release_tag}"
+                        ],
+                        provider="privatemode",
+                    )
+                )
+            continue
+
+        # Cross-feed join: root_hash + authoritative disk identity
+        disk_entry = models_disk_map.get(wl["root_hash"])
+        if disk_entry is None:
+            report.disagreements.append(
+                FeedDisagreementItem(
+                    model_id=model_id,
+                    served_model_id=served_id,
+                    in_router_manifest=None,
+                    in_openai_models=None,
+                    router_healthy=None,
+                    reason=(
+                        f"Privatemode deployment.yaml ({release_tag}) mounts root_hash {wl['root_hash']} "
+                        f"for '{served_id}' which is absent from models.yaml"
+                    ),
+                    registered=True,
+                    provider="privatemode",
+                    feed_summary="deployment.yaml vs models.yaml",
+                )
+            )
+            continue
+        if not _privatemode_disk_identity_matches(served_id, wl["k8s_slug"], disk_entry):
+            report.disagreements.append(
+                FeedDisagreementItem(
+                    model_id=model_id,
+                    served_model_id=served_id,
+                    in_router_manifest=None,
+                    in_openai_models=None,
+                    router_healthy=None,
+                    reason=(
+                        f"Privatemode cross-feed disk identity mismatch at {release_tag}: "
+                        f"workload '{served_id}' (pod slug '{wl['k8s_slug']}') mounted root_hash {wl['root_hash']} "
+                        f"belonging to models.yaml disk '{disk_entry['disk_key']}'"
+                    ),
+                    registered=True,
+                    provider="privatemode",
+                    feed_summary="deployment.yaml vs models.yaml",
+                )
+            )
+            continue
+
+        old_tag = str(model.get("enclave_tag") or "").strip()
+        expected_old_manifest = f"config/privatemode-manifest-{old_tag}.json" if old_tag else ""
+        expected_new_manifest = f"config/privatemode-manifest-{release_tag}.json"
+        if old_tag == release_tag:
+            if cur_manifest_path != expected_new_manifest:
+                report.disagreements.append(
+                    FeedDisagreementItem(
+                        model_id=model_id,
+                        served_model_id=served_id,
+                        in_router_manifest=None,
+                        in_openai_models=None,
+                        router_healthy=None,
+                        reason=(
+                            f"Privatemode model '{model_id}' pins enclave_tag='{old_tag}' but "
+                            f"serve_command --manifest-path is {cur_manifest_path!r} (expected {expected_new_manifest!r})"
+                        ),
+                        registered=True,
+                        provider="privatemode",
+                        feed_summary="deployment.yaml vs models.yaml",
+                    )
+                )
+                continue
+        else:
+            if cur_manifest_path not in (expected_old_manifest, expected_new_manifest):
+                report.disagreements.append(
+                    FeedDisagreementItem(
+                        model_id=model_id,
+                        served_model_id=served_id,
+                        in_router_manifest=None,
+                        in_openai_models=None,
+                        router_healthy=None,
+                        reason=(
+                            f"Privatemode model '{model_id}' serve_command --manifest-path {cur_manifest_path!r} "
+                            f"matches neither pinned tag '{old_tag}' nor upstream tag '{release_tag}'"
+                        ),
+                        registered=True,
+                        provider="privatemode",
+                        feed_summary="deployment.yaml vs models.yaml",
+                    )
+                )
+                continue
+
+        changes = {}
+        notes: list[str] = []
+        action = "update"
+
+        rt = model.get("remote_trust") or {}
+        old_hash = rt.get("provider_manifest_weights_hash")
+        new_hash = disk_entry["weights_hash"]
+        old_source = rt.get("provider_manifest_weights_source")
+        new_source = disk_entry["weights_source"]
+
+        weights_changed = (old_hash != new_hash) or (old_source != new_source)
+        if old_hash != new_hash:
+            changes["remote_trust.provider_manifest_weights_hash"] = {"from": old_hash, "to": new_hash}
+        if old_source != new_source:
+            changes["remote_trust.provider_manifest_weights_source"] = {"from": old_source, "to": new_source}
+        if model.get("upstream") != disk_entry["upstream"]:
+            changes["upstream"] = {"from": model.get("upstream"), "to": disk_entry["upstream"]}
+        if (
+            model.get("disk_gb_estimate") is not None
+            and model.get("disk_gb_estimate") != disk_entry["disk_gb_estimate"]
+        ):
+            changes["disk_gb_estimate"] = {
+                "from": model.get("disk_gb_estimate"),
+                "to": disk_entry["disk_gb_estimate"],
+            }
+        if (
+            isinstance(wl.get("max_model_len"), int)
+            and not isinstance(wl.get("max_model_len"), bool)
+            and wl["max_model_len"] > 0
+            and model.get("context_window") != wl["max_model_len"]
+        ):
+            changes["context_window"] = {"from": model.get("context_window"), "to": wl["max_model_len"]}
+
+        tag_changed = old_tag != release_tag
+        if tag_changed:
+            changes["enclave_tag"] = {"from": model.get("enclave_tag"), "to": release_tag}
+            if cur_manifest_path != expected_new_manifest:
+                projected_cmd = _project_privatemode_serve_command(
+                    str(serve_cmd),
+                    old_tag=old_tag,
+                    new_tag=release_tag,
+                    served_id=served_id,
+                )
+                if projected_cmd != serve_cmd:
+                    changes["serve_command"] = {"from": serve_cmd, "to": projected_cmd}
+            notes.append(
+                f"Privatemode Contrast release changed ({old_tag or 'unset'} -> {release_tag}); "
+                f"commit verified {expected_new_manifest} and scripts/build-privatemode-proxy pins, "
+                "then run ./scripts/build-privatemode-proxy --verify and re-evaluate before re-clearing."
+            )
+
+        if weights_changed:
+            sim_model = copy.deepcopy(model)
+            demote_changes = _demote_routing_and_preserve_evidence(sim_model, new_status="candidate")
+            if demote_changes:
+                action = "demote_weights_changed"
+                changes.update(demote_changes)
+                notes.append(
+                    "Demoted to candidate/blocked because provider_manifest_weights_hash or source changed"
+                )
+        elif tag_changed:
+            action = "manifest_upgrade_required"
+            sim_model = copy.deepcopy(model)
+            demote_changes = _demote_routing_and_preserve_evidence(sim_model, new_status="candidate")
+            if demote_changes:
+                changes.update(demote_changes)
+                notes.append(
+                    "Applying Contrast release upgrade requires clearance demotion until re-attested on the new manifest"
+                )
+
+        if changes:
+            report.updated_models.append(
+                ModelDriftItem(
+                    model_id=model_id,
+                    served_model_id=served_id,
+                    action=action,
+                    changes=changes,
+                    notes=notes,
+                    weights_changed=weights_changed,
+                    provider="privatemode",
+                )
+            )
+
+    # Step C: New Privatemode coding-candidate discovery hint
+    if discover_new_coding_models:
+        ignore_set = (
+            set(DEFAULT_PRIVATEMODE_IGNORED_SERVED_IDS)
+            if ignored_served_ids is None
+            else set(ignored_served_ids)
+        )
+        proposed_ids: set[str] = set()
+        proposed_repos: set[str] = set()
+        for served_id in sorted(workloads.keys()):
+            if served_id in registered_served_ids or served_id in ignore_set:
+                continue
+            wl = workloads[served_id]
+            if wl.get("tool_calling_hint") is not True:
+                continue
+            candidate_id = _privatemode_candidate_id(served_id)
+            if candidate_id in all_existing_by_id:
+                colliding = all_existing_by_id[candidate_id]
+                raise CatalogSyncError(
+                    f"Discovered Privatemode model '{served_id}' (candidate id '{candidate_id}') collides with "
+                    f"existing catalog entry id='{colliding.get('id')}' "
+                    f"(repo='{colliding.get('repo')}', runtime='{colliding.get('runtime')}')"
+                )
+            if served_id in all_existing_by_repo:
+                colliding_r = all_existing_by_repo[served_id]
+                raise CatalogSyncError(
+                    f"Discovered Privatemode model '{served_id}' collides with existing catalog entry "
+                    f"id='{colliding_r.get('id')}' sharing repo='{served_id}'"
+                )
+            if candidate_id in proposed_ids:
+                raise CatalogSyncError(
+                    f"Discovered Privatemode model '{served_id}' produces duplicate candidate id '{candidate_id}'"
+                )
+            if served_id in proposed_repos:
+                raise CatalogSyncError(
+                    f"Discovered Privatemode model '{served_id}' produces duplicate candidate repo '{served_id}'"
+                )
+
+            disk_entry = models_disk_map.get(wl["root_hash"])
+            if disk_entry is None:
+                report.disagreements.append(
+                    FeedDisagreementItem(
+                        model_id=candidate_id,
+                        served_model_id=served_id,
+                        in_router_manifest=None,
+                        in_openai_models=None,
+                        router_healthy=None,
+                        reason=(
+                            f"Unregistered Privatemode workload '{served_id}' ({release_tag}) mounts "
+                            f"root_hash {wl['root_hash']} which is absent from models.yaml"
+                        ),
+                        registered=False,
+                        provider="privatemode",
+                        feed_summary="deployment.yaml vs models.yaml",
+                    )
+                )
+                continue
+            if not _privatemode_disk_identity_matches(served_id, wl["k8s_slug"], disk_entry):
+                report.disagreements.append(
+                    FeedDisagreementItem(
+                        model_id=candidate_id,
+                        served_model_id=served_id,
+                        in_router_manifest=None,
+                        in_openai_models=None,
+                        router_healthy=None,
+                        reason=(
+                            f"Unregistered Privatemode workload '{served_id}' (pod slug '{wl['k8s_slug']}') "
+                            f"mounted root_hash {wl['root_hash']} belonging to mismatched models.yaml disk "
+                            f"'{disk_entry['disk_key']}'"
+                        ),
+                        registered=False,
+                        provider="privatemode",
+                        feed_summary="deployment.yaml vs models.yaml",
+                    )
+                )
+                continue
+
+            proposed_ids.add(candidate_id)
+            proposed_repos.add(served_id)
+            report.new_models.append(
+                {
+                    "id": candidate_id,
+                    "provider": "privatemode",
+                    "manual_onboarding_required": True,
+                    "status": "candidate",
+                    "repo": served_id,
+                    "upstream": disk_entry["upstream"],
+                    "converter": "edgelesssys",
+                    "conversion_runtime_version": "vllm",
+                    "runtime": "proxy",
+                    "enclave_repo": DEFAULT_PRIVATEMODE_REPO,
+                    "enclave_tag": release_tag,
+                    "disk_key": disk_entry["disk_key"],
+                    "disk_gb_estimate": disk_entry["disk_gb_estimate"],
+                    "context_window": wl.get("max_model_len"),
+                    "capabilities": {"tool_calling": True},
+                    "routing": {
+                        "private_local": "blocked",
+                        "private_attested": "blocked",
+                    },
+                    "remote_trust": {
+                        "tier": "enclave_runtime_attested",
+                        "attestation_method": PRIVATEMODE_ATTESTATION_METHOD,
+                        "weights_hash": None,
+                        "weights_source": None,
+                        "provider_manifest_weights_hash": disk_entry["weights_hash"],
+                        "provider_manifest_weights_source": disk_entry["weights_source"],
+                        "usage_policy": "provider_terms_apply",
+                        "jurisdiction": "DE/EU",
+                        "pricing_per_m_tokens": None,
+                    },
+                }
+            )
+
+    return report
+
+
+def merge_drift_reports(reports: list[CatalogDriftReport]) -> CatalogDriftReport:
+    """Deterministically merge provider drift reports after enforcing shared snapshot identity and uniqueness."""
+    if not reports:
+        raise CatalogSyncError("merge_drift_reports requires at least one CatalogDriftReport")
+
+    first = reports[0]
+    if not isinstance(first.base_catalog_sha256, str) or not first.base_catalog_sha256:
+        raise CatalogSyncError("merge_drift_reports requires a non-null base_catalog_sha256 on every report")
+    observed_date = first.observed_date
+    base_sha = first.base_catalog_sha256
+
+    merged_providers: list[str] = []
+    merged_provenance: dict[str, Any] = {}
+    merged_updates: list[ModelDriftItem] = []
+    merged_removed: list[ModelDriftItem] = []
+    merged_new: list[dict[str, Any]] = []
+    merged_disagreements: list[FeedDisagreementItem] = []
+
+    seen_registered_targets: dict[str, str] = {}
+    seen_new_ids: set[str] = set()
+    seen_new_repos: set[str] = set()
+
+    for rep in reports:
+        if rep.observed_date != observed_date:
+            raise CatalogSyncError(
+                f"Cannot merge drift reports with different observed_date values: "
+                f"{observed_date!r} vs {rep.observed_date!r}"
+            )
+        if not isinstance(rep.base_catalog_sha256, str) or rep.base_catalog_sha256 != base_sha:
+            raise CatalogSyncError(
+                f"Cannot merge drift reports with missing or mismatched base_catalog_sha256: "
+                f"{base_sha!r} vs {rep.base_catalog_sha256!r}"
+            )
+        rep_providers = list(rep.providers) if rep.providers is not None else ["tinfoil"]
+        for p in rep_providers:
+            if p not in merged_providers:
+                merged_providers.append(p)
+        if isinstance(rep.provenance, dict):
+            for pk, pv in rep.provenance.items():
+                if pk in merged_provenance:
+                    raise CatalogSyncError(f"Duplicate provenance entry for provider '{pk}' in merge")
+                merged_provenance[pk] = copy.deepcopy(pv)
+
+        for item in rep.updated_models:
+            prev_bucket = seen_registered_targets.get(item.model_id)
+            if prev_bucket is not None:
+                raise CatalogSyncError(
+                    f"Conflicting or duplicate drift target '{item.model_id}' across/within {prev_bucket} and updated_models"
+                )
+            seen_registered_targets[item.model_id] = "updated_models"
+            merged_updates.append(copy.deepcopy(item))
+
+        for item in rep.removed_models:
+            prev_bucket = seen_registered_targets.get(item.model_id)
+            if prev_bucket is not None:
+                raise CatalogSyncError(
+                    f"Conflicting or duplicate drift target '{item.model_id}' across/within {prev_bucket} and removed_models"
+                )
+            seen_registered_targets[item.model_id] = "removed_models"
+            merged_removed.append(copy.deepcopy(item))
+
+        for d_item in rep.disagreements:
+            if getattr(d_item, "registered", True):
+                prev_bucket = seen_registered_targets.get(d_item.model_id)
+                if prev_bucket is not None:
+                    raise CatalogSyncError(
+                        f"Conflicting or duplicate drift target '{d_item.model_id}' across/within {prev_bucket} and registered disagreements"
+                    )
+                seen_registered_targets[d_item.model_id] = "disagreements"
+            merged_disagreements.append(copy.deepcopy(d_item))
+
+        for new_m in rep.new_models:
+            nid = str(new_m.get("id") or "").strip()
+            nrepo = str(new_m.get("repo") or "").strip()
+            if not nid:
+                raise CatalogSyncError("Merged candidate model entry is missing 'id'")
+            if nid in seen_new_ids:
+                raise CatalogSyncError(
+                    f"Duplicate proposed candidate model id '{nid}' across/within merged providers"
+                )
+            if nrepo and nrepo in seen_new_repos:
+                raise CatalogSyncError(
+                    f"Duplicate proposed candidate model repo '{nrepo}' across/within merged providers"
+                )
+            seen_new_ids.add(nid)
+            if nrepo:
+                seen_new_repos.add(nrepo)
+            merged_new.append(copy.deepcopy(new_m))
+
+    return CatalogDriftReport(
+        observed_date=observed_date,
+        updated_models=merged_updates,
+        new_models=merged_new,
+        removed_models=merged_removed,
+        disagreements=merged_disagreements,
+        base_catalog_sha256=base_sha,
+        providers=merged_providers,
+        provenance=merged_provenance or None,
+    )
 
 
 _YAML_RESERVED_SCALARS = frozenset(
@@ -1366,15 +3400,76 @@ def _get_nested_field_value(target: dict[str, Any], field_path: str) -> Any:
     return cur
 
 
+def _is_provider_aware_or_privatemode_report(report: CatalogDriftReport) -> bool:
+    if report.providers is not None:
+        return True
+    for item in report.updated_models + report.removed_models:
+        if getattr(item, "provider", "tinfoil") == "privatemode":
+            return True
+    for d in report.disagreements:
+        if getattr(d, "provider", "tinfoil") == "privatemode":
+            return True
+    for m in report.new_models:
+        rt = m.get("remote_trust") or {}
+        if m.get("provider") == "privatemode" or (
+            isinstance(rt, dict) and rt.get("attestation_method") == PRIVATEMODE_ATTESTATION_METHOD
+        ):
+            return True
+    return False
+
+
+def _validate_target_matches_provider(target: dict[str, Any], *, provider: str, model_id: str) -> None:
+    if provider == "tinfoil":
+        if not is_tinfoil_managed_model(target):
+            raise CatalogSyncError(
+                f"Cannot quarantine '{model_id}': catalog entry is not a Tinfoil-managed model"
+            )
+        return
+    if provider == "privatemode":
+        if not is_privatemode_managed_model(target):
+            raise CatalogSyncError(
+                f"Cannot quarantine '{model_id}': catalog entry is not a Privatemode-managed model"
+            )
+        return
+    raise CatalogSyncError(f"Cannot quarantine '{model_id}': unsupported provider {provider!r}")
+
+
+def _is_privatemode_unpriced_or_manual_candidate(new_entry: dict[str, Any]) -> bool:
+    if new_entry.get("manual_onboarding_required") is True:
+        return True
+    rt = new_entry.get("remote_trust")
+    att = rt.get("attestation_method") if isinstance(rt, dict) else None
+    if new_entry.get("provider") == "privatemode" or att == PRIVATEMODE_ATTESTATION_METHOD:
+        pricing = rt.get("pricing_per_m_tokens") if isinstance(rt, dict) else None
+        if not isinstance(pricing, dict):
+            return True
+        in_p = pricing.get("input")
+        out_p = pricing.get("output")
+        if (
+            isinstance(in_p, bool)
+            or not isinstance(in_p, (int, float))
+            or not math.isfinite(float(in_p))
+            or float(in_p) < 0
+            or isinstance(out_p, bool)
+            or not isinstance(out_p, (int, float))
+            or not math.isfinite(float(out_p))
+            or float(out_p) < 0
+        ):
+            return True
+    return False
+
+
 def apply_catalog_healing(
     models_path: Path,
     report: CatalogDriftReport,
     *,
     quarantine_disagreements: bool = False,
     append_new_models: bool = True,
+    safety_only: bool = False,
+    apply_summary_out: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Apply a validated CatalogDriftReport to models.yaml atomically after endpoint validation."""
-    if report.disagreements and not quarantine_disagreements:
+    if not safety_only and report.disagreements and not quarantine_disagreements:
         reasons = "; ".join(d.reason for d in report.disagreements)
         raise CatalogSyncError(
             f"Refusing to mutate {models_path} while primary feeds disagree: {reasons}. "
@@ -1393,6 +3488,13 @@ def apply_catalog_healing(
             raise CatalogSyncError(f"Expected top-level 'models' list in {models_path}")
 
         current_digest = compute_models_data_digest(data)
+        require_non_null_digest = _is_provider_aware_or_privatemode_report(report)
+        if require_non_null_digest:
+            if not isinstance(report.base_catalog_sha256, str) or not report.base_catalog_sha256:
+                raise CatalogSyncError(
+                    f"Refusing to apply provider-aware or Privatemode drift report to {models_path}: "
+                    "non-null base_catalog_sha256 is required"
+                )
         if report.base_catalog_sha256 is not None and current_digest != report.base_catalog_sha256:
             raise CatalogSyncError(
                 f"Refusing to apply stale catalog drift report to {models_path}: "
@@ -1404,7 +3506,31 @@ def apply_catalog_healing(
             str(m.get("id")): m for m in models_list if isinstance(m, dict) and m.get("id")
         }
 
-        # Verify all precondition 'from' values against unmodified catalog entries before mutating
+        # Pre-mutation check 1: reject duplicate model_id within or across updated_models, removed_models, and registered disagreements
+        seen_targets: dict[str, str] = {}
+        for bucket_name, items_iter in (
+            ("updated_models", report.updated_models),
+            ("removed_models", report.removed_models),
+        ):
+            for item in items_iter:
+                prev_bucket = seen_targets.get(item.model_id)
+                if prev_bucket is not None:
+                    raise CatalogSyncError(
+                        f"Refusing to apply catalog drift report: duplicate target model '{item.model_id}' "
+                        f"in {prev_bucket} and {bucket_name}"
+                    )
+                seen_targets[item.model_id] = bucket_name
+        for d in report.disagreements:
+            if getattr(d, "registered", True):
+                prev_bucket = seen_targets.get(d.model_id)
+                if prev_bucket is not None:
+                    raise CatalogSyncError(
+                        f"Refusing to apply catalog drift report: conflicting or duplicate target model "
+                        f"'{d.model_id}' in {prev_bucket} and registered disagreements"
+                    )
+                seen_targets[d.model_id] = "disagreements"
+
+        # Pre-mutation check 2: verify all precondition 'from' values against unmodified catalog entries
         for item in report.updated_models + report.removed_models:
             target = by_id.get(item.model_id)
             if target is None:
@@ -1420,6 +3546,260 @@ def apply_catalog_healing(
                         f"field '{field_path}' is {actual_cur!r}, expected {expected_from!r}"
                     )
 
+        # Pre-mutation check 3: validate all registered disagreements before any mutation when quarantining
+        if report.disagreements and quarantine_disagreements:
+            for d in report.disagreements:
+                if not getattr(d, "registered", True):
+                    continue
+                target = by_id.get(d.model_id)
+                if target is None:
+                    raise CatalogSyncError(
+                        f"Cannot quarantine '{d.model_id}': registered model not found in {models_path}"
+                    )
+                _validate_target_matches_provider(
+                    target,
+                    provider=getattr(d, "provider", "tinfoil"),
+                    model_id=d.model_id,
+                )
+                target_served_id = str(target.get("repo") or target.get("id") or "").strip()
+                if target_served_id != d.served_model_id:
+                    raise CatalogSyncError(
+                        f"Cannot quarantine '{d.model_id}': catalog entry served_model_id "
+                        f"'{target_served_id}' does not match disagreement served_model_id '{d.served_model_id}'"
+                    )
+
+        # Pre-mutation check 4 (full-apply only): committed Privatemode manifest proof + new_models guards
+        verified_pm_proofs: list[dict[str, Any]] = []
+        if not safety_only:
+            pm_prov = (report.provenance or {}).get("privatemode") if isinstance(report.provenance, dict) else None
+            pm_commit_sha = pm_prov.get("commit_sha") if isinstance(pm_prov, dict) else None
+            for item in report.updated_models:
+                target = by_id[item.model_id]
+                if is_privatemode_managed_model(target) and (
+                    "enclave_tag" in item.changes or "serve_command" in item.changes
+                ):
+                    target_tag = (
+                        str(item.changes["enclave_tag"].get("to") or "")
+                        if "enclave_tag" in item.changes
+                        else str(target.get("enclave_tag") or "")
+                    )
+                    projected_cmd = (
+                        str(item.changes["serve_command"].get("to") or "")
+                        if "serve_command" in item.changes
+                        else str(target.get("serve_command") or "")
+                    )
+                    verified_pm_proofs.append(
+                        _verify_committed_privatemode_manifest(
+                            models_path.parent,
+                            target_tag=target_tag,
+                            expected_commit_sha=pm_commit_sha,
+                            projected_serve_command=projected_cmd,
+                            served_id=item.served_model_id,
+                        )
+                    )
+
+            if append_new_models:
+                seen_append_ids: set[str] = set()
+                seen_append_repos: set[str] = set()
+                existing_repos: dict[str, dict[str, Any]] = {
+                    str(m.get("repo")).strip(): m
+                    for m in models_list
+                    if isinstance(m, dict) and str(m.get("repo") or "").strip()
+                }
+                for new_entry in report.new_models:
+                    if _is_privatemode_unpriced_or_manual_candidate(new_entry):
+                        raise CatalogSyncError(
+                            f"Refusing to auto-append Privatemode candidate '{new_entry.get('id')}': "
+                            "new Privatemode models require manual EUR-to-USD pricing and pinned manifest onboarding "
+                            "(pass --no-discover-new or --safety-only to apply non-discovery updates)"
+                        )
+                    new_id = str(new_entry.get("id") or "").strip()
+                    new_repo = str(new_entry.get("repo") or "").strip()
+                    if not new_id:
+                        raise CatalogSyncError("Discovered candidate model entry is missing 'id'")
+                    if new_id in by_id or new_id in seen_append_ids:
+                        colliding = by_id.get(new_id)
+                        detail = (
+                            f"(existing repo='{colliding.get('repo')}', runtime='{colliding.get('runtime')}')"
+                            if colliding is not None
+                            else "(duplicate in report.new_models)"
+                        )
+                        raise CatalogSyncError(
+                            f"Cannot append discovered candidate model '{new_id}': ID already exists in {models_path} {detail}"
+                        )
+                    if new_repo and (new_repo in existing_repos or new_repo in seen_append_repos):
+                        colliding = existing_repos.get(new_repo)
+                        detail = (
+                            f"(existing id='{colliding.get('id')}', runtime='{colliding.get('runtime')}')"
+                            if colliding is not None
+                            else "(duplicate in report.new_models)"
+                        )
+                        raise CatalogSyncError(
+                            f"Cannot append discovered candidate model '{new_id}': repo '{new_repo}' already exists in {models_path} {detail}"
+                        )
+                    seen_append_ids.add(new_id)
+                    if new_repo:
+                        seen_append_repos.add(new_repo)
+
+        if safety_only:
+            applied_actions: list[dict[str, Any]] = []
+            quarantined_list: list[dict[str, Any]] = []
+            deferred_updates: list[dict[str, Any]] = []
+            deferred_new_models: list[str] = [str(m.get("id") or "") for m in report.new_models]
+            outstanding_disagreements: list[dict[str, Any]] = []
+            mutated_any = False
+
+            for item in report.updated_models:
+                target = by_id[item.model_id]
+                needs_safety_demote = (
+                    item.weights_changed
+                    or item.action in ("demote_weights_changed", "demote_zero_health")
+                    or (
+                        "deprecated" in item.changes
+                        and item.changes["deprecated"].get("to") is True
+                        and "routing.private_attested" in item.changes
+                    )
+                )
+                safety_keys = {
+                    "status",
+                    "routing.private_attested",
+                    "routing.default_private_attested",
+                    "eval_evidence_artifact",
+                }
+                non_safety_fields = sorted(k for k in item.changes if k not in safety_keys)
+                if needs_safety_demote:
+                    s_changes = _demote_routing_and_preserve_evidence(target, new_status="candidate")
+                    if s_changes:
+                        target["verified_date"] = report.observed_date
+                        mutated_any = True
+                        applied_actions.append(
+                            {
+                                "model_id": item.model_id,
+                                "served_model_id": item.served_model_id,
+                                "provider": getattr(item, "provider", "tinfoil"),
+                                "action": item.action,
+                                "changes": s_changes,
+                            }
+                        )
+                    if non_safety_fields:
+                        deferred_updates.append(
+                            {
+                                "model_id": item.model_id,
+                                "served_model_id": item.served_model_id,
+                                "provider": getattr(item, "provider", "tinfoil"),
+                                "action": item.action,
+                                "deferred_fields": non_safety_fields,
+                            }
+                        )
+                else:
+                    deferred_updates.append(
+                        {
+                            "model_id": item.model_id,
+                            "served_model_id": item.served_model_id,
+                            "provider": getattr(item, "provider", "tinfoil"),
+                            "action": item.action,
+                            "deferred_fields": sorted(item.changes.keys()),
+                        }
+                    )
+
+            for item in report.removed_models:
+                target = by_id[item.model_id]
+                r_changes = _demote_routing_and_preserve_evidence(target, new_status="archived")
+                if r_changes:
+                    target["verified_date"] = report.observed_date
+                    mutated_any = True
+                    applied_actions.append(
+                        {
+                            "model_id": item.model_id,
+                            "served_model_id": item.served_model_id,
+                            "provider": getattr(item, "provider", "tinfoil"),
+                            "action": item.action,
+                            "changes": r_changes,
+                        }
+                    )
+
+            for d in report.disagreements:
+                is_reg = bool(getattr(d, "registered", True))
+                if is_reg and quarantine_disagreements:
+                    target = by_id[d.model_id]
+                    q_changes = _demote_routing_and_preserve_evidence(target, new_status="candidate")
+                    if q_changes:
+                        target["verified_date"] = report.observed_date
+                        mutated_any = True
+                    quarantined_list.append(
+                        {
+                            "model_id": d.model_id,
+                            "served_model_id": d.served_model_id,
+                            "provider": getattr(d, "provider", "tinfoil"),
+                            "action": "quarantine_disagreement",
+                            "changes": q_changes,
+                            "reason": d.reason,
+                        }
+                    )
+                else:
+                    outstanding_disagreements.append(
+                        {
+                            "model_id": d.model_id,
+                            "served_model_id": d.served_model_id,
+                            "provider": getattr(d, "provider", "tinfoil"),
+                            "registered": is_reg,
+                            "reason": d.reason,
+                        }
+                    )
+
+            wrote_file = False
+            if mutated_any:
+                for m in models_list:
+                    try:
+                        resolve_endpoint(m, require_api_key=False)
+                    except RegistryError as exc:
+                        raise CatalogSyncError(
+                            f"Healed catalog failed endpoint validation for model '{m.get('id')}': {exc}"
+                        ) from exc
+                rendered = dump_models_yaml(data, header_comments)
+                try:
+                    orig_mode = stat.S_IMODE(models_path.stat().st_mode) or 0o644
+                except OSError:
+                    orig_mode = 0o644
+                parent_dir = models_path.parent
+                fd, tmp_path_str = tempfile.mkstemp(
+                    prefix=".models-sync-", suffix=".yaml", dir=str(parent_dir)
+                )
+                tmp_path = Path(tmp_path_str)
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                        handle.write(rendered)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.chmod(tmp_path, orig_mode)
+                    if models_path.read_bytes() != initial_bytes:
+                        raise CatalogSyncError(
+                            f"Aborting catalog update: {models_path} was modified concurrently outside catalog_file_lock during validation"
+                        )
+                    os.replace(str(tmp_path), str(models_path))
+                    wrote_file = True
+                finally:
+                    if tmp_path.exists():
+                        try:
+                            tmp_path.unlink()
+                        except OSError:
+                            pass
+
+            if apply_summary_out is not None:
+                apply_summary_out.clear()
+                apply_summary_out.update(
+                    {
+                        "safety_only": True,
+                        "wrote_file": wrote_file,
+                        "applied_actions": applied_actions,
+                        "quarantined_disagreements": quarantined_list,
+                        "deferred_updates": deferred_updates,
+                        "deferred_new_models": deferred_new_models,
+                        "outstanding_disagreements": outstanding_disagreements,
+                    }
+                )
+            return data
+
         for item in report.updated_models + report.removed_models:
             target = by_id[item.model_id]
             has_weight_change = (
@@ -1428,9 +3808,11 @@ def apply_catalog_healing(
                 or "remote_trust.provider_manifest_weights_hash" in item.changes
                 or "remote_trust.provider_manifest_weights_source" in item.changes
             )
+            pm_tag_upgrade = is_privatemode_managed_model(target) and "enclave_tag" in item.changes
+            must_demote = has_weight_change or pm_tag_upgrade
             if item.action == "archive_removed":
                 _demote_routing_and_preserve_evidence(target, new_status="archived")
-            elif item.action == "demote_zero_health" or has_weight_change:
+            elif item.action == "demote_zero_health" or must_demote:
                 _demote_routing_and_preserve_evidence(target, new_status="candidate")
 
             for field_path, diff in item.changes.items():
@@ -1442,13 +3824,13 @@ def apply_catalog_healing(
                     "eval_evidence_artifact",
                 ):
                     if field_path == "status":
-                        if not has_weight_change or new_val in ("candidate", "archived"):
+                        if not must_demote or new_val in ("candidate", "archived"):
                             cur_rank = _STATUS_RANK.get(str(target.get("status")), -1)
                             new_rank = _STATUS_RANK.get(str(new_val), 1)
                             if new_rank > cur_rank:
                                 target["status"] = new_val
                     elif field_path == "routing.private_attested":
-                        if not has_weight_change or new_val == "blocked":
+                        if not must_demote or new_val == "blocked":
                             r_dict = target.setdefault("routing", {})
                             r_dict["private_attested"] = new_val
                             if new_val != "cleared":
@@ -1475,32 +3857,24 @@ def apply_catalog_healing(
                 cur[parts[-1]] = new_val
             target["verified_date"] = report.observed_date
 
+        pending_quarantine_items: list[ModelDriftItem] = []
         if report.disagreements and quarantine_disagreements:
             for d in report.disagreements:
                 if not getattr(d, "registered", True):
                     continue
                 target = by_id.get(d.model_id)
                 if target is not None:
-                    if not is_tinfoil_managed_model(target):
-                        raise CatalogSyncError(
-                            f"Cannot quarantine '{d.model_id}': catalog entry is not a Tinfoil-managed model"
-                        )
-                    target_served_id = str(target.get("repo") or target.get("id") or "").strip()
-                    if target_served_id != d.served_model_id:
-                        raise CatalogSyncError(
-                            f"Cannot quarantine '{d.model_id}': catalog entry served_model_id "
-                            f"'{target_served_id}' does not match disagreement served_model_id '{d.served_model_id}'"
-                        )
                     q_changes = _demote_routing_and_preserve_evidence(target, new_status="candidate")
                     if q_changes:
                         target["verified_date"] = report.observed_date
-                        report.updated_models.append(
+                        pending_quarantine_items.append(
                             ModelDriftItem(
                                 model_id=d.model_id,
                                 served_model_id=d.served_model_id,
                                 action="quarantine_disagreement",
                                 changes=q_changes,
                                 notes=[f"Quarantined due to feed disagreement: {d.reason}"],
+                                provider=getattr(d, "provider", "tinfoil"),
                             )
                         )
 
@@ -1513,20 +3887,6 @@ def apply_catalog_healing(
             for new_entry in report.new_models:
                 new_id = str(new_entry.get("id") or "").strip()
                 new_repo = str(new_entry.get("repo") or "").strip()
-                if not new_id:
-                    raise CatalogSyncError("Discovered candidate model entry is missing 'id'")
-                if new_id in by_id:
-                    colliding = by_id[new_id]
-                    raise CatalogSyncError(
-                        f"Cannot append discovered candidate model '{new_id}': ID already exists in {models_path} "
-                        f"(existing repo='{colliding.get('repo')}', runtime='{colliding.get('runtime')}')"
-                    )
-                if new_repo and new_repo in by_repo:
-                    colliding = by_repo[new_repo]
-                    raise CatalogSyncError(
-                        f"Cannot append discovered candidate model '{new_id}': repo '{new_repo}' already exists in {models_path} "
-                        f"(existing id='{colliding.get('id')}', runtime='{colliding.get('runtime')}')"
-                    )
                 models_list.append(copy.deepcopy(new_entry))
                 by_id[new_id] = models_list[-1]
                 if new_repo:
@@ -1557,11 +3917,15 @@ def apply_catalog_healing(
                 handle.flush()
                 os.fsync(handle.fileno())
             os.chmod(tmp_path, orig_mode)
+            for pm_proof in verified_pm_proofs:
+                _reverify_committed_privatemode_proof(pm_proof)
             if models_path.read_bytes() != initial_bytes:
                 raise CatalogSyncError(
                     f"Aborting catalog update: {models_path} was modified concurrently outside catalog_file_lock during validation"
                 )
             os.replace(str(tmp_path), str(models_path))
+            if pending_quarantine_items:
+                report.updated_models.extend(pending_quarantine_items)
         finally:
             if tmp_path.exists():
                 try:
@@ -1934,18 +4298,33 @@ GITHUB_BOT_AUTHOR_LOGINS: frozenset[str] = frozenset(
 )
 
 
-def format_human_drift_report(report: CatalogDriftReport, *, applied: bool = False) -> str:
+def format_human_drift_report(
+    report: CatalogDriftReport,
+    *,
+    applied: bool = False,
+    apply_summary: dict[str, Any] | None = None,
+) -> str:
+    provider_aware = report.providers is not None
+    prov_suffix = (
+        f" [providers={','.join(report.providers)}]"
+        if provider_aware and report.providers
+        else ""
+    )
     if not report.has_drift:
-        return f"Catalog check ({report.observed_date}): clean (0 drift items)."
+        return f"Catalog check ({report.observed_date}){prov_suffix}: clean (0 drift items)."
 
     lines: list[str] = []
-    header_verb = (
-        "Applied self-healing catalog updates" if applied else "Detected catalog drift"
-    )
-    lines.append(f"{header_verb} ({report.observed_date}):")
+    if apply_summary and apply_summary.get("safety_only"):
+        header_verb = "Applied safety-only catalog updates"
+    else:
+        header_verb = (
+            "Applied self-healing catalog updates" if applied else "Detected catalog drift"
+        )
+    lines.append(f"{header_verb} ({report.observed_date}){prov_suffix}:")
 
     for item in report.updated_models:
-        lines.append(f"  [update:{item.action}] {item.model_id} (served={item.served_model_id})")
+        ptag = f"[{item.provider}] " if provider_aware else ""
+        lines.append(f"  {ptag}[update:{item.action}] {item.model_id} (served={item.served_model_id})")
         for k, diff in sorted(item.changes.items()):
             lines.append(f"    - {k}: {diff.get('from')!r} -> {diff.get('to')!r}")
         for note in item.notes:
@@ -1953,22 +4332,43 @@ def format_human_drift_report(report: CatalogDriftReport, *, applied: bool = Fal
 
     for m in report.new_models:
         rt = m.get("remote_trust") or {}
-        pricing = rt.get("pricing_per_m_tokens") or {}
+        pricing = rt.get("pricing_per_m_tokens")
+        att = rt.get("attestation_method") if isinstance(rt, dict) else None
+        m_prov = m.get("provider") or (
+            "privatemode" if att == PRIVATEMODE_ATTESTATION_METHOD else "tinfoil"
+        )
+        ptag = f"[{m_prov}] " if provider_aware else ""
+        if isinstance(pricing, dict) and pricing.get("input") is not None and pricing.get("output") is not None:
+            pricing_str = f"pricing=${pricing.get('input')}/${pricing.get('output')} per 1M"
+        else:
+            pricing_str = "pricing=manual-verification-required"
         lines.append(
-            f"  [new:candidate] {m.get('id')} (served={m.get('repo')}, "
+            f"  {ptag}[new:candidate] {m.get('id')} (served={m.get('repo')}, "
             f"upstream={m.get('upstream')}, "
             f"hash={rt.get('provider_manifest_weights_hash')}, "
-            f"pricing=${pricing.get('input')}/${pricing.get('output')} per 1M)"
+            f"{pricing_str})"
         )
 
     for item in report.removed_models:
-        lines.append(f"  [removed:{item.action}] {item.model_id} (served={item.served_model_id})")
+        ptag = f"[{item.provider}] " if provider_aware else ""
+        lines.append(f"  {ptag}[removed:{item.action}] {item.model_id} (served={item.served_model_id})")
         for k, diff in sorted(item.changes.items()):
             lines.append(f"    - {k}: {diff.get('from')!r} -> {diff.get('to')!r}")
 
     for d in report.disagreements:
+        ptag = f"[{d.provider}] " if provider_aware else ""
         lines.append(
-            f"  [disagreement] {d.model_id} (served={d.served_model_id}): {d.reason}"
+            f"  {ptag}[disagreement] {d.model_id} (served={d.served_model_id}): {d.reason}"
+        )
+
+    if isinstance(apply_summary, dict) and apply_summary.get("safety_only"):
+        lines.append(
+            f"  [safety-only summary] wrote_file={apply_summary.get('wrote_file')} "
+            f"applied={len(apply_summary.get('applied_actions') or [])} "
+            f"quarantined={len(apply_summary.get('quarantined_disagreements') or [])} "
+            f"deferred_updates={len(apply_summary.get('deferred_updates') or [])} "
+            f"deferred_new_models={len(apply_summary.get('deferred_new_models') or [])} "
+            f"outstanding_disagreements={len(apply_summary.get('outstanding_disagreements') or [])}"
         )
 
     return "\n".join(lines)
@@ -2013,16 +4413,46 @@ def render_github_issue_body(
     clean_human = _cap_backtick_runs(human_output.rstrip())
     fence = _code_fence_for(clean_human, json_payload)
 
-    if check_status == "disagreement" or (exit_code == 1 and report_dict.get("disagreements")):
+    raw_providers = report_dict.get("providers")
+    prov_list = [str(p) for p in raw_providers] if isinstance(raw_providers, list) and raw_providers else None
+    if prov_list == ["privatemode"]:
+        feed_label = "Privatemode (`deployment.yaml` vs `models.yaml`)"
+    elif prov_list and len(prov_list) > 1:
+        feed_label = "upstream catalog feeds (`Tinfoil` / `Privatemode`)"
+    else:
+        feed_label = "(`router_manifest` vs `/v1/models`)"
+
+    apply_summary = report_dict.get("apply_summary") if isinstance(report_dict.get("apply_summary"), dict) else None
+
+    if check_status == "safety_applied_with_disagreements":
+        heading = "## Safety-Only Catalog Demotions Applied (Disagreements Remain)"
+        summary_line = (
+            f"Independent safety demotions or archives were applied, but {feed_label} disagreements remain unresolved."
+        )
+    elif check_status == "safety_applied":
+        wrote_file = bool(apply_summary.get("wrote_file")) if apply_summary is not None else True
+        applied_actions = apply_summary.get("applied_actions") if apply_summary is not None else None
+        if apply_summary is not None and not wrote_file and not applied_actions:
+            heading = "## Safety-Only Catalog Check: Updates Deferred (No File Written)"
+            summary_line = (
+                "No safety demotions or archives were written (`models.yaml` unchanged); "
+                "non-safety updates or manual candidates remain deferred for operator review."
+            )
+        else:
+            heading = "## Safety-Only Catalog Demotions Applied"
+            summary_line = (
+                "Safety-protective catalog demotions or archives were applied without admitting unverified release tags or manual candidates."
+            )
+    elif check_status == "disagreement" or (exit_code == 1 and report_dict.get("disagreements")):
         heading = "## Upstream Catalog Feed Disagreement Detected"
         summary_line = (
-            "Primary upstream catalog feeds (`router_manifest` vs `/v1/models`) disagreed. "
+            f"Primary upstream catalog feeds {feed_label} disagreed. "
             "No automatic catalog mutation was performed."
         )
     elif check_status == "quarantined":
         heading = "## Upstream Catalog Feed Disagreement Quarantined"
         summary_line = (
-            "Primary upstream catalog feeds disagreed; disagreeing registered models were "
+            f"Primary upstream catalog feeds {feed_label} disagreed; disagreeing registered models were "
             "conservatively quarantined (`routing.private_attested: blocked`)."
         )
     elif check_status == "drift" or exit_code == 2 or report_dict.get("has_drift"):
@@ -2039,6 +4469,8 @@ def render_github_issue_body(
         f"- **Observed date**: `{observed_date}`",
         f"- **Check status**: `{check_status or ('clean' if exit_code == 0 else 'drift')}` (exit code `{exit_code}`)",
     ]
+    if prov_list:
+        meta_lines.append(f"- **Providers**: `{', '.join(prov_list)}`")
     if base_digest:
         meta_lines.append(f"- **Catalog SHA-256**: `{base_digest}`")
     if checked_ref:
@@ -2047,6 +4479,37 @@ def render_github_issue_body(
         meta_lines.append(f"- **Checked commit**: `{str(checked_sha)[:128]}`")
     if run_url:
         meta_lines.append(f"- **Workflow run**: {str(run_url)[:512]}")
+
+    if prov_list == ["privatemode"]:
+        remediation_cmds = [
+            "cd lab",
+            "./scripts/sync-model-catalog --provider privatemode --check",
+            "# Apply safety-protective demotions/archives only (no unverified tag upgrades):",
+            "./scripts/sync-model-catalog --provider privatemode --apply --safety-only",
+            "# Full apply only after updating scripts/build-privatemode-proxy and committing config/privatemode-manifest-<tag>.json:",
+            "./scripts/sync-model-catalog --provider privatemode --apply --no-discover-new",
+            ".venv/bin/python ./scripts/generate-eval-manifest --check",
+            ".venv/bin/python -m unittest discover -s tests -v",
+        ]
+    elif prov_list and len(prov_list) > 1:
+        remediation_cmds = [
+            "cd lab",
+            "./scripts/sync-model-catalog --provider all --check",
+            "# Apply safety-protective demotions/archives across all providers:",
+            "./scripts/sync-model-catalog --provider all --apply --safety-only",
+            "# Apply Tinfoil updates directly (Privatemode tag upgrades require committed manifest + builder pins first):",
+            "./scripts/sync-model-catalog --provider tinfoil --apply",
+            ".venv/bin/python ./scripts/generate-eval-manifest --check",
+            ".venv/bin/python -m unittest discover -s tests -v",
+        ]
+    else:
+        remediation_cmds = [
+            "cd lab",
+            "./scripts/sync-model-catalog --check",
+            "./scripts/sync-model-catalog --apply",
+            ".venv/bin/python ./scripts/generate-eval-manifest --check",
+            ".venv/bin/python -m unittest discover -s tests -v",
+        ]
 
     def _assemble_body(h_text: str, j_text: str) -> str:
         body_parts = [
@@ -2065,11 +4528,7 @@ def render_github_issue_body(
             "### Local Remediation Steps (in `lab/`)",
             "",
             "```bash",
-            "cd lab",
-            "./scripts/sync-model-catalog --check",
-            "./scripts/sync-model-catalog --apply",
-            ".venv/bin/python ./scripts/generate-eval-manifest --check",
-            ".venv/bin/python -m unittest discover -s tests -v",
+            *remediation_cmds,
             "```",
             "",
             "> Note: Newly discovered models are scaffolded as `status: candidate` with `routing.private_attested: blocked` and require operator-approved 4-gate evaluation (`sanity`, `v1`, `tools`, `opencode-smoke`) before promotion.",

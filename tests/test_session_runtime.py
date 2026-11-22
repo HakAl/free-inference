@@ -108,9 +108,9 @@ class SessionRuntimeTests(unittest.TestCase):
             r = c.getresponse(); return r.status, r.read()
         finally: c.close()
 
-    def renew(self, info, allow=True):
+    def renew(self, info, allow=True, seconds=20):
         os.write(self.auth_writer, b'1' if allow else b'0')
-        return self.control(dict(action='renew', seconds=20, session_id=info['session_id'], generation=info['generation']))
+        return self.control(dict(action='renew', seconds=seconds, session_id=info['session_id'], generation=info['generation']))
 
     def test_authoritative_status_atomic_budget_and_redaction(self):
         self.start(limit=3)
@@ -328,12 +328,12 @@ class SessionRuntimeTests(unittest.TestCase):
         self._assert_replacement_receives_no_request(expire=False)
 
     def test_generation_history_is_bounded_without_resetting_requests(self):
-        self.start()
+        self.start(ttl=120)
         info = self.control({'action': 'status'})
-        for _ in range(31): info = self.renew(info)
+        for _ in range(31): info = self.renew(info, seconds=120)
         self.assertEqual(info['generation'], 32)
         self.assertEqual(info['requests_remaining'], 5)
-        with self.assertRaises(ValueError): self.renew(info)
+        with self.assertRaises(ValueError): self.renew(info, seconds=120)
         self.assertEqual(self.control({'action': 'status'})['generation'], 32)
 
     def test_control_rejects_wrong_identity_and_invalid_renew_without_authorizing(self):
