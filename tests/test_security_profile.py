@@ -5382,7 +5382,7 @@ class Phase2LookoutRemediationTests(unittest.TestCase):
                 patch.object(oc_att, "read_pid_record_for_model", side_effect=_read_rec_in_temp_runs),
                 patch.object(oc_att, "ensure_model_served", side_effect=_ensure_in_temp_runs),
                 patch.object(oc_att, "execute_worker_profile_session", side_effect=_capture_worker_exec),
-                patch.object(oc_att, "shutil") as mock_shutil,
+                patch.object(oc_att, "resolve_opencode_binary", return_value=("/usr/bin/true", None)),
                 patch(
                     "local_assist.session.status_for_record",
                     return_value={"state": "ON", "remaining_seconds": 10800, "window_seconds": 14400, "requests_remaining": 25, "request_limit": 25},
@@ -5390,7 +5390,6 @@ class Phase2LookoutRemediationTests(unittest.TestCase):
                 patch("local_assist.session.SessionLeaseSupplier", return_value=lambda: None),
                 redirect_stderr(err_1),
             ):
-                mock_shutil.which.return_value = "/usr/bin/true"
                 with patch.object(oc_att, "validate_worker_binary_and_args", return_value=(True, ["run", "hi"], None)):
                     rc1 = oc_att.main(
                         [
@@ -5439,7 +5438,7 @@ class Phase2LookoutRemediationTests(unittest.TestCase):
                     ),
                 ),
                 patch.object(oc_att, "execute_worker_profile_session", side_effect=_capture_worker_exec),
-                patch.object(oc_att, "shutil") as mock_shutil,
+                patch.object(oc_att, "resolve_opencode_binary", return_value=("/usr/bin/true", None)),
                 patch(
                     "local_assist.session.status_for_record",
                     return_value={"state": "ON", "remaining_seconds": 6000, "window_seconds": 7200, "requests_remaining": 25, "request_limit": 25},
@@ -5447,7 +5446,6 @@ class Phase2LookoutRemediationTests(unittest.TestCase):
                 patch("local_assist.session.SessionLeaseSupplier", return_value=lambda: None),
                 redirect_stderr(err_2),
             ):
-                mock_shutil.which.return_value = "/usr/bin/true"
                 with patch.object(oc_att, "validate_worker_binary_and_args", return_value=(True, ["run", "hi"], None)):
                     rc2 = oc_att.main(
                         [
@@ -5475,7 +5473,7 @@ class Phase2LookoutRemediationTests(unittest.TestCase):
                 patch.object(oc_att, "read_pid_record_for_model", side_effect=_read_rec_in_temp_runs),
                 patch.object(oc_att, "ensure_model_served", side_effect=_ensure_in_temp_runs),
                 patch.object(oc_att, "execute_worker_profile_session", side_effect=_capture_worker_exec),
-                patch.object(oc_att, "shutil") as mock_shutil,
+                patch.object(oc_att, "resolve_opencode_binary", return_value=("/usr/bin/true", None)),
                 patch(
                     "local_assist.session.status_for_record",
                     return_value={"state": "ON", "remaining_seconds": 600, "window_seconds": 3600, "requests_remaining": 25, "request_limit": 25},
@@ -5483,7 +5481,6 @@ class Phase2LookoutRemediationTests(unittest.TestCase):
                 patch("local_assist.session.SessionLeaseSupplier", return_value=lambda: None),
                 redirect_stderr(err_3),
             ):
-                mock_shutil.which.return_value = "/usr/bin/true"
                 with patch.object(oc_att, "validate_worker_binary_and_args", return_value=(True, ["run", "hi"], None)):
                     rc3 = oc_att.main(
                         [

@@ -2047,8 +2047,15 @@ class OpenCode23UnitTests(unittest.TestCase):
             fake_oc = Path(td) / "oc"
             fake_oc.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             os.chmod(fake_oc, 0o700)
+            fake_sb = Path(td) / "fake-sandbox-exec"
+            fake_sb.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            os.chmod(fake_sb, 0o700)
             sb = compile_seatbelt_profile(
-                prof, workspace_dir=ws, isolated_home=wh, opencode_bin=fake_oc
+                prof,
+                workspace_dir=ws,
+                isolated_home=wh,
+                opencode_bin=fake_oc,
+                sandbox_exec_bin=fake_sb,
             )
             self.assertNotIn("cli\\.json", sb)
             for iv in _dual_realpath_variants(wh.resolve()):

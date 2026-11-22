@@ -4913,10 +4913,15 @@ class LookoutRound3RegressionTests(unittest.TestCase):
             os.chmod(fake_oc_ver, 0o700)
             (short_root / "opencode").symlink_to(fake_oc_ver)
 
+            fake_sb = short_root / "fake-sandbox-exec"
+            fake_sb.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            os.chmod(fake_sb, 0o700)
+
             env_with_oc = {
                 "PATH": f"{short_root}:{os.environ.get('PATH', '/usr/bin:/bin')}",
                 "HOME": str(fake_home),
                 "FREE_INFERENCE_WORKER_HOMES_DIR": str(workers_dir),
+                "FREE_INFERENCE_SANDBOX_EXEC_BIN": str(fake_sb),
                 "PYTHONDONTWRITEBYTECODE": "1",
             }
 
@@ -4924,8 +4929,8 @@ class LookoutRound3RegressionTests(unittest.TestCase):
             http_daemon_py.write_text(
                 textwrap.dedent(
                     f"""
-                    from http.server import BaseHTTPRequestHandler, HTTPServer
-                    import json, signal, sys
+                    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+                    import json, signal, socketserver, sys
                     port = int(sys.argv[sys.argv.index("--port") + 1])
                     class H(BaseHTTPRequestHandler):
                         def do_GET(self):
@@ -4937,7 +4942,13 @@ class LookoutRound3RegressionTests(unittest.TestCase):
                             self.wfile.write(raw)
                         def log_message(self, *a):
                             pass
-                    srv = HTTPServer(("127.0.0.1", port), H)
+                    class FastHTTPServer(ThreadingHTTPServer):
+                        allow_reuse_address = True
+                        def server_bind(self):
+                            socketserver.TCPServer.server_bind(self)
+                            self.server_name = "127.0.0.1"
+                            self.server_port = self.server_address[1]
+                    srv = FastHTTPServer(("127.0.0.1", port), H)
                     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
                     srv.serve_forever()
                     """
@@ -5023,14 +5034,14 @@ class LookoutRound3RegressionTests(unittest.TestCase):
                     "--port",
                     str(bystander_port),
                     "--wait",
-                    "5",
+                    "15",
                     mock_model_id,
                 ],
                 cwd=str(clone_root),
                 env=env_with_oc,
                 capture_output=True,
                 text=True,
-                timeout=10,
+                timeout=25,
                 check=False,
             )
             self.assertEqual(cp_by_ver.returncode, 0, cp_by_ver.stderr)

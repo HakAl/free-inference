@@ -151,17 +151,27 @@ class SessionPolicyTests(unittest.TestCase):
                 if proc.poll() is None: proc.terminate(); proc.wait(5)
 
     def test_notification_failure_does_not_stop_watcher(self):
+        from local_assist import custody
         from local_assist.session import main
         from contextlib import redirect_stdout, redirect_stderr
         import io, subprocess
+        real_platform = sys.platform
+        real_validate = custody.validate_creatable_runs_dir
+
+        def _validate_with_real_platform(*args, **kwargs):
+            with patch.object(sys, 'platform', real_platform):
+                return real_validate(*args, **kwargs)
+
         for error in [OSError('private-path'), subprocess.TimeoutExpired('osascript', 5)]:
             with patch('local_assist.session.select_model', return_value='test'), \
                  patch('local_assist.session.read_pid_record_for_model', return_value={'model_id': 'test'}), \
                  patch('local_assist.session.status_for_record', side_effect=[self.status(), {'state': 'OFF'}]), \
-                 patch('local_assist.session.time.sleep'), patch('local_assist.session.sys.platform', 'darwin'), \
+                 patch('local_assist.session.time.sleep'), \
+                 patch('local_assist.custody.validate_creatable_runs_dir', side_effect=_validate_with_real_platform), \
+                 patch('local_assist.session.sys.platform', 'darwin'), \
                  patch('local_assist.session.subprocess.run', side_effect=error), \
                  redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as stderr:
-                self.assertEqual(main(['watch', '--notify']), 0)
+                self.assertEqual(main(['watch', '--notify']), 0, stderr.getvalue())
                 self.assertIn('continuing to watch', stderr.getvalue())
                 self.assertNotIn('private-path', stderr.getvalue())
 
