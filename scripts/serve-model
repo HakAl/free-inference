@@ -566,6 +566,12 @@ def main(argv: list[str]) -> int:
         help="Maximum total duration in seconds for a single proxied request/stream in se-key-proxy (default: 300).",
     )
     parser.add_argument(
+        "--max-actual-usd",
+        dest="max_actual_usd",
+        default=None,
+        help="Optional live post-accounting USD spend cap enforced in se-key-proxy (decimal in 0.000001..100000, requires --max-tokens-cap > 0 and model pricing).",
+    )
+    parser.add_argument(
         "--interactive",
         action="store_true",
         default=False,
@@ -751,6 +757,26 @@ def _main_serve_body(
         print("Cannot combine --interactive and --eval-caps.", file=sys.stderr)
         return 2
 
+    from local_assist.session import (
+        MAX_CHAT_REQUESTS_LIMIT,
+        control_path,
+        control_request,
+        format_micro_usd_decimal,
+        parse_usd_to_micro_usd,
+        price_float_to_micro_usd,
+        sanitize_status,
+        status_for_record,
+        verify_live_spend_cap,
+    )
+
+    max_actual_micro_usd: int | None = None
+    if args.max_actual_usd is not None:
+        try:
+            max_actual_micro_usd = parse_usd_to_micro_usd(str(args.max_actual_usd))
+        except ValueError as exc:
+            print(f"Invalid --max-actual-usd: {exc}", file=sys.stderr)
+            return 2
+
     raw_flags = set(argv[1:])
     has_explicit_flag = lambda flag: any(
         tok == flag or tok.startswith(f"{flag}=") for tok in raw_flags
@@ -764,6 +790,13 @@ def _main_serve_body(
             args.max_request_bytes = INTERACTIVE_MAX_REQUEST_BYTES
         if not has_explicit_flag("--ttl-seconds"):
             args.ttl_seconds = INTERACTIVE_TTL_SECONDS
+
+    if not (1 <= args.max_chat_requests <= MAX_CHAT_REQUESTS_LIMIT):
+        print(
+            f"Invalid --max-chat-requests: must be an integer in 1..{MAX_CHAT_REQUESTS_LIMIT}.",
+            file=sys.stderr,
+        )
+        return 2
 
     chat_template_args_override = None
     if args.chat_template_args is not None:
@@ -818,6 +851,44 @@ def _main_serve_body(
         return 1
 
     uses_se_key_proxy = bool(endpoint.api_key_keychain_service)
+    if max_actual_micro_usd is not None and not uses_se_key_proxy:
+        print(
+            f"--max-actual-usd is only supported for se-key-proxy models, got '{endpoint.model_id}'.",
+            file=sys.stderr,
+        )
+        return 2
+    if max_actual_micro_usd is not None and args.max_tokens_cap <= 0:
+        print(
+            "--max-actual-usd requires --max-tokens-cap > 0 so per-request output tokens are clamped.",
+            file=sys.stderr,
+        )
+        return 2
+    pricing_micro: tuple[int, int, int | None] | None = None
+    if uses_se_key_proxy:
+        raw_pricing = endpoint.pricing_per_m_tokens
+        if isinstance(raw_pricing, dict) and "input" in raw_pricing and "output" in raw_pricing:
+            try:
+                in_m = price_float_to_micro_usd(raw_pricing["input"])
+                out_m = price_float_to_micro_usd(raw_pricing["output"])
+                cached_m = (
+                    price_float_to_micro_usd(raw_pricing["cached_input"])
+                    if raw_pricing.get("cached_input") is not None
+                    else None
+                )
+                pricing_micro = (in_m, out_m, cached_m)
+            except ValueError as exc:
+                if max_actual_micro_usd is not None:
+                    print(
+                        f"Refusing to start '{endpoint.model_id}' with --max-actual-usd: invalid pricing in models.yaml ({exc}).",
+                        file=sys.stderr,
+                    )
+                    return 1
+        elif max_actual_micro_usd is not None:
+            print(
+                f"Refusing to start '{endpoint.model_id}' with --max-actual-usd: missing pricing_per_m_tokens.input/output in models.yaml.",
+                file=sys.stderr,
+            )
+            return 1
     se_proxy_bin: Path | None = None
     upstream_port: int | None = None
     upstream_cmd: list[str] | None = None
@@ -960,6 +1031,23 @@ def _main_serve_body(
             return 1
 
         if same_model_record is not None and not args.refresh_session:
+            if max_actual_micro_usd is not None:
+                if same_model_record.get("status") == "starting":
+                    print(
+                        f"Refusing to reuse starting session for '{endpoint.model_id}' when --max-actual-usd is requested; "
+                        "wait for startup to finish or pass --refresh-session.",
+                        file=sys.stderr,
+                    )
+                    return 1
+                live_reuse = status_for_record(same_model_record, RUNS)
+                cap_err = verify_live_spend_cap(
+                    live_reuse,
+                    max_actual_micro_usd,
+                    model_id=endpoint.model_id,
+                )
+                if cap_err is not None:
+                    print(cap_err, file=sys.stderr)
+                    return 1
             if should_publish_pointer:
                 _publish_active_runs_pointer_with_warning(RUNS, expected_stat=pinned_stat)
             print(
@@ -1114,6 +1202,14 @@ def _main_serve_body(
                     "stream_timeout_seconds": args.stream_timeout_seconds,
                     "thinking_enabled": bool(args.thinking),
                     "default_chat_params": default_chat_params,
+                    **(
+                        {
+                            "max_actual_usd": round(max_actual_micro_usd / 1_000_000.0, 6),
+                            "max_actual_micro_usd": max_actual_micro_usd,
+                        }
+                        if max_actual_micro_usd is not None
+                        else {}
+                    ),
                     "command": [],
                     "upstream_command": upstream_cmd,
                     "log": str(log),
@@ -1200,8 +1296,25 @@ def _main_serve_body(
                         "--stream-timeout-seconds",
                         str(args.stream_timeout_seconds),
                     ]
-                    from local_assist.session import control_path
                     se_cmd.extend(['--control-socket', str(control_path(RUNS, endpoint.model_id))])
+                    if pricing_micro is not None:
+                        in_m, out_m, cached_m = pricing_micro
+                        se_cmd.extend([
+                            "--price-input-per-m",
+                            format_micro_usd_decimal(in_m),
+                            "--price-output-per-m",
+                            format_micro_usd_decimal(out_m),
+                        ])
+                        if cached_m is not None:
+                            se_cmd.extend([
+                                "--price-cached-input-per-m",
+                                format_micro_usd_decimal(cached_m),
+                            ])
+                    if max_actual_micro_usd is not None:
+                        se_cmd.extend([
+                            "--max-actual-usd",
+                            format_micro_usd_decimal(max_actual_micro_usd),
+                        ])
                     if default_chat_params:
                         se_cmd.extend(
                             [
@@ -1269,6 +1382,26 @@ def _main_serve_body(
                         raise RuntimeError(
                             f"Upstream proxy process exited prematurely with code {upstream_proc.returncode}"
                         )
+
+                    if max_actual_micro_usd is not None:
+                        raw_ctl = control_request(
+                            control_path(RUNS, endpoint.model_id),
+                            {"action": "status"},
+                            expected_pid=se_proc.pid,
+                        )
+                        live_ctl = sanitize_status(
+                            raw_ctl,
+                            expected_model=endpoint.served_model_id,
+                            expected_pid=se_proc.pid,
+                        )
+                        cap_err = verify_live_spend_cap(
+                            live_ctl,
+                            max_actual_micro_usd,
+                            model_id=endpoint.model_id,
+                            require_exact=True,
+                        )
+                        if cap_err is not None:
+                            raise RuntimeError(cap_err)
 
                     with _pid_lock(RUNS):
                         _assert_provisional_record_active(model_pid_file, startup_nonce)

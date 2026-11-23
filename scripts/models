@@ -33,6 +33,55 @@ from local_assist.registry import (
 )
 
 
+def _parse_bounded_usd_to_micro(
+    raw_usd: Any,
+    *,
+    max_micro: int,
+    decimal_cls: Any,
+    invalid_op: Any,
+    isfinite_fn: Any,
+) -> int | None:
+    if type(raw_usd) is int:
+        if raw_usd < 1 or raw_usd > (max_micro // 1_000_000):
+            return None
+        return raw_usd * 1_000_000
+    if type(raw_usd) is not float:
+        return None
+    if not isfinite_fn(raw_usd) or raw_usd <= 0:
+        return None
+    try:
+        micro_dec = decimal_cls(str(raw_usd)) * decimal_cls(1_000_000)
+    except (invalid_op, ValueError):
+        return None
+    if not micro_dec.is_finite():
+        return None
+    if micro_dec < 1 or micro_dec > max_micro:
+        return None
+    return int(micro_dec.to_integral_value())
+
+
+def _parse_recorded_cap_micro_usd(
+    rec: dict[str, Any],
+    *,
+    max_micro: int,
+    decimal_cls: Any,
+    invalid_op: Any,
+    isfinite_fn: Any,
+) -> int | None:
+    if "max_actual_micro_usd" in rec and rec.get("max_actual_micro_usd") is not None:
+        raw_micro = rec.get("max_actual_micro_usd")
+        if type(raw_micro) is int and 1 <= raw_micro <= max_micro:
+            return raw_micro
+        return None
+    return _parse_bounded_usd_to_micro(
+        rec.get("max_actual_usd"),
+        max_micro=max_micro,
+        decimal_cls=decimal_cls,
+        invalid_op=invalid_op,
+        isfinite_fn=isfinite_fn,
+    )
+
+
 def _classify_session_record(rec: dict[str, Any], runs_dir: Path | None = None) -> dict[str, Any]:
     model_id = str(rec.get("model_id") or "unknown")
     runtime = str(rec.get("runtime") or "unknown")
@@ -148,13 +197,30 @@ def _classify_session_record(rec: dict[str, Any], runs_dir: Path | None = None) 
         if trust_tier == "local" or runtime in ("mlx-lm", "mlx_lm")
         else "./scripts/opencode-attested"
     )
-    from local_assist.session import status_for_record
+    from decimal import Decimal, InvalidOperation
+    import math
+    from local_assist.session import MAX_ACTUAL_MICRO_USD, status_for_record
     from local_assist.registry import _effective_runs_dir
     authorization = status_for_record(rec, _effective_runs_dir(runs_dir)) if is_proxy else None
+    live_max_actual_usd: float | None = None
+    recorded_max_actual_usd: float | None = None
+    rec_micro = _parse_recorded_cap_micro_usd(rec, max_micro=MAX_ACTUAL_MICRO_USD, decimal_cls=Decimal, invalid_op=InvalidOperation, isfinite_fn=math.isfinite)
+    if rec_micro is not None:
+        recorded_max_actual_usd = round(rec_micro / 1_000_000.0, 6)
     if authorization and authorization['state'] == 'ON':
         remaining_ttl_seconds = authorization['remaining_seconds']
         ttl_seconds = authorization['window_seconds']
         expires_at = datetime.fromtimestamp(authorization['expires_at'], timezone.utc).isoformat()
+        if authorization.get('max_actual_usd') is not None:
+            auth_cap_micro = _parse_recorded_cap_micro_usd(
+                authorization,
+                max_micro=MAX_ACTUAL_MICRO_USD,
+                decimal_cls=Decimal,
+                invalid_op=InvalidOperation,
+                isfinite_fn=math.isfinite,
+            )
+            if auth_cap_micro is not None:
+                live_max_actual_usd = round(auth_cap_micro / 1_000_000.0, 6)
     uncleared_arg = " --allow-uncleared-model" if needs_uncleared_flag else ""
     port_arg = (
         f" --port {port}"
@@ -187,6 +253,8 @@ def _classify_session_record(rec: dict[str, Any], runs_dir: Path | None = None) 
         "max_chat_requests": max_reqs,
         "max_tokens_cap": max_tokens,
         "max_request_bytes": max_bytes,
+        "max_actual_usd": live_max_actual_usd,
+        "recorded_max_actual_usd": recorded_max_actual_usd,
         "ttl_seconds": ttl_seconds,
         "started_at": started_at,
         "expires_at": expires_at,
@@ -270,6 +338,7 @@ def main(argv: list[str] | None = None, *, runs_dir: Path | None = None) -> int:
                         "stale_sessions": stale_sessions,
                     },
                     indent=2,
+                    allow_nan=False,
                 )
             )
             return 0
@@ -297,11 +366,45 @@ def main(argv: list[str] | None = None, *, runs_dir: Path | None = None) -> int:
                     if s.get("remaining_ttl_seconds") is not None
                     else f"{s.get('ttl_seconds')}s total"
                 )
+                spend_cap_str = ""
+                if s.get("max_actual_usd") is not None:
+                    from decimal import Decimal, InvalidOperation
+                    import math
+                    from local_assist.session import MAX_ACTUAL_MICRO_USD, format_micro_usd_decimal
+                    auth_obj = s.get("authorization")
+                    live_micro: int | None = None
+                    if isinstance(auth_obj, dict) and type(auth_obj.get("max_actual_micro_usd")) is int:
+                        cand_live = auth_obj["max_actual_micro_usd"]
+                        if 1 <= cand_live <= MAX_ACTUAL_MICRO_USD:
+                            live_micro = cand_live
+                    if live_micro is None:
+                        live_micro = _parse_bounded_usd_to_micro(
+                            s.get("max_actual_usd"),
+                            max_micro=MAX_ACTUAL_MICRO_USD,
+                            decimal_cls=Decimal,
+                            invalid_op=InvalidOperation,
+                            isfinite_fn=math.isfinite,
+                        )
+                    if live_micro is not None:
+                        spend_cap_str = f"  max_actual_usd=${format_micro_usd_decimal(live_micro)}"
+                elif s.get("recorded_max_actual_usd") is not None:
+                    from decimal import Decimal, InvalidOperation
+                    import math
+                    from local_assist.session import MAX_ACTUAL_MICRO_USD, format_micro_usd_decimal
+                    rec_micro = _parse_bounded_usd_to_micro(
+                        s.get("recorded_max_actual_usd"),
+                        max_micro=MAX_ACTUAL_MICRO_USD,
+                        decimal_cls=Decimal,
+                        invalid_op=InvalidOperation,
+                        isfinite_fn=math.isfinite,
+                    )
+                    if rec_micro is not None:
+                        spend_cap_str = f"  recorded_max_actual_usd=${format_micro_usd_decimal(rec_micro)} (launch intent)"
                 print(
                     f"  caps: max_requests={s.get('max_chat_requests')}  "
                     f"max_tokens={s.get('max_tokens_cap')}  "
                     f"max_request_bytes={s.get('max_request_bytes')}  "
-                    f"ttl={ttl_info}  thinking={'on' if s.get('thinking_enabled') else 'off'}"
+                    f"ttl={ttl_info}  thinking={'on' if s.get('thinking_enabled') else 'off'}{spend_cap_str}"
                 )
             cmds = s["commands"]
             if s.get('authorization'):

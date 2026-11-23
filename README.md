@@ -2,6 +2,27 @@
 
 **Free as in liberty, not as in free compute. The software costs nothing; the Mac and the watts are yours to supply, and your prompts, keys, and code stay on your machine.** A private coding-agent launcher, Secure Enclave key-sealing proxy, and evaluation workbench for engineers running open-weight coding agents on Apple Silicon Macs.
 
+### Just want a private coding agent?
+
+On an Apple Silicon Mac (with [`opencode`](https://opencode.ai) `v2.3.2` installed):
+
+```bash
+# 100% local (48 GB Mac recommended, 0 API keys, 0 bytes leave localhost):
+./scripts/setup --local-only
+cd /path/to/your/project
+/path/to/free-inference/scripts/opencode-local
+
+# Or frontier models in a hardware TEE (16 GB+ Mac with Touch ID, zero .env keys):
+./scripts/setup --launcher-only
+./scripts/se-key store free-inference.tinfoil
+cd /path/to/your/project
+/path/to/free-inference/scripts/opencode-attested
+```
+
+*(First local run? Download the default MLX model once offline-ready via [Quick Start](#2-rung-1-local-private-coding-private-local). You can also use the unified `./scripts/free-inference` CLI (`local`, `attested`, `doctor`, `session`, `models`). Read on below for the 5-rung data-control ladder and threat model.)*
+
+---
+
 Most "free inference" lists optimize for `$0` API tiers where your prompts and code become the product. `free-inference` is built for software engineers and security-conscious teams who want **verifiable data control** over their coding agent sessions, targeting 48 GB unified memory for 30B local MLX models and 16 GB+ Apple Silicon Macs for Rung 3 attested enclave sessions or smaller local models:
 
 1. **5-rung data control**: Keep prompts, repository context, and outputs under the highest practical data control that clears the capability bar for the task.
@@ -38,7 +59,7 @@ Every endpoint in [`models.yaml`](models.yaml) is ordered along five explicit da
 
 | Platform | Rung 1 Local | Rung 2/3 Attested | Offline Tests & CI |
 |---|---|---|---|
-| **macOS Apple Silicon (`arm64`) + Touch ID** | Supported (48 GB RAM rec. for 30B MLX) | Supported (Secure Enclave + Touch ID) | Supported (all 108 tests + hardware SE selftest) |
+| **macOS Apple Silicon (`arm64`) + Touch ID** | Supported (48 GB RAM rec. for 30B MLX) | Supported (Secure Enclave + Touch ID) | Supported (all 330 tests + hardware SE selftest) |
 | **macOS Apple Silicon (`arm64`) without Touch ID**<br>*(e.g. Mac mini / Studio without Magic Keyboard)* | Supported | Unsupported (`selftest` exits `77`; `setup` skips gracefully) | Supported (`test_se_key` skips biometric gate on exit `77`) |
 | **Linux (`x86_64` / `arm64`)** | N/A (requires Apple Metal) | N/A (requires Secure Enclave) | Supported (portable stdlib unit + `--offline-ci` manifest suite) |
 
@@ -174,14 +195,16 @@ See [`SECURITY.md`](SECURITY.md) for the full threat model. Key operational boun
 
 | Command | Purpose |
 |---|---|
-| `./scripts/models` | List all models in `models.yaml` with data-control rung, status, and usage policy (`--active` / `--sessions` inspects live served models, ports, caps, and TTL; `--json` emits JSON) |
-| `./scripts/session status\|start\|stop\|renew\|watch` | Operator authorization windows, live time/shared requests, explicit revocation, in-place Touch ID renewal, and foreground warnings (`--model`, `--for 2h`, `--json`, `--notify`) |
-| `./scripts/sync-model-catalog` | `--check` or `--apply` upstream model catalog drift against live enclave and Hugging Face sources |
-| `./scripts/serve-model <id>` | Start a local MLX server (`127.0.0.1:8080`) or dual attested proxy (`:8081` + `:9081`; `--interactive`, `--eval-caps`, `--thinking`, `--port`, `--refresh-session`) |
+| `./scripts/free-inference <cmd>` | Unified CLI entrypoint dispatching to `doctor`, `status`, `models`, `session`, `local`, `attested`, `delegate`, `sync`, `setup`, `se-key`, `serve`, `stop`, and `verify` (`--version`) |
+| `./scripts/doctor` | Read-only, offline-by-default environment, custody pointer, binary integrity, SE metadata, `/dev/bpf0`, registry, and live session audit (`--json`, `--strict`, `--check-catalog`) |
+| `./scripts/models` | List all models in `models.yaml` with data-control rung, status, and usage policy (`--active` / `--sessions` inspects live served models, ports, caps, live/recorded spend caps, and TTL; `--json` emits JSON) |
+| `./scripts/session status\|start\|stop\|renew\|watch` | Operator authorization windows, live time, shared requests, live token/estimated USD spend, optional `--max-actual-usd` spend cap, explicit revocation, in-place Touch ID renewal, and foreground warnings (`--model`, `--for 2h`, `--json`, `--notify`) |
+| `./scripts/sync-model-catalog` | `--check` or `--apply` upstream Tinfoil and Privatemode catalog drift (`--provider tinfoil\|privatemode\|all`, `--privatemode-tag`, `--safety-only`) |
+| `./scripts/serve-model <id>` | Start a local MLX server (`127.0.0.1:8080`) or dual attested proxy (`:8081` + `:9081`; `--interactive`, `--eval-caps`, `--max-actual-usd`, `--thinking`, `--port`, `--refresh-session`) |
 | `./scripts/verify-served-model <id>` | Verify active PID records (`pid_lstart`), `/v1/models`, and OS listener `--model` flags (`--require-offline` for Rung 1) |
 | `./scripts/stop-model <id>` | Stop a running model server or proxy after verifying `pid_lstart` (`--all` stops all) |
 | `./scripts/opencode-local` | Launch OpenCode locked to Rung 1 (`private-local`) with isolated state and Rung 1 MCP (`--port`, `--allow-subagents`, `--refresh-session`) |
-| `./scripts/opencode-attested` | Launch OpenCode locked to Rung 2/3 (`private-attested`) with spend caps (`--max-session-usd`, `--thinking`, `--allow-subagents`, `--port`, `--refresh-session`) and Rung 1 MCP |
+| `./scripts/opencode-attested` | Launch OpenCode locked to Rung 2/3 (`private-attested`) with spend ceilings and live caps (`--max-session-usd`, `--max-actual-usd`, `--thinking`, `--allow-subagents`, `--port`, `--refresh-session`) and Rung 1 MCP |
 | `./scripts/delegate-local <tool>` | Delegate bounded subtasks (`delegate_task`, `compress_context`, `extract_fields`, `propose_eval_prompts`) to Rung 1 |
 | `./scripts/se-key <cmd> <service>` | Build `bin/se-key-proxy` (also buildable standalone via `swift build --package-path tools/se_key_proxy -c release`), run `selftest`, or `store` / `migrate` / `status` / `delete` Secure Enclave keys |
 | `./scripts/eval <suite> <id>` | Run `sanity`, `v1`, or `tools` promptfoo suites plus streaming TTFT probe |
@@ -243,9 +266,11 @@ rm -rf ~/.config/free-inference/se-envelopes .venv node_modules bin .home
 ├── evals/{prompts,suites,rubrics,chat_templates,transforms}/
 ├── local_assist/                    Registry, catalog sync, launch helpers, admission gates, MCP server, SE key & worker sandbox
 ├── scripts/
+│   ├── free-inference               Unified CLI dispatcher (`doctor`, `status`, `local`, `attested`, `session`, `models`, `sync`, ...)
+│   ├── doctor                       Read-only, offline-by-default environment, custody, binary, and session audit
 │   ├── setup                        Bootstrap (--launcher-only, --local-only, or full), bin/se-key-proxy, bin/tinfoil-proxy
-│   ├── models                       List registered models with rung and usage policy (--version)
-│   ├── sync-model-catalog           Check/heal upstream catalog drift and reconcile [catalog-drift] issues
+│   ├── models                       List registered models with rung and usage policy (--version, --active)
+│   ├── sync-model-catalog           Check/heal upstream Tinfoil and Privatemode catalog drift and reconcile [catalog-drift] issues
 │   ├── se-key                       Build, selftest, store, status, and delete SE keys
 │   ├── serve-model / stop-model     Start/stop local MLX servers or dual attested proxies
 │   ├── verify-served-model          Verify PID records and live listener --model flags
@@ -255,11 +280,11 @@ rm -rf ~/.config/free-inference/se-envelopes .venv node_modules bin .home
 │   ├── delegate-local               CLI wrapper for Rung 1 local_assist tools
 │   ├── eval / timing / opencode-smoke
 │   └── *-e2e                        End-to-end verification harnesses
-├── tests/                           108 offline unit, catalog sync, Seatbelt, and SE selftests
-└── tools/se_key_proxy/main.swift    Hardware-backed Secure Enclave + Touch ID proxy
+├── tests/                           330 offline unit, doctor, spend metering, catalog sync, Seatbelt, and SE selftests
+└── tools/se_key_proxy/main.swift    Hardware-backed Secure Enclave + Touch ID proxy with live token/USD metering
 ```
 
-Run the offline unit, catalog sync, Seatbelt, and Secure Enclave selftest suite (108 tests, stdlib + Node):
+Run the offline unit, doctor, spend metering, catalog sync, Seatbelt, and Secure Enclave selftest suite (330 tests, stdlib + Node):
 
 ```bash
 .venv/bin/python -B -m unittest discover -s tests -v

@@ -10,11 +10,13 @@ import json
 import os
 from pathlib import Path
 import secrets
+import shlex
 import stat
 import sys
 import tempfile
 import time
 from typing import Iterator, Sequence
+import unicodedata
 
 try:
     import pwd
@@ -67,6 +69,132 @@ class VerifiedRunsDir:
     exists: bool
     stat_id: tuple[int, int] | None
     dir_fd: int | None
+
+
+POINTER_REFUSAL_REASONS: frozenset[str] = frozenset({
+    "home_untrusted",
+    "config_dir_untrusted",
+    "pointer_unreadable",
+    "pointer_mode_invalid",
+    "pointer_malformed",
+    "target_missing",
+    "target_untrusted_ancestor",
+    "target_untrusted_leaf",
+    "target_identity_changed",
+    "target_unreadable",
+})
+
+
+@dataclass(frozen=True)
+class _WalkFailureDetail:
+    reason_code: str
+    untrusted_ancestor: str | None = None
+    ancestor_owned_group_writable: bool = False
+
+
+@dataclass(frozen=True)
+class ActiveRunsPointerInspection:
+    status: str  # "ok", "absent", or "refused"
+    path: Path | None = None
+    stat_id: tuple[int, int] | None = None
+    reason_code: str | None = None
+    message: str | None = None
+    remediation: str | None = None
+    untrusted_ancestor: str | None = None
+    ancestor_owned_group_writable: bool = False
+    ancestor_path_shell_safe: bool = False
+
+
+def _sanitize_single_line_text(text: str) -> str:
+    out: list[str] = []
+    for ch in text:
+        code = ord(ch)
+        if code < 32 or code == 127:
+            out.append(f"\\x{code:02x}")
+        elif code >= 128 and (
+            unicodedata.category(ch).startswith("C")
+            or ch in ("\u0085", "\u2028", "\u2029")
+        ):
+            out.append(f"\\u{code:04x}" if code <= 0xFFFF else f"\\U{code:08x}")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _pointer_refusal_message_and_remediation(
+    reason_code: str,
+    *,
+    untrusted_ancestor: str | None = None,
+    ancestor_owned_group_writable: bool = False,
+) -> tuple[str, str]:
+    safe_anc = (
+        _sanitize_single_line_text(untrusted_ancestor)
+        if (
+            ancestor_owned_group_writable
+            and isinstance(untrusted_ancestor, str)
+            and untrusted_ancestor.startswith("/")
+        )
+        else None
+    )
+    if reason_code == "home_untrusted":
+        return (
+            "Active session pointer refused: passwd home directory is unavailable or untrusted.",
+            "Ensure your home directory is owned by your user and not group/world-writable.",
+        )
+    if reason_code == "config_dir_untrusted":
+        return (
+            "Active session pointer refused: ~/.config/free-inference has untrusted ownership, permissions, or changed during read.",
+            "Ensure ~/.config is not group/world-writable and ~/.config/free-inference is an owned 0700 directory (chmod 0700 ~/.config/free-inference).",
+        )
+    if reason_code == "pointer_unreadable":
+        return (
+            "Active session pointer refused: ~/.config/free-inference/active-runs.json could not be opened safely.",
+            "Remove any symlink/special file at ~/.config/free-inference/active-runs.json and run ./scripts/session start from your checkout.",
+        )
+    if reason_code == "pointer_mode_invalid":
+        return (
+            "Active session pointer refused: ~/.config/free-inference/active-runs.json must be an owned 0600 regular file (1..4096 bytes).",
+            "Run ./scripts/session start from your checkout to republish ~/.config/free-inference/active-runs.json with mode 0600.",
+        )
+    if reason_code == "pointer_malformed":
+        return (
+            "Active session pointer refused: ~/.config/free-inference/active-runs.json is malformed or has an unsupported schema.",
+            "Run ./scripts/session start from your checkout to republish ~/.config/free-inference/active-runs.json.",
+        )
+    if reason_code == "target_missing":
+        return (
+            "Active session pointer refused: target session store directory does not exist.",
+            "Run ./scripts/session start from your checkout to refresh ~/.config/free-inference/active-runs.json.",
+        )
+    if reason_code == "target_identity_changed":
+        return (
+            "Active session pointer refused: target session store directory identity (dev/ino) changed after publication.",
+            "Run ./scripts/session start from your checkout to refresh ~/.config/free-inference/active-runs.json.",
+        )
+    if reason_code == "target_untrusted_ancestor":
+        if safe_anc is not None and ancestor_owned_group_writable:
+            if safe_anc == untrusted_ancestor:
+                quoted_anc = shlex.quote(safe_anc)
+                rem_cmd = f"Tighten ancestor permissions (chmod 0750 {quoted_anc}) or use a session store under a 0700 directory."
+            else:
+                rem_cmd = "Tighten ancestor permissions to 0750 or use a session store under a 0700 directory."
+            return (
+                f"Active session pointer refused: ancestor directory '{safe_anc}' is group-writable.",
+                rem_cmd,
+            )
+        return (
+            "Active session pointer refused: an ancestor directory of the session store has untrusted ownership or permissions.",
+            "Ensure all ancestor directories of the session store are owned by root or your user and not group/world-writable.",
+        )
+    if reason_code == "target_untrusted_leaf":
+        return (
+            "Active session pointer refused: target session store directory has untrusted type, ownership, or permissions.",
+            "Ensure the session store is an owned non-symlink directory that is not group/world-writable.",
+        )
+    return (
+        "Active session pointer refused: target session store directory could not be validated safely.",
+        "Run ./scripts/doctor to inspect session store permissions and refresh ~/.config/free-inference/active-runs.json.",
+    )
 
 
 @dataclass(frozen=True)
@@ -263,7 +391,12 @@ def _trusted_code_root_ancestors() -> frozenset[str]:
 _CODE_ROOT_ANCESTORS: frozenset[str] = _trusted_code_root_ancestors()
 
 
-def _is_trusted_ancestor_stat(st: os.stat_result, *, cand_abs: str = "") -> bool:
+def _is_trusted_ancestor_stat(
+    st: os.stat_result,
+    *,
+    cand_abs: str = "",
+    allow_code_root_ancestors: bool = True,
+) -> bool:
     if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
         return False
     euid = os.geteuid() if hasattr(os, "geteuid") else st.st_uid
@@ -275,13 +408,23 @@ def _is_trusted_ancestor_stat(st: os.stat_result, *, cand_abs: str = "") -> bool
     if st.st_uid == 0 and bool(st.st_mode & stat.S_ISVTX):
         return True
     if (
-        cand_abs
+        allow_code_root_ancestors
+        and cand_abs
         and _strip_data_firmlink_prefix(cand_abs) in _CODE_ROOT_ANCESTORS
         and st.st_uid == euid
         and (mode & 0o002) == 0
     ):
         return True
     return False
+
+
+def _is_owned_group_writable_only_dir(st: os.stat_result, euid: int) -> bool:
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode):
+        return False
+    if st.st_uid != euid:
+        return False
+    mode = stat.S_IMODE(st.st_mode)
+    return (mode & 0o020) != 0 and (mode & 0o002) == 0
 
 
 def _fd_has_create_child_perm(st: os.stat_result) -> bool:
@@ -318,7 +461,7 @@ def _expand_tilde_strict(raw: str) -> tuple[str | None, str | None]:
     return raw, None
 
 
-def _walk_and_validate_runs_dir(
+def _walk_and_validate_runs_dir_detailed(
     raw_path: str | Path,
     *,
     require_existing: bool,
@@ -327,27 +470,29 @@ def _walk_and_validate_runs_dir(
     allow_tilde: bool = False,
     expected_stat: tuple[int, int] | None = None,
     label: str = "--runs-dir",
-) -> tuple[VerifiedRunsDir | None, str | None]:
+    allow_code_root_ancestors: bool = True,
+    require_creatable: bool = True,
+) -> tuple[VerifiedRunsDir | None, str | None, _WalkFailureDetail | None]:
     raw_str = str(raw_path) if isinstance(raw_path, Path) else raw_path
-    if not isinstance(raw_str, str) or not raw_str.strip():
-        return None, f"{label} must be a non-empty absolute path."
+    if not isinstance(raw_str, str) or not raw_str.strip() or "\x00" in raw_str:
+        return None, f"{label} must be a non-empty absolute path.", _WalkFailureDetail("target_unreadable")
     cleaned = raw_str.strip()
     if allow_tilde and cleaned.startswith("~"):
         exp, t_err = _expand_tilde_strict(cleaned)
         if t_err is not None or exp is None:
-            return None, t_err or f"Invalid {label}: {raw_path!r}."
+            return None, t_err or f"Invalid {label}: {raw_path!r}.", _WalkFailureDetail("target_unreadable")
         cleaned = exp
     if not cleaned.startswith("/"):
-        return None, f"{label} must be an absolute path, got {raw_path!r}."
+        return None, f"{label} must be an absolute path, got {raw_path!r}.", _WalkFailureDetail("target_unreadable")
     if len(cleaned) > 1:
         cleaned = cleaned.rstrip("/")
     if "//" in cleaned:
-        return None, f"{label} must not contain duplicate '/' separators: {raw_path!r}."
+        return None, f"{label} must not contain duplicate '/' separators: {raw_path!r}.", _WalkFailureDetail("target_unreadable")
     segments = [s for s in cleaned.split("/") if s]
     if not segments:
-        return None, f"{label} cannot be the root directory '/'."
+        return None, f"{label} cannot be the root directory '/'.", _WalkFailureDetail("target_unreadable")
     if "." in segments or ".." in segments:
-        return None, f"{label} must not contain '.' or '..' segments: {raw_path!r}."
+        return None, f"{label} must not contain '.' or '..' segments: {raw_path!r}.", _WalkFailureDetail("target_unreadable")
 
     o_dir = getattr(os, "O_DIRECTORY", 0)
     o_nofollow = getattr(os, "O_NOFOLLOW", 0)
@@ -358,10 +503,10 @@ def _walk_and_validate_runs_dir(
         cur_fd = os.open("/", os.O_RDONLY | o_dir)
     except PermissionError as exc:
         if exc.errno != errno.EPERM:
-            return None, f"{label}: cannot open '/': {exc}"
+            return None, f"{label}: cannot open '/': {exc}", _WalkFailureDetail("target_unreadable")
         cur_fd = None
     except OSError as exc:
-        return None, f"{label}: cannot open '/': {exc}"
+        return None, f"{label}: cannot open '/': {exc}", _WalkFailureDetail("target_unreadable")
 
     def _close_quiet(fd: int | None) -> None:
         if fd is not None and fd >= 0:
@@ -370,9 +515,9 @@ def _walk_and_validate_runs_dir(
             except OSError:
                 pass
 
-    def _verify_darwin_fd_path(fd: int, expected_abs: str) -> str | None:
+    def _verify_darwin_fd_path(fd: int, expected_abs: str) -> tuple[str | None, _WalkFailureDetail | None]:
         if sys.platform != "darwin":
-            return None
+            return None, None
         try:
             raw_fd_path = (
                 fcntl.fcntl(fd, _DARWIN_F_GETPATH, bytes(1024))
@@ -380,10 +525,13 @@ def _walk_and_validate_runs_dir(
                 .decode("utf-8", errors="surrogateescape")
             )
         except OSError as exc:
-            return f"{label}: F_GETPATH failed on '{expected_abs}': {exc}"
+            return f"{label}: F_GETPATH failed on '{expected_abs}': {exc}", _WalkFailureDetail("target_unreadable")
         if _strip_data_firmlink_prefix(raw_fd_path) != _strip_data_firmlink_prefix(expected_abs):
-            return f"{label}: descriptor path mismatch on '{expected_abs}' (got '{raw_fd_path}')."
-        return None
+            return (
+                f"{label}: descriptor path mismatch on '{expected_abs}' (got '{raw_fd_path}').",
+                _WalkFailureDetail("target_identity_changed"),
+            )
+        return None, None
 
     canonical_parts: list[str] = []
     try:
@@ -402,11 +550,11 @@ def _walk_and_validate_runs_dir(
                     st0 = None
                 except OSError as exc:
                     _close_quiet(cur_fd)
-                    return None, f"{label}: cannot inspect '/{seg}': {exc}"
+                    return None, f"{label}: cannot inspect '/{seg}': {exc}", _WalkFailureDetail("target_unreadable")
                 if st0 is not None and stat.S_ISLNK(st0.st_mode):
                     if is_leaf:
                         _close_quiet(cur_fd)
-                        return None, f"{label} '{cleaned}' must not be a symlink."
+                        return None, f"{label} '{cleaned}' must not be a symlink.", _WalkFailureDetail("target_untrusted_leaf")
                     try:
                         link_target = (
                             os.readlink(seg, dir_fd=cur_fd)
@@ -415,10 +563,14 @@ def _walk_and_validate_runs_dir(
                         )
                     except OSError as exc:
                         _close_quiet(cur_fd)
-                        return None, f"{label}: cannot readlink '/{seg}': {exc}"
+                        return None, f"{label}: cannot readlink '/{seg}': {exc}", _WalkFailureDetail("target_unreadable")
                     if st0.st_uid != 0 or link_target != f"private/{seg}":
                         _close_quiet(cur_fd)
-                        return None, f"{label}: untrusted symlink ancestor '/{seg}'."
+                        return (
+                            None,
+                            f"{label}: untrusted symlink ancestor '/{seg}'.",
+                            _WalkFailureDetail("target_untrusted_ancestor", untrusted_ancestor=f"/{seg}"),
+                        )
                     priv_fd: int | None = None
                     try:
                         priv_fd = (
@@ -429,7 +581,7 @@ def _walk_and_validate_runs_dir(
                     except PermissionError as exc:
                         if exc.errno != errno.EPERM:
                             _close_quiet(cur_fd)
-                            return None, f"{label}: cannot open '/private': {exc}"
+                            return None, f"{label}: cannot open '/private': {exc}", _WalkFailureDetail("target_unreadable")
                         try:
                             st_priv = (
                                 os.stat("private", dir_fd=cur_fd, follow_symlinks=False)
@@ -438,21 +590,37 @@ def _walk_and_validate_runs_dir(
                             )
                         except OSError as st_exc:
                             _close_quiet(cur_fd)
-                            return None, f"{label}: cannot inspect '/private': {st_exc}"
-                        if not _is_trusted_ancestor_stat(st_priv):
+                            return None, f"{label}: cannot inspect '/private': {st_exc}", _WalkFailureDetail("target_unreadable")
+                        if not _is_trusted_ancestor_stat(st_priv, allow_code_root_ancestors=allow_code_root_ancestors):
                             _close_quiet(cur_fd)
-                            return None, f"{label}: untrusted '/private' directory."
+                            return (
+                                None,
+                                f"{label}: untrusted '/private' directory.",
+                                _WalkFailureDetail(
+                                    "target_untrusted_ancestor",
+                                    untrusted_ancestor="/private",
+                                    ancestor_owned_group_writable=_is_owned_group_writable_only_dir(st_priv, euid),
+                                ),
+                            )
                         _close_quiet(cur_fd)
                         cur_fd = None
                     except OSError as exc:
                         _close_quiet(cur_fd)
-                        return None, f"{label}: cannot open '/private': {exc}"
+                        return None, f"{label}: cannot open '/private': {exc}", _WalkFailureDetail("target_unreadable")
                     else:
                         st_priv = os.fstat(priv_fd)
-                        if not _is_trusted_ancestor_stat(st_priv):
+                        if not _is_trusted_ancestor_stat(st_priv, allow_code_root_ancestors=allow_code_root_ancestors):
                             _close_quiet(priv_fd)
                             _close_quiet(cur_fd)
-                            return None, f"{label}: untrusted '/private' directory."
+                            return (
+                                None,
+                                f"{label}: untrusted '/private' directory.",
+                                _WalkFailureDetail(
+                                    "target_untrusted_ancestor",
+                                    untrusted_ancestor="/private",
+                                    ancestor_owned_group_writable=_is_owned_group_writable_only_dir(st_priv, euid),
+                                ),
+                            )
                         _close_quiet(cur_fd)
                         cur_fd = priv_fd
 
@@ -467,7 +635,7 @@ def _walk_and_validate_runs_dir(
                     except PermissionError as exc:
                         if exc.errno != errno.EPERM:
                             _close_quiet(cur_fd)
-                            return None, f"{label}: cannot open '{sub_abs}': {exc}"
+                            return None, f"{label}: cannot open '{sub_abs}': {exc}", _WalkFailureDetail("target_unreadable")
                         try:
                             st_sub = (
                                 os.stat(seg, dir_fd=cur_fd, follow_symlinks=False)
@@ -476,26 +644,42 @@ def _walk_and_validate_runs_dir(
                             )
                         except OSError as st_exc:
                             _close_quiet(cur_fd)
-                            return None, f"{label}: cannot inspect '{sub_abs}': {st_exc}"
-                        if not _is_trusted_ancestor_stat(st_sub):
+                            return None, f"{label}: cannot inspect '{sub_abs}': {st_exc}", _WalkFailureDetail("target_unreadable")
+                        if not _is_trusted_ancestor_stat(st_sub, allow_code_root_ancestors=allow_code_root_ancestors):
                             _close_quiet(cur_fd)
-                            return None, f"{label}: untrusted ancestor '{sub_abs}'."
+                            return (
+                                None,
+                                f"{label}: untrusted ancestor '{sub_abs}'.",
+                                _WalkFailureDetail(
+                                    "target_untrusted_ancestor",
+                                    untrusted_ancestor=sub_abs,
+                                    ancestor_owned_group_writable=_is_owned_group_writable_only_dir(st_sub, euid),
+                                ),
+                            )
                         _close_quiet(cur_fd)
                         cur_fd = None
                     except OSError as exc:
                         _close_quiet(cur_fd)
-                        return None, f"{label}: cannot open '{sub_abs}': {exc}"
+                        return None, f"{label}: cannot open '{sub_abs}': {exc}", _WalkFailureDetail("target_unreadable")
                     else:
                         st_sub = os.fstat(sub_fd)
-                        if not _is_trusted_ancestor_stat(st_sub):
+                        if not _is_trusted_ancestor_stat(st_sub, allow_code_root_ancestors=allow_code_root_ancestors):
                             _close_quiet(sub_fd)
                             _close_quiet(cur_fd)
-                            return None, f"{label}: untrusted ancestor '{sub_abs}'."
+                            return (
+                                None,
+                                f"{label}: untrusted ancestor '{sub_abs}'.",
+                                _WalkFailureDetail(
+                                    "target_untrusted_ancestor",
+                                    untrusted_ancestor=sub_abs,
+                                    ancestor_owned_group_writable=_is_owned_group_writable_only_dir(st_sub, euid),
+                                ),
+                            )
                         if cur_fd is None:
-                            fd_err = _verify_darwin_fd_path(sub_fd, sub_abs)
+                            fd_err, fd_det = _verify_darwin_fd_path(sub_fd, sub_abs)
                             if fd_err is not None:
                                 _close_quiet(sub_fd)
-                                return None, fd_err
+                                return None, fd_err, fd_det
                         _close_quiet(cur_fd)
                         cur_fd = sub_fd
                     canonical_parts.extend(["private", seg])
@@ -516,25 +700,33 @@ def _walk_and_validate_runs_dir(
                     return (
                         None,
                         f"{label} '{cleaned}' must be an existing, non-symlink directory owned by uid {euid} and not group/world-writable.",
+                        _WalkFailureDetail("target_missing"),
                     )
                 if cur_fd is None:
                     return (
                         None,
                         f"{label}: nearest existing ancestor for '{cleaned}' is not accessible.",
+                        _WalkFailureDetail("target_unreadable"),
                     )
                 if not create:
-                    st_cur = os.fstat(cur_fd)
-                    if not _fd_has_create_child_perm(st_cur):
-                        _close_quiet(cur_fd)
-                        return None, f"{label}: nearest existing ancestor for '{cleaned}' is not writable."
+                    if require_creatable:
+                        st_cur = os.fstat(cur_fd)
+                        if not _fd_has_create_child_perm(st_cur):
+                            _close_quiet(cur_fd)
+                            return (
+                                None,
+                                f"{label}: nearest existing ancestor for '{cleaned}' is not writable.",
+                                _WalkFailureDetail("target_unreadable"),
+                            )
                     anc_abs = "/" + "/".join(canonical_parts)
-                    fd_err = _verify_darwin_fd_path(cur_fd, anc_abs)
+                    fd_err, fd_det = _verify_darwin_fd_path(cur_fd, anc_abs)
                     _close_quiet(cur_fd)
                     if fd_err is not None:
-                        return None, fd_err
+                        return None, fd_err, fd_det
                     abs_absent = Path("/" + "/".join([*canonical_parts, *segments[idx:]]))
                     return (
                         VerifiedRunsDir(path=abs_absent, exists=False, stat_id=None, dir_fd=None),
+                        None,
                         None,
                     )
                 # create=True: create descriptor-relatively inside cur_fd with mode 0700.
@@ -546,19 +738,27 @@ def _walk_and_validate_runs_dir(
                     created_here = False
                 except OSError as exc:
                     _close_quiet(cur_fd)
-                    return None, f"{label}: failed to create directory component '{seg}' for '{cleaned}': {exc}"
+                    return (
+                        None,
+                        f"{label}: failed to create directory component '{seg}' for '{cleaned}': {exc}",
+                        _WalkFailureDetail("target_unreadable"),
+                    )
                 try:
                     next_fd = os.open(seg, os.O_RDONLY | o_dir | o_nofollow, dir_fd=cur_fd)
                 except OSError as exc:
                     _close_quiet(cur_fd)
-                    return None, f"{label}: component '{seg}' in '{cleaned}' failed no-follow directory open after mkdir: {exc}"
+                    return (
+                        None,
+                        f"{label}: component '{seg}' in '{cleaned}' failed no-follow directory open after mkdir: {exc}",
+                        _WalkFailureDetail("target_untrusted_leaf" if is_leaf else "target_untrusted_ancestor"),
+                    )
                 if created_here:
                     try:
                         os.fchmod(next_fd, 0o700)
                     except OSError as exc:
                         _close_quiet(next_fd)
                         _close_quiet(cur_fd)
-                        return None, f"{label}: failed to chmod 0700 on '{seg}': {exc}"
+                        return None, f"{label}: failed to chmod 0700 on '{seg}': {exc}", _WalkFailureDetail("target_unreadable")
                 st_created = os.fstat(next_fd)
                 if (
                     not stat.S_ISDIR(st_created.st_mode)
@@ -570,6 +770,11 @@ def _walk_and_validate_runs_dir(
                     return (
                         None,
                         f"{label}: directory component '{seg}' in '{cleaned}' has untrusted ownership or permissions.",
+                        _WalkFailureDetail(
+                            "target_untrusted_leaf" if is_leaf else "target_untrusted_ancestor",
+                            untrusted_ancestor=None if is_leaf else cand_abs,
+                            ancestor_owned_group_writable=False if is_leaf else _is_owned_group_writable_only_dir(st_created, euid),
+                        ),
                     )
                 _close_quiet(cur_fd)
                 cur_fd = next_fd
@@ -585,27 +790,40 @@ def _walk_and_validate_runs_dir(
                         )
                     except OSError as st_exc:
                         _close_quiet(cur_fd)
-                        return None, f"{label}: cannot inspect ancestor '{cand_abs}': {st_exc}"
-                    if not _is_trusted_ancestor_stat(st_anc, cand_abs=cand_abs):
+                        return None, f"{label}: cannot inspect ancestor '{cand_abs}': {st_exc}", _WalkFailureDetail("target_unreadable")
+                    if not _is_trusted_ancestor_stat(
+                        st_anc,
+                        cand_abs=cand_abs,
+                        allow_code_root_ancestors=allow_code_root_ancestors,
+                    ):
                         _close_quiet(cur_fd)
                         return (
                             None,
                             f"{label}: ancestor directory '{cand_abs}' has untrusted ownership or group/world-writable permissions.",
+                            _WalkFailureDetail(
+                                "target_untrusted_ancestor",
+                                untrusted_ancestor=cand_abs,
+                                ancestor_owned_group_writable=_is_owned_group_writable_only_dir(st_anc, euid),
+                            ),
                         )
                     _close_quiet(cur_fd)
                     cur_fd = None
                     canonical_parts.append(seg)
                     continue
                 _close_quiet(cur_fd)
-                return None, f"{label}: cannot open component '{seg}' in '{cleaned}': {exc}"
+                return None, f"{label}: cannot open component '{seg}' in '{cleaned}': {exc}", _WalkFailureDetail("target_unreadable")
             except OSError as exc:
                 _close_quiet(cur_fd)
                 if exc.errno in (errno.ELOOP, errno.ENOTDIR, getattr(errno, "EFTYPE", -1)):
                     return (
                         None,
                         f"{label} '{cleaned}' must be an existing, non-symlink directory owned by uid {euid} and not group/world-writable.",
+                        _WalkFailureDetail(
+                            "target_untrusted_leaf" if is_leaf else "target_untrusted_ancestor",
+                            untrusted_ancestor=None if is_leaf else cand_abs,
+                        ),
                     )
-                return None, f"{label}: cannot open component '{seg}' in '{cleaned}': {exc}"
+                return None, f"{label}: cannot open component '{seg}' in '{cleaned}': {exc}", _WalkFailureDetail("target_unreadable")
 
             st_next = os.fstat(next_fd)
             if is_leaf:
@@ -619,27 +837,37 @@ def _walk_and_validate_runs_dir(
                     return (
                         None,
                         f"{label} '{cleaned}' must be an existing, non-symlink directory owned by uid {euid} and not group/world-writable.",
+                        _WalkFailureDetail("target_untrusted_leaf"),
                     )
             else:
-                if not _is_trusted_ancestor_stat(st_next, cand_abs=cand_abs):
+                if not _is_trusted_ancestor_stat(
+                    st_next,
+                    cand_abs=cand_abs,
+                    allow_code_root_ancestors=allow_code_root_ancestors,
+                ):
                     _close_quiet(next_fd)
                     _close_quiet(cur_fd)
                     return (
                         None,
                         f"{label}: ancestor directory '{cand_abs}' has untrusted ownership or group/world-writable permissions.",
+                        _WalkFailureDetail(
+                            "target_untrusted_ancestor",
+                            untrusted_ancestor=cand_abs,
+                            ancestor_owned_group_writable=_is_owned_group_writable_only_dir(st_next, euid),
+                        ),
                     )
             if was_unanchored:
-                fd_err = _verify_darwin_fd_path(next_fd, cand_abs)
+                fd_err, fd_det = _verify_darwin_fd_path(next_fd, cand_abs)
                 if fd_err is not None:
                     _close_quiet(next_fd)
                     _close_quiet(cur_fd)
-                    return None, fd_err
+                    return None, fd_err, fd_det
             _close_quiet(cur_fd)
             cur_fd = next_fd
             canonical_parts.append(seg)
 
         if cur_fd is None:
-            return None, f"{label}: cannot open leaf directory '{cleaned}'."
+            return None, f"{label}: cannot open leaf directory '{cleaned}'.", _WalkFailureDetail("target_unreadable")
         canonical_path = Path("/" + "/".join(canonical_parts))
         st_leaf = os.fstat(cur_fd)
         actual_stat = (int(st_leaf.st_dev), int(st_leaf.st_ino))
@@ -648,37 +876,68 @@ def _walk_and_validate_runs_dir(
             return (
                 None,
                 f"{label} '{canonical_path}' directory identity changed after validation (expected {expected_stat}, got {actual_stat}).",
+                _WalkFailureDetail("target_identity_changed"),
             )
         try:
             st_path = os.lstat(canonical_path)
         except OSError as exc:
             _close_quiet(cur_fd)
-            return None, f"{label}: post-walk lstat failed on '{canonical_path}': {exc}"
+            return None, f"{label}: post-walk lstat failed on '{canonical_path}': {exc}", _WalkFailureDetail("target_identity_changed")
         if (
             stat.S_ISLNK(st_path.st_mode)
             or not stat.S_ISDIR(st_path.st_mode)
             or (int(st_path.st_dev), int(st_path.st_ino)) != actual_stat
         ):
             _close_quiet(cur_fd)
-            return None, f"{label}: directory '{canonical_path}' was replaced during validation."
-        fd_leaf_err = _verify_darwin_fd_path(cur_fd, str(canonical_path))
+            return (
+                None,
+                f"{label}: directory '{canonical_path}' was replaced during validation.",
+                _WalkFailureDetail("target_identity_changed"),
+            )
+        fd_leaf_err, fd_leaf_det = _verify_darwin_fd_path(cur_fd, str(canonical_path))
         if fd_leaf_err is not None:
             _close_quiet(cur_fd)
-            return None, fd_leaf_err
+            return None, fd_leaf_err, fd_leaf_det
 
         if retain_fd:
             return (
                 VerifiedRunsDir(path=canonical_path, exists=True, stat_id=actual_stat, dir_fd=cur_fd),
+                None,
                 None,
             )
         _close_quiet(cur_fd)
         return (
             VerifiedRunsDir(path=canonical_path, exists=True, stat_id=actual_stat, dir_fd=None),
             None,
+            None,
         )
     except BaseException:
         _close_quiet(cur_fd)
         raise
+
+
+def _walk_and_validate_runs_dir(
+    raw_path: str | Path,
+    *,
+    require_existing: bool,
+    create: bool,
+    retain_fd: bool = False,
+    allow_tilde: bool = False,
+    expected_stat: tuple[int, int] | None = None,
+    label: str = "--runs-dir",
+    allow_code_root_ancestors: bool = True,
+) -> tuple[VerifiedRunsDir | None, str | None]:
+    res, err, _ = _walk_and_validate_runs_dir_detailed(
+        raw_path,
+        require_existing=require_existing,
+        create=create,
+        retain_fd=retain_fd,
+        allow_tilde=allow_tilde,
+        expected_stat=expected_stat,
+        label=label,
+        allow_code_root_ancestors=allow_code_root_ancestors,
+    )
+    return res, err
 
 
 def raw_env_runs_dir() -> str | None:
@@ -715,6 +974,7 @@ def inspect_existing_runs_dir(
     *,
     expected_stat: tuple[int, int] | None = None,
     label: str = "--runs-dir",
+    allow_code_root_ancestors: bool = True,
 ) -> tuple[VerifiedRunsDir | None, str | None]:
     return _walk_and_validate_runs_dir(
         raw_path,
@@ -724,6 +984,7 @@ def inspect_existing_runs_dir(
         allow_tilde=False,
         expected_stat=expected_stat,
         label=label,
+        allow_code_root_ancestors=allow_code_root_ancestors,
     )
 
 
@@ -739,6 +1000,7 @@ def validate_creatable_runs_dir(
     *,
     allow_tilde: bool = False,
     label: str = "--runs-dir",
+    allow_code_root_ancestors: bool = True,
 ) -> tuple[VerifiedRunsDir | None, str | None]:
     return _walk_and_validate_runs_dir(
         raw_path,
@@ -748,6 +1010,7 @@ def validate_creatable_runs_dir(
         allow_tilde=allow_tilde,
         expected_stat=None,
         label=label,
+        allow_code_root_ancestors=allow_code_root_ancestors,
     )
 
 
@@ -758,6 +1021,7 @@ def ensure_creatable_runs_dir(
     allow_tilde: bool = False,
     expected_stat: tuple[int, int] | None = None,
     label: str = "--runs-dir",
+    allow_code_root_ancestors: bool = True,
 ) -> tuple[VerifiedRunsDir | None, str | None]:
     return _walk_and_validate_runs_dir(
         raw_path,
@@ -767,6 +1031,7 @@ def ensure_creatable_runs_dir(
         allow_tilde=allow_tilde,
         expected_stat=expected_stat,
         label=label,
+        allow_code_root_ancestors=allow_code_root_ancestors,
     )
 
 
@@ -775,6 +1040,7 @@ def open_existing_runs_dir(
     *,
     expected_stat: tuple[int, int] | None = None,
     label: str = "--runs-dir",
+    allow_code_root_ancestors: bool = True,
 ) -> tuple[VerifiedRunsDir | None, str | None]:
     return _walk_and_validate_runs_dir(
         raw_path,
@@ -784,6 +1050,7 @@ def open_existing_runs_dir(
         allow_tilde=False,
         expected_stat=expected_stat,
         label=label,
+        allow_code_root_ancestors=allow_code_root_ancestors,
     )
 
 
@@ -1433,6 +1700,39 @@ def write_active_runs_pointer(
             os.close(fi_fd)
         except OSError:
             pass
+    try:
+        port_res = check_runs_dir_custody_portability(
+            v_res.path,
+            expected_stat=v_res.stat_id,
+            require_existing=True,
+        )
+        if port_res.status == "refused":
+            if (
+                port_res.reason_code == "target_untrusted_ancestor"
+                and port_res.ancestor_owned_group_writable
+                and port_res.untrusted_ancestor
+            ):
+                safe_anc = _sanitize_single_line_text(port_res.untrusted_ancestor)
+                if port_res.ancestor_path_shell_safe and safe_anc == port_res.untrusted_ancestor:
+                    quoted_anc = shlex.quote(safe_anc)
+                    warn_line = (
+                        f"WARNING: active-runs.json target has group-writable ancestor '{safe_anc}'; "
+                        f"read-only custody launchers will refuse it (fix: chmod 0750 {quoted_anc}).\n"
+                    )
+                else:
+                    warn_line = (
+                        f"WARNING: active-runs.json target has group-writable ancestor '{safe_anc}'; "
+                        "read-only custody launchers will refuse it (tighten ancestor permissions to 0750).\n"
+                    )
+            else:
+                reason = _sanitize_single_line_text(str(port_res.reason_code or "target_unreadable"))
+                warn_line = (
+                    f"WARNING: active-runs.json target may not be readable by read-only custody launchers "
+                    f"(reason: {reason}).\n"
+                )
+            sys.stderr.write(warn_line)
+    except Exception:
+        pass
     return fi_dir / ACTIVE_RUNS_POINTER_FILENAME
 
 
@@ -1440,76 +1740,343 @@ def _after_pointer_read_hook() -> None:
     return
 
 
-def read_active_runs_pointer() -> Path | None:
-    fi_dir = resolve_user_free_inference_config_dir(create=False)
-    if fi_dir is None:
-        clear_pinned_pointer_fd()
-        return None
-    ptr_path = fi_dir / ACTIVE_RUNS_POINTER_FILENAME
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+def _before_pointer_chain_recheck_hook() -> None:
+    return
+
+
+def _build_pointer_refusal(
+    reason_code: str,
+    *,
+    untrusted_ancestor: str | None = None,
+    ancestor_owned_group_writable: bool = False,
+) -> ActiveRunsPointerInspection:
+    code = reason_code if reason_code in POINTER_REFUSAL_REASONS else "target_unreadable"
+    raw_anc = (
+        untrusted_ancestor
+        if (
+            ancestor_owned_group_writable
+            and isinstance(untrusted_ancestor, str)
+            and untrusted_ancestor.startswith("/")
+        )
+        else None
+    )
+    safe_anc = _sanitize_single_line_text(raw_anc) if raw_anc is not None else None
+    shell_safe = raw_anc is not None and safe_anc == raw_anc
+    msg, rem = _pointer_refusal_message_and_remediation(
+        code,
+        untrusted_ancestor=raw_anc,
+        ancestor_owned_group_writable=ancestor_owned_group_writable,
+    )
+    return ActiveRunsPointerInspection(
+        status="refused",
+        path=None,
+        stat_id=None,
+        reason_code=code,
+        message=msg,
+        remediation=rem,
+        untrusted_ancestor=safe_anc,
+        ancestor_owned_group_writable=ancestor_owned_group_writable,
+        ancestor_path_shell_safe=shell_safe,
+    )
+
+
+def check_runs_dir_custody_portability(
+    runs_dir: str | Path,
+    *,
+    expected_stat: tuple[int, int] | None = None,
+    require_existing: bool = True,
+    require_creatable: bool = True,
+) -> ActiveRunsPointerInspection:
+    v_res, v_err, detail = _walk_and_validate_runs_dir_detailed(
+        runs_dir,
+        require_existing=require_existing,
+        create=False,
+        retain_fd=False,
+        allow_tilde=False,
+        expected_stat=expected_stat,
+        label="active-runs pointer",
+        allow_code_root_ancestors=False,
+        require_creatable=require_creatable,
+    )
+    if v_err is not None or v_res is None:
+        return _build_pointer_refusal(
+            detail.reason_code if detail is not None else "target_unreadable",
+            untrusted_ancestor=detail.untrusted_ancestor if detail is not None else None,
+            ancestor_owned_group_writable=detail.ancestor_owned_group_writable if detail is not None else False,
+        )
+    if not v_res.exists:
+        return ActiveRunsPointerInspection(status="absent")
+    return ActiveRunsPointerInspection(
+        status="ok",
+        path=v_res.path,
+        stat_id=v_res.stat_id,
+    )
+
+
+def _verify_pointer_parent_chain(
+    home_dir: Path,
+    home_fd: int,
+    st_home: os.stat_result,
+    *,
+    cfg_fd: int | None = None,
+    st_cfg: os.stat_result | None = None,
+    fi_fd: int | None = None,
+    st_fi: os.stat_result | None = None,
+    euid: int,
+) -> bool:
+    _before_pointer_chain_recheck_hook()
     try:
-        fd = os.open(str(ptr_path), flags)
+        cur_home = os.lstat(home_dir)
     except OSError:
-        clear_pinned_pointer_fd()
-        return None
+        return False
+    if (
+        stat.S_ISLNK(cur_home.st_mode)
+        or not stat.S_ISDIR(cur_home.st_mode)
+        or cur_home.st_uid != euid
+        or (stat.S_IMODE(cur_home.st_mode) & 0o022) != 0
+        or (cur_home.st_dev, cur_home.st_ino) != (st_home.st_dev, st_home.st_ino)
+    ):
+        return False
+    if cfg_fd is not None:
+        if st_cfg is None:
+            return False
+        try:
+            cur_cfg = os.stat(".config", dir_fd=home_fd, follow_symlinks=False)
+        except OSError:
+            return False
+        if (
+            stat.S_ISLNK(cur_cfg.st_mode)
+            or not stat.S_ISDIR(cur_cfg.st_mode)
+            or cur_cfg.st_uid != euid
+            or (stat.S_IMODE(cur_cfg.st_mode) & 0o022) != 0
+            or (cur_cfg.st_dev, cur_cfg.st_ino) != (st_cfg.st_dev, st_cfg.st_ino)
+        ):
+            return False
+    if fi_fd is not None:
+        if cfg_fd is None or st_fi is None:
+            return False
+        try:
+            cur_fi = os.stat("free-inference", dir_fd=cfg_fd, follow_symlinks=False)
+        except OSError:
+            return False
+        if (
+            stat.S_ISLNK(cur_fi.st_mode)
+            or not stat.S_ISDIR(cur_fi.st_mode)
+            or cur_fi.st_uid != euid
+            or stat.S_IMODE(cur_fi.st_mode) != 0o700
+            or (cur_fi.st_dev, cur_fi.st_ino) != (st_fi.st_dev, st_fi.st_ino)
+        ):
+            return False
+    return True
+
+
+def inspect_active_runs_pointer(
+    *,
+    pin_fd: bool = True,
+    allow_code_root_ancestors: bool = True,
+) -> ActiveRunsPointerInspection:
+    def _finish_non_ok(result: ActiveRunsPointerInspection) -> ActiveRunsPointerInspection:
+        if pin_fd:
+            clear_pinned_pointer_fd()
+        return result
+
+    home_dir = _resolve_passwd_home_dir()
+    if home_dir is None:
+        return _finish_non_ok(_build_pointer_refusal("home_untrusted"))
+
+    o_dir = getattr(os, "O_DIRECTORY", 0)
+    o_nofollow = getattr(os, "O_NOFOLLOW", 0)
+    o_nonblock = getattr(os, "O_NONBLOCK", 0)
+    euid = os.geteuid() if hasattr(os, "geteuid") else 0
+
+    home_fd: int | None = None
+    cfg_fd: int | None = None
+    fi_fd: int | None = None
+    ptr_fd: int | None = None
+    raw: bytes = b""
     try:
-        st = os.fstat(fd)
+        try:
+            home_fd = os.open(str(home_dir), os.O_RDONLY | o_dir | o_nofollow)
+            st_home = os.fstat(home_fd)
+        except OSError:
+            return _finish_non_ok(_build_pointer_refusal("home_untrusted"))
+        if (
+            not stat.S_ISDIR(st_home.st_mode)
+            or st_home.st_uid != euid
+            or (stat.S_IMODE(st_home.st_mode) & 0o022) != 0
+        ):
+            return _finish_non_ok(_build_pointer_refusal("home_untrusted"))
+
+        try:
+            cfg_fd = os.open(".config", os.O_RDONLY | o_dir | o_nofollow, dir_fd=home_fd)
+            st_cfg = os.fstat(cfg_fd)
+        except FileNotFoundError:
+            if not _verify_pointer_parent_chain(home_dir, home_fd, st_home, euid=euid):
+                return _finish_non_ok(_build_pointer_refusal("config_dir_untrusted"))
+            return _finish_non_ok(ActiveRunsPointerInspection(status="absent"))
+        except OSError:
+            return _finish_non_ok(_build_pointer_refusal("config_dir_untrusted"))
+        if (
+            not stat.S_ISDIR(st_cfg.st_mode)
+            or st_cfg.st_uid != euid
+            or (stat.S_IMODE(st_cfg.st_mode) & 0o022) != 0
+        ):
+            return _finish_non_ok(_build_pointer_refusal("config_dir_untrusted"))
+
+        try:
+            fi_fd = os.open("free-inference", os.O_RDONLY | o_dir | o_nofollow, dir_fd=cfg_fd)
+            st_fi = os.fstat(fi_fd)
+        except FileNotFoundError:
+            if not _verify_pointer_parent_chain(
+                home_dir, home_fd, st_home, cfg_fd=cfg_fd, st_cfg=st_cfg, euid=euid
+            ):
+                return _finish_non_ok(_build_pointer_refusal("config_dir_untrusted"))
+            return _finish_non_ok(ActiveRunsPointerInspection(status="absent"))
+        except OSError:
+            return _finish_non_ok(_build_pointer_refusal("config_dir_untrusted"))
+        if (
+            not stat.S_ISDIR(st_fi.st_mode)
+            or st_fi.st_uid != euid
+            or stat.S_IMODE(st_fi.st_mode) != 0o700
+        ):
+            return _finish_non_ok(_build_pointer_refusal("config_dir_untrusted"))
+
+        try:
+            ptr_fd = os.open(
+                ACTIVE_RUNS_POINTER_FILENAME,
+                os.O_RDONLY | o_nofollow | o_nonblock,
+                dir_fd=fi_fd,
+            )
+        except FileNotFoundError:
+            if not _verify_pointer_parent_chain(
+                home_dir,
+                home_fd,
+                st_home,
+                cfg_fd=cfg_fd,
+                st_cfg=st_cfg,
+                fi_fd=fi_fd,
+                st_fi=st_fi,
+                euid=euid,
+            ):
+                return _finish_non_ok(_build_pointer_refusal("config_dir_untrusted"))
+            return _finish_non_ok(ActiveRunsPointerInspection(status="absent"))
+        except OSError:
+            return _finish_non_ok(_build_pointer_refusal("pointer_unreadable"))
+
+        try:
+            st = os.fstat(ptr_fd)
+        except OSError:
+            return _finish_non_ok(_build_pointer_refusal("pointer_unreadable"))
         if (
             not stat.S_ISREG(st.st_mode)
-            or (hasattr(os, "geteuid") and st.st_uid != os.geteuid())
+            or st.st_uid != euid
             or stat.S_IMODE(st.st_mode) != 0o600
             or st.st_size <= 0
             or st.st_size > 4096
         ):
-            clear_pinned_pointer_fd()
-            return None
-        raw = os.read(fd, 4097)
-        if len(raw) > 4096:
-            clear_pinned_pointer_fd()
-            return None
-    except OSError:
-        clear_pinned_pointer_fd()
-        return None
-    finally:
+            return _finish_non_ok(_build_pointer_refusal("pointer_mode_invalid"))
+
         try:
-            os.close(fd)
+            chunks: list[bytes] = []
+            total = 0
+            while total <= 4096:
+                part = os.read(ptr_fd, 4097 - total)
+                if not part:
+                    break
+                chunks.append(part)
+                total += len(part)
+            raw = b"".join(chunks)
         except OSError:
-            pass
+            return _finish_non_ok(_build_pointer_refusal("pointer_unreadable"))
+        if len(raw) == 0 or len(raw) > 4096:
+            return _finish_non_ok(_build_pointer_refusal("pointer_mode_invalid"))
+
+        if not _verify_pointer_parent_chain(
+            home_dir,
+            home_fd,
+            st_home,
+            cfg_fd=cfg_fd,
+            st_cfg=st_cfg,
+            fi_fd=fi_fd,
+            st_fi=st_fi,
+            euid=euid,
+        ):
+            return _finish_non_ok(_build_pointer_refusal("config_dir_untrusted"))
+    finally:
+        for fd_item in (ptr_fd, fi_fd, cfg_fd, home_fd):
+            if fd_item is not None and fd_item >= 0:
+                try:
+                    os.close(fd_item)
+                except OSError:
+                    pass
 
     try:
         obj = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        clear_pinned_pointer_fd()
-        return None
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError):
+        return _finish_non_ok(_build_pointer_refusal("pointer_malformed"))
     if not isinstance(obj, dict):
-        clear_pinned_pointer_fd()
-        return None
+        return _finish_non_ok(_build_pointer_refusal("pointer_malformed"))
     if type(obj.get("schema_version")) is not int or obj["schema_version"] != ACTIVE_RUNS_POINTER_SCHEMA_VERSION:
-        clear_pinned_pointer_fd()
-        return None
+        return _finish_non_ok(_build_pointer_refusal("pointer_malformed"))
     raw_runs = obj.get("runs_dir")
-    if not isinstance(raw_runs, str) or not raw_runs.startswith("/"):
-        clear_pinned_pointer_fd()
-        return None
+    if (
+        not isinstance(raw_runs, str)
+        or not raw_runs.startswith("/")
+        or "\x00" in raw_runs
+        or any(ord(ch) < 32 or ord(ch) == 127 for ch in raw_runs)
+    ):
+        return _finish_non_ok(_build_pointer_refusal("pointer_malformed"))
+
     expected_ptr_stat: tuple[int, int] | None = None
     if "runs_dev" in obj or "runs_ino" in obj:
         raw_dev = obj.get("runs_dev")
         raw_ino = obj.get("runs_ino")
         if type(raw_dev) is not int or type(raw_ino) is not int or raw_ino <= 0:
-            clear_pinned_pointer_fd()
-            return None
+            return _finish_non_ok(_build_pointer_refusal("pointer_malformed"))
         expected_ptr_stat = (raw_dev, raw_ino)
-    v_ptr, ptr_err = open_existing_runs_dir(
-        raw_runs,
-        expected_stat=expected_ptr_stat,
-        label="active-runs pointer",
+
+    try:
+        v_ptr, ptr_err, walk_detail = _walk_and_validate_runs_dir_detailed(
+            raw_runs,
+            require_existing=True,
+            create=False,
+            retain_fd=pin_fd,
+            allow_tilde=False,
+            expected_stat=expected_ptr_stat,
+            label="active-runs pointer",
+            allow_code_root_ancestors=allow_code_root_ancestors,
+        )
+    except (ValueError, OSError):
+        return _finish_non_ok(_build_pointer_refusal("pointer_malformed"))
+    if ptr_err is not None or v_ptr is None or v_ptr.stat_id is None or (pin_fd and v_ptr.dir_fd is None):
+        if v_ptr is not None and v_ptr.dir_fd is not None and v_ptr.dir_fd >= 0:
+            try:
+                os.close(v_ptr.dir_fd)
+            except OSError:
+                pass
+        return _finish_non_ok(
+            _build_pointer_refusal(
+                walk_detail.reason_code if walk_detail is not None else "target_unreadable",
+                untrusted_ancestor=walk_detail.untrusted_ancestor if walk_detail is not None else None,
+                ancestor_owned_group_writable=(
+                    walk_detail.ancestor_owned_group_writable if walk_detail is not None else False
+                ),
+            )
+        )
+    if pin_fd:
+        assert v_ptr.dir_fd is not None
+        _set_pinned_pointer_fd(v_ptr.path, v_ptr.dir_fd, v_ptr.stat_id)
+        _after_pointer_read_hook()
+    return ActiveRunsPointerInspection(
+        status="ok",
+        path=v_ptr.path,
+        stat_id=v_ptr.stat_id,
     )
-    if ptr_err is not None or v_ptr is None or v_ptr.dir_fd is None or v_ptr.stat_id is None:
-        clear_pinned_pointer_fd()
-        return None
-    _set_pinned_pointer_fd(v_ptr.path, v_ptr.dir_fd, v_ptr.stat_id)
-    _after_pointer_read_hook()
-    return v_ptr.path
+
+
+def read_active_runs_pointer() -> Path | None:
+    res = inspect_active_runs_pointer(pin_fd=True)
+    return res.path if res.status == "ok" else None
 
 
 def unvalidated_external_worker_homes_path() -> Path | None:

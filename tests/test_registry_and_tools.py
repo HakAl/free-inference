@@ -3880,10 +3880,10 @@ class RegistryAndToolsTests(unittest.TestCase):
         from local_assist.server import SERVER_INFO
 
         # 1. Version parity across __init__.py, server.py, package.json, and scripts/models --version (A4)
-        self.assertEqual(local_assist.__version__, "0.3.1")
-        self.assertEqual(SERVER_INFO["version"], "0.3.1")
+        self.assertEqual(local_assist.__version__, "0.4.0")
+        self.assertEqual(SERVER_INFO["version"], "0.4.0")
         pkg_json = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))
-        self.assertEqual(pkg_json["version"], "0.3.1")
+        self.assertEqual(pkg_json["version"], "0.4.0")
 
         # 1b. Anchored release-hygiene.json scan.allow rule for Swift parameter label (Minor 4);
         # release-hygiene.json is private-only and absent in exported public clones / CI.
@@ -4058,7 +4058,7 @@ class RegistryAndToolsTests(unittest.TestCase):
                 text=True,
                 check=True,
             )
-            self.assertEqual(models_ver_clean.stdout.strip(), "free-inference-lab 0.3.1")
+            self.assertEqual(models_ver_clean.stdout.strip(), "free-inference-lab 0.4.0")
 
             for launcher_rel in ("opencode-local", "opencode-attested"):
                 hlp = subprocess.run(
@@ -7138,6 +7138,496 @@ class RegistryAndToolsTests(unittest.TestCase):
             self.assertEqual(meta_cold["ttl_seconds"], 7200)
             serve_cmd = cold_cmds[1]
             self.assertEqual(serve_cmd[serve_cmd.index("--ttl-seconds") + 1], "7200")
+
+    def test_serve_model_max_actual_usd_cli_reuse_and_post_ready_checks(self) -> None:
+        import importlib.machinery
+        import io
+        import subprocess
+        import types
+        from contextlib import redirect_stderr, redirect_stdout
+        from unittest.mock import patch
+
+        serve_path = ROOT / "scripts" / "serve-model"
+
+        # 1. Fail-closed exit 2 CLI validation via subprocess
+        cli_cases = [
+            ("non_proxy_model", ["qwen3-1.7b-mlx-4bit", "--max-actual-usd", "1.00"]),
+            ("max_tokens_cap_zero", ["tinfoil-deepseek-v4-1-flash", "--max-tokens-cap", "0", "--max-actual-usd", "1.00"]),
+            ("max_chat_requests_over_int32", ["tinfoil-deepseek-v4-1-flash", "--max-chat-requests", "2147483648"]),
+            ("invalid_usd_unicode", ["tinfoil-deepseek-v4-1-flash", "--max-actual-usd", "\u0661.5"]),
+            ("invalid_usd_overlong", ["tinfoil-deepseek-v4-1-flash", "--max-actual-usd", "1" + ("0" * 33)]),
+            ("invalid_usd_zero", ["tinfoil-deepseek-v4-1-flash", "--max-actual-usd", "0"]),
+        ]
+        for label, extra in cli_cases:
+            with self.subTest(label=label):
+                cp = subprocess.run(
+                    [sys.executable, str(serve_path), *extra],
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                )
+                self.assertEqual(cp.returncode, 2, f"{label}: rc={cp.returncode} stderr={cp.stderr}")
+
+        # 2. In-process already-active / starting reuse checks
+        loader = importlib.machinery.SourceFileLoader("serve_model_cap_mod", str(serve_path))
+        mod = types.ModuleType(loader.name)
+        mod.__file__ = str(serve_path)
+        loader.exec_module(mod)
+
+        healthy_live = {
+            "state": "ON",
+            "session_id": "sess-serve-1",
+            "pid": os.getpid(),
+            "model": "deepseek-v4-1-flash",
+            "generation": 1,
+            "remaining_seconds": 3600,
+            "expires_at": 2000000000,
+            "requests_used": 1,
+            "request_limit": 100,
+            "requests_remaining": 99,
+            "window_seconds": 7200,
+            "prompt_tokens": 0,
+            "cached_prompt_tokens": 0,
+            "completion_tokens": 0,
+            "usage_reported_requests": 0,
+            "usage_unreported_requests": 0,
+            "estimated_micro_usd": 0,
+            "max_actual_micro_usd": 1_000_000,
+            "spend_cap_exceeded": False,
+            "spend_cap_low": False,
+            "spend_indeterminate": False,
+        }
+        with tempfile.TemporaryDirectory() as td:
+            runs_dir = Path(td) / "runs"
+            runs_dir.mkdir(mode=0o700)
+            pid_path = pid_file_for_model("tinfoil-deepseek-v4-1-flash", runs_dir)
+
+            # Starting record refused when --max-actual-usd requested
+            pid_path.write_text(
+                json.dumps({
+                    "model_id": "tinfoil-deepseek-v4-1-flash",
+                    "repo": "deepseek-v4-1-flash",
+                    "port": 8081,
+                    "pid": os.getpid(),
+                    "pid_lstart": "fake-lstart",
+                    "status": "starting",
+                }),
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"FREE_INFERENCE_RUNS_DIR": str(runs_dir)}), \
+                 patch.object(mod, "_classify_pid_state", return_value="matched"), \
+                 redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                rc_start = mod.main(["serve-model", "tinfoil-deepseek-v4-1-flash", "--max-actual-usd", "1.00"])
+            self.assertEqual(rc_start, 1)
+
+            # Ready record reuse checks (looser, zero_reqs, indeterminate, exceeded -> fail; equal/stricter -> pass)
+            pid_path.write_text(
+                json.dumps({
+                    "model_id": "tinfoil-deepseek-v4-1-flash",
+                    "repo": "deepseek-v4-1-flash",
+                    "port": 8081,
+                    "pid": os.getpid(),
+                    "pid_lstart": "fake-lstart",
+                    "status": "ready",
+                }),
+                encoding="utf-8",
+            )
+            for label, live_obj, req_str, want_rc in [
+                ("equal_cap", healthy_live, "1.00", 0),
+                ("stricter_live_cap", healthy_live, "2.00", 0),
+                ("looser_live_cap", healthy_live, "0.50", 1),
+                ("zero_reqs", dict(healthy_live, requests_remaining=0, requests_used=100), "1.00", 1),
+                ("indeterminate", dict(healthy_live, spend_indeterminate=True), "1.00", 1),
+                ("exceeded", dict(healthy_live, spend_cap_exceeded=True), "1.00", 1),
+            ]:
+                with self.subTest(reuse=label), \
+                     patch.dict(os.environ, {"FREE_INFERENCE_RUNS_DIR": str(runs_dir)}), \
+                     patch.object(mod, "verify_se_key_proxy_binary", return_value=Path("/usr/bin/true")), \
+                     patch.object(mod, "_classify_pid_state", return_value="matched"), \
+                     patch("local_assist.session.status_for_record", return_value=live_obj), \
+                     redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                    rc = mod.main(["serve-model", "tinfoil-deepseek-v4-1-flash", "--max-actual-usd", req_str])
+                self.assertEqual(rc, want_rc, label)
+
+            # 3. Cold-start forwards pricing & --max-actual-usd and enforces exact post-ready cap verification
+            pid_path.unlink()
+            captured_se_cmds: list[list[str]] = []
+
+            class _FakeProc:
+                def __init__(self, pid_val: int, ready_fd: int | None = None):
+                    self.pid = pid_val
+                    self.returncode = None
+                    if ready_fd is not None:
+                        os.write(ready_fd, b'{"status":"ready"}\n')
+
+                def poll(self):
+                    return self.returncode
+
+                def terminate(self):
+                    self.returncode = 0
+
+                def wait(self, timeout=None):
+                    return 0
+
+            def _fake_popen(cmd, **kw):
+                if "--ready-fd" in cmd:
+                    captured_se_cmds.append(list(cmd))
+                    rfd = int(cmd[cmd.index("--ready-fd") + 1])
+                    return _FakeProc(os.getpid(), ready_fd=rfd)
+                return _FakeProc(os.getpid() + 1000)
+
+            good_post_raw = {
+                "protocol": 1,
+                "state": "ON",
+                "session_id": "sess-post-1",
+                "pid": os.getpid(),
+                "model": "deepseek-v4-1-flash",
+                "generation": 1,
+                "remaining_seconds": 3600,
+                "expires_at": 2000000000,
+                "requests_used": 0,
+                "request_limit": 100,
+                "requests_remaining": 100,
+                "window_seconds": 7200,
+                "prompt_tokens": 0,
+                "cached_prompt_tokens": 0,
+                "completion_tokens": 0,
+                "usage_reported_requests": 0,
+                "usage_unreported_requests": 0,
+                "estimated_micro_usd": 0,
+                "max_actual_micro_usd": 1_500_000,
+                "spend_cap_exceeded": False,
+                "spend_cap_low": False,
+                "spend_indeterminate": False,
+            }
+
+            # 3a. Mismatched post-ready cap (1.0 vs requested 1.5) fails closed and rolls back PID record
+            bad_post_raw = dict(good_post_raw, max_actual_micro_usd=1_000_000)
+            up_started = {"v": False}
+
+            def _fake_popen_tracked(cmd, **kw):
+                if "--ready-fd" not in cmd:
+                    up_started["v"] = True
+                return _fake_popen(cmd, **kw)
+
+            with patch.dict(os.environ, {"FREE_INFERENCE_RUNS_DIR": str(runs_dir)}), \
+                 patch.object(mod, "verify_se_key_proxy_binary", return_value=Path("/usr/bin/true")), \
+                 patch.object(mod, "ensure_envelope_available_or_migrate", return_value=(True, "", {})), \
+                 patch.object(mod, "_require_process_lstart", return_value="fake-lstart"), \
+                 patch.object(mod, "_terminate_proc"), \
+                 patch.object(mod, "_port_is_bound", side_effect=lambda _h, _p: up_started["v"]), \
+                 patch.object(mod, "subprocess") as sp_mod, \
+                 patch("local_assist.session.control_request", return_value=bad_post_raw), \
+                 redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                sp_mod.Popen.side_effect = _fake_popen_tracked
+                sp_mod.STDOUT = subprocess.STDOUT
+                sp_mod.DEVNULL = subprocess.DEVNULL
+                rc_bad_post = mod.main(["serve-model", "tinfoil-deepseek-v4-1-flash", "--max-actual-usd", "1.50"])
+            self.assertEqual(rc_bad_post, 1)
+            self.assertFalse(pid_path.exists(), "failed post-ready cap check must roll back PID file")
+
+            # 3b. Exact post-ready cap succeeds, forwards pricing & cap, and marks ready
+            captured_se_cmds.clear()
+            up_started["v"] = False
+            with patch.dict(os.environ, {"FREE_INFERENCE_RUNS_DIR": str(runs_dir)}), \
+                 patch.object(mod, "verify_se_key_proxy_binary", return_value=Path("/usr/bin/true")), \
+                 patch.object(mod, "ensure_envelope_available_or_migrate", return_value=(True, "", {})), \
+                 patch.object(mod, "_require_process_lstart", return_value="fake-lstart"), \
+                 patch.object(mod, "_terminate_proc"), \
+                 patch.object(mod, "_port_is_bound", side_effect=lambda _h, _p: up_started["v"]), \
+                 patch.object(mod, "subprocess") as sp_mod, \
+                 patch("local_assist.session.control_request", return_value=good_post_raw), \
+                 redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                sp_mod.Popen.side_effect = _fake_popen_tracked
+                sp_mod.STDOUT = subprocess.STDOUT
+                sp_mod.DEVNULL = subprocess.DEVNULL
+                rc_ok_post = mod.main(["serve-model", "tinfoil-deepseek-v4-1-flash", "--max-actual-usd", "1.50"])
+            self.assertEqual(rc_ok_post, 0)
+            self.assertEqual(len(captured_se_cmds), 1)
+            se_cmd = captured_se_cmds[0]
+            self.assertIn("--price-input-per-m", se_cmd)
+            self.assertIn("--price-output-per-m", se_cmd)
+            self.assertIn("--max-actual-usd", se_cmd)
+            self.assertEqual(se_cmd[se_cmd.index("--max-actual-usd") + 1], "1.5")
+            written_rec = json.loads(pid_path.read_text(encoding="utf-8"))
+            self.assertEqual(written_rec["status"], "ready")
+            self.assertEqual(written_rec["max_actual_micro_usd"], 1_500_000)
+            self.assertEqual(written_rec["max_actual_usd"], 1.5)
+
+    def test_opencode_attested_max_actual_usd_enforcement_and_lease_binding(self) -> None:
+        import io
+        import subprocess
+        import types
+        from contextlib import redirect_stderr, redirect_stdout
+        from unittest.mock import patch
+        from local_assist.registry import session_token_file_for_model
+
+        oc_att = _load_script_module("oc_att_cap_track2", ROOT / "scripts" / "opencode-attested")
+        model_ds = load_model("tinfoil-deepseek-v4-1-flash")
+        ep_ds = resolve_endpoint(model_ds, require_api_key=False)
+
+        def _fake_verify_ok(cmd: list[str], **_kw: object) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(cmd, 0, stdout="deepseek-v4-1-flash\n", stderr="")
+
+        def _make_live(**overrides: object) -> dict[str, object]:
+            base: dict[str, object] = {
+                "protocol": 1,
+                "state": "ON",
+                "session_id": "sess-att-1",
+                "pid": os.getpid(),
+                "model": "deepseek-v4-1-flash",
+                "model_id": "tinfoil-deepseek-v4-1-flash",
+                "generation": 1,
+                "remaining_seconds": 3600,
+                "remaining_milliseconds": 3_600_000,
+                "expires_at": 2000000000,
+                "requests_used": 1,
+                "request_limit": 100,
+                "requests_remaining": 99,
+                "window_seconds": 7200,
+                "prompt_tokens": 100,
+                "cached_prompt_tokens": 0,
+                "completion_tokens": 50,
+                "usage_reported_requests": 1,
+                "usage_unreported_requests": 0,
+                "estimated_micro_usd": 1000,
+                "estimated_usd": 0.001,
+                "estimated_usd_source": "proxy",
+                "max_actual_micro_usd": 1_000_000,
+                "max_actual_usd": 1.0,
+                "spend_cap_exceeded": False,
+                "spend_cap_low": False,
+                "spend_indeterminate": False,
+            }
+            base.update(overrides)
+            return base
+
+        # 1. CLI rejects invalid / Unicode / overlong --max-actual-usd with exit 2
+        for bad_arg in ["\u0661.5", "1" + ("0" * 33), "0", "1e2"]:
+            with self.subTest(bad_arg=bad_arg), redirect_stderr(io.StringIO()):
+                rc_bad = oc_att.main(["scripts/opencode-attested", "--max-actual-usd", bad_arg, "--print-config"])
+                self.assertEqual(rc_bad, 2)
+
+        # 2. Refuses combining --max-actual-usd with explicit handoff_token
+        r_fd, w_fd = os.pipe()
+        os.write(w_fd, ("se-session-" + "e" * 64 + "\n").encode("utf-8"))
+        os.close(w_fd)
+        err_handoff = io.StringIO()
+        try:
+            with patch.dict(os.environ, {"_FREE_INFERENCE_TOKEN_FD": str(r_fd)}), \
+                 redirect_stderr(err_handoff):
+                rc_h = oc_att.main(["scripts/opencode-attested", "--max-actual-usd", "1.00", "--print-config"])
+        finally:
+            try:
+                os.close(r_fd)
+            except OSError:
+                pass
+        self.assertEqual(rc_h, 1)
+        self.assertIn("handoff token", err_handoff.getvalue().lower())
+
+        with tempfile.TemporaryDirectory() as td:
+            runs_dir = Path(td) / "runs"
+            runs_dir.mkdir(mode=0o700)
+            pid_path = pid_file_for_model("tinfoil-deepseek-v4-1-flash", runs_dir)
+            tok_path = session_token_file_for_model("tinfoil-deepseek-v4-1-flash", runs_dir)
+            raw_tok = "se-session-" + "d" * 64
+            tok_path.write_text(
+                json.dumps({"session_id": "sess-att-1", "generation": 1, "token": raw_tok}),
+                encoding="utf-8",
+            )
+            tok_path.chmod(0o600)
+
+            def _write_rec(pid_val: int | None = None) -> None:
+                pid_path.write_text(
+                    json.dumps({
+                        "model_id": "tinfoil-deepseek-v4-1-flash",
+                        "repo": "deepseek-v4-1-flash",
+                        "port": 8081,
+                        "pid": os.getpid() if pid_val is None else pid_val,
+                        "status": "ready",
+                        "session_token_file": str(tok_path),
+                        "max_chat_requests": 1000,
+                        "max_tokens_cap": 16384,
+                        "max_request_bytes": 8388608,
+                        "ttl_seconds": 7200,
+                        "max_actual_usd": 1.0,
+                        "max_actual_micro_usd": 1_000_000,
+                    }),
+                    encoding="utf-8",
+                )
+
+            _write_rec()
+
+            # 3. Attach path: rejects legacy, UNKNOWN, metadata-only, zero reqs, looser cap, indeterminate, exceeded; accepts equal/stricter
+            for label, live_obj, req_micro, want_ok in [
+                ("equal_cap", _make_live(), 1_000_000, True),
+                ("stricter_live_cap", _make_live(max_actual_micro_usd=500_000, max_actual_usd=0.5), 1_000_000, True),
+                ("looser_live_cap", _make_live(max_actual_micro_usd=2_000_000, max_actual_usd=2.0), 1_000_000, False),
+                ("legacy_no_cap", {k: v for k, v in _make_live().items() if k not in ("max_actual_micro_usd", "max_actual_usd", "spend_cap_exceeded", "spend_cap_low", "spend_indeterminate")}, 1_000_000, False),
+                ("unknown_state", {"state": "UNKNOWN", "model_id": "tinfoil-deepseek-v4-1-flash"}, 1_000_000, False),
+                ("zero_reqs", _make_live(requests_remaining=0, requests_used=100), 1_000_000, False),
+                ("indeterminate", _make_live(spend_indeterminate=True), 1_000_000, False),
+                ("exceeded", _make_live(spend_cap_exceeded=True), 1_000_000, False),
+            ]:
+                with self.subTest(attach=label), \
+                     patch("local_assist.session.status_for_record", return_value=live_obj):
+                    ok_a, err_a, meta_a = oc_att.ensure_model_served(
+                        ep_ds,
+                        no_serve=True,
+                        max_actual_micro_usd=req_micro,
+                        runs_dir=runs_dir,
+                        run_cmd=_fake_verify_ok,
+                    )
+                self.assertEqual(ok_a, want_ok, f"{label}: {err_a}")
+                if want_ok:
+                    assert meta_a is not None
+                    self.assertEqual(meta_a["verified_pid"], os.getpid())
+                    self.assertEqual(meta_a["verified_session_id"], "sess-att-1")
+
+            # 4. Cold-start path forwards --max-actual-usd to serve-model and verifies post-start live cap
+            pid_path.unlink()
+            cold_cmds: list[list[str]] = []
+
+            def _fake_cold(cmd: list[str], **_kw: object) -> subprocess.CompletedProcess[str]:
+                cold_cmds.append(list(cmd))
+                if len(cold_cmds) == 1:
+                    return subprocess.CompletedProcess(cmd, 1, stdout="", stderr="down")
+                if len(cold_cmds) == 2:
+                    _write_rec()
+                    return subprocess.CompletedProcess(cmd, 0, stdout="started", stderr="")
+                return subprocess.CompletedProcess(cmd, 0, stdout="deepseek-v4-1-flash\n", stderr="")
+
+            with patch("local_assist.session.status_for_record", return_value=_make_live()):
+                ok_c, err_c, meta_c = oc_att.ensure_model_served(
+                    ep_ds,
+                    no_serve=False,
+                    max_actual_micro_usd=1_000_000,
+                    runs_dir=runs_dir,
+                    run_cmd=_fake_cold,
+                )
+            self.assertTrue(ok_c, msg=err_c)
+            assert meta_c is not None
+            self.assertEqual(meta_c["verified_pid"], os.getpid())
+            self.assertEqual(meta_c["verified_session_id"], "sess-att-1")
+            self.assertIn("--max-actual-usd", cold_cmds[1])
+            self.assertEqual(cold_cmds[1][cold_cmds[1].index("--max-actual-usd") + 1], "1")
+
+            # 5. _main_inner_attested: session replacement before SessionLeaseSupplier acquisition fails closed
+            _write_rec()
+            args_int, oc_args_int = oc_att.parse_args(
+                ["scripts/opencode-attested", "--model", "tinfoil-deepseek-v4-1-flash", "--no-serve", "--max-actual-usd", "1.00", "--print-config"]
+            )
+            fake_meta = {
+                "attached": True,
+                "max_chat_requests": 1000,
+                "max_tokens_cap": 16384,
+                "max_request_bytes": 8388608,
+                "ttl_seconds": 7200,
+                "input_price_per_m": 0.25,
+                "output_price_per_m": 1.0,
+                "verified_pid": os.getpid(),
+                "verified_session_id": "sess-att-1",
+            }
+            # 5a. session_id replaced before SessionLeaseSupplier reads status -> fails closed exit 1
+            with patch.dict(os.environ, {"FREE_INFERENCE_RUNS_DIR": str(runs_dir)}), \
+                 patch.object(oc_att, "ensure_model_served", return_value=(True, None, dict(fake_meta))), \
+                 patch.object(oc_att, "check_uncontained_legacy_home", return_value=None), \
+                 patch.object(oc_att, "resolve_opencode_binary", return_value=(Path("/bin/echo"), None)), \
+                 patch("local_assist.session.status_for_record", return_value=_make_live(session_id="sess-REPLACED")), \
+                 redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                rc_rep = oc_att._main_inner_attested(args_int, oc_args_int, Path(td), None)
+            self.assertEqual(rc_rep, 1)
+
+            # 6. Interactive --print-config: real rendered provider config + real publish_and_run_opencode(--print-config)
+            #    verifies zero raw session token leakage AND single bound SessionLeaseSupplier reaches SessionAuthRelay
+            orig_publish = oc_att.publish_and_run_opencode
+            captured_interactive_relays: list[object] = []
+
+            def _spy_publish_and_run(**kw: object) -> int:
+                # Inspect the real rendered config_text passed into publish_and_run_opencode
+                rendered_cfg = json.loads(kw["config_text"])
+                self.assertIn("private-attested", rendered_cfg.get("provider", {}))
+                # Verify real relay factory receives our single bound SessionLeaseSupplier
+                relay_obj = kw["relay_factory"]("svc-pw-canary")
+                captured_interactive_relays.append(relay_obj)
+                # Run the REAL publish_and_run_opencode with print_config=True to inspect actual serialized stdout
+                return orig_publish(**kw)
+
+            int_stdout = io.StringIO()
+            with patch.dict(os.environ, {"FREE_INFERENCE_RUNS_DIR": str(runs_dir), "FREE_INFERENCE_OPENCODE_ATTESTED_HOME": str(Path(td) / "iso-home")}), \
+                 patch.object(oc_att, "ensure_model_served", return_value=(True, None, dict(fake_meta))), \
+                 patch.object(oc_att, "check_uncontained_legacy_home", return_value=None), \
+                 patch.object(oc_att, "resolve_opencode_binary", return_value=(Path("/bin/echo"), None)), \
+                 patch.object(oc_att, "publish_and_run_opencode", side_effect=_spy_publish_and_run), \
+                 patch("local_assist.session.status_for_record", return_value=_make_live()), \
+                 redirect_stdout(int_stdout), redirect_stderr(io.StringIO()):
+                rc_ok_int = oc_att._main_inner_attested(args_int, oc_args_int, Path(td), None)
+            self.assertEqual(rc_ok_int, 0)
+            int_out_text = int_stdout.getvalue()
+            self.assertNotIn(raw_tok, int_out_text, "Interactive --print-config leaked raw session token!")
+            int_payload = json.loads(int_out_text)
+            self.assertIn("private-attested", int_payload["config"]["provider"])
+            self.assertEqual(int_payload["session_caps"]["live_status"]["max_actual_usd"], 1.0)
+            self.assertNotIn("token", int_payload["session_caps"]["live_status"])
+            self.assertEqual(len(captured_interactive_relays), 1)
+            int_sup = captured_interactive_relays[0].lease_provider
+            self.assertIsNotNone(int_sup)
+            self.assertEqual(int_sup.session_id, "sess-att-1")
+            self.assertEqual(int_sup.required_max_actual_micro_usd, 1_000_000)
+            int_sup.close()
+
+            # 7. Worker --print-config: real rendered provider config via build_base_config_fn + bound _WorkerTokenRelay
+            #    verifies populated provider config has relay token (never raw session token) and bound SessionLeaseSupplier
+            captured_worker_relays: list[object] = []
+
+            def _fake_exec_worker(**kw: object) -> int:
+                relay_obj = kw["relay_factory"]()
+                captured_worker_relays.append(relay_obj)
+                # Populate a real-shaped base config via the real _build_att_base_cfg callback
+                relay_stub = types.SimpleNamespace(
+                    api_base_url="http://127.0.0.1:41234/v1",
+                    relay_token="wk-relay-" + ("7c" * 32),
+                )
+                compiled_cfg = kw["build_base_config_fn"](relay_stub)
+                self.assertIn("private-attested", compiled_cfg["provider"])
+                self.assertEqual(
+                    compiled_cfg["provider"]["private-attested"]["options"]["apiKey"],
+                    relay_stub.relay_token,
+                )
+                payload = kw["build_print_config_payload_fn"](
+                    "wk-1", Path(td) / "oc.json", Path(td) / "sb.sb", Path(td) / "home", compiled_cfg, relay_stub
+                )
+                out = json.dumps(payload)
+                self.assertNotIn(raw_tok, out, "Worker --print-config leaked raw session token!")
+                self.assertIn(relay_stub.relay_token, out)
+                self.assertEqual(payload["session_caps"]["live_status"]["max_actual_usd"], 1.0)
+                self.assertNotIn("token", payload["session_caps"]["live_status"])
+                return 0
+
+            fake_profile = types.SimpleNamespace(
+                allow_uncleared_model=False,
+                spend_inherit_attached_session_caps=True,
+                spend_max_session_usd=None,
+                allow_subagents=False,
+            )
+            with patch.dict(os.environ, {"FREE_INFERENCE_RUNS_DIR": str(runs_dir)}), \
+                 patch.object(oc_att, "_resolve_active_security_profile", return_value=fake_profile), \
+                 patch.object(oc_att, "validate_common_worker_flags", return_value=None), \
+                 patch.object(oc_att, "validate_worker_binary_and_args", return_value=(True, [], None)), \
+                 patch.object(oc_att, "_precheck_worker_attached_session", return_value=None), \
+                 patch.object(oc_att, "ensure_model_served", return_value=(True, None, dict(fake_meta))), \
+                 patch.object(oc_att, "resolve_opencode_binary", return_value=(Path("/bin/echo"), None)), \
+                 patch.object(oc_att, "execute_worker_profile_session", side_effect=_fake_exec_worker), \
+                 patch("local_assist.session.status_for_record", return_value=_make_live()), \
+                 redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                rc_ok_wk = oc_att._main_inner_attested(args_int, oc_args_int, Path(td), None)
+            self.assertEqual(rc_ok_wk, 0)
+            self.assertEqual(len(captured_worker_relays), 1)
+            wk_sup = captured_worker_relays[0].lease_provider
+            self.assertIsNotNone(wk_sup)
+            self.assertEqual(wk_sup.session_id, "sess-att-1")
+            self.assertEqual(wk_sup.required_max_actual_micro_usd, 1_000_000)
+            wk_sup.close()
 
 
 if __name__ == "__main__":

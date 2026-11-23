@@ -352,7 +352,7 @@ agy mcp add local_assist -- /path/to/free-inference/scripts/local-assist-server
 agy mcp list
 ```
 
-For workspace-only scoping in Antigravity (without editing `~/.gemini/config/mcp_config.json`), place a workspace plugin at `<workspace>/.agents/plugins/local-assist/plugin.json` (`{"name": "local-assist", "version": "0.3.1"}`) and `<workspace>/.agents/plugins/local-assist/mcp_config.json`, then validate with `agy plugin validate <workspace>/.agents/plugins/local-assist --strict`.
+For workspace-only scoping in Antigravity (without editing `~/.gemini/config/mcp_config.json`), place a workspace plugin at `<workspace>/.agents/plugins/local-assist/plugin.json` (`{"name": "local-assist", "version": "0.4.0"}`) and `<workspace>/.agents/plugins/local-assist/mcp_config.json`, then validate with `agy plugin validate <workspace>/.agents/plugins/local-assist --strict`.
 
 ### Inspecting `local_assist` Telemetry (`./scripts/local-assist-stats`)
 

@@ -637,6 +637,58 @@ class SEKeyProxyLeakBackstopTests(unittest.TestCase):
                 upstream_srv.shutdown()
                 upstream_srv.server_close()
 
+    def test_metering_and_spend_cap_cli_validation_fails_closed_exit_2(self) -> None:
+        base_args = [
+            str(TEST_BINARY_PATH),
+            "proxy",
+            "--service",
+            "free-inference.clitest",
+            "--listen-port",
+            "0",
+            "--upstream-url",
+            "http://127.0.0.1:9999/v1",
+            "--allowed-model",
+            "deepseek-v4-1-flash",
+            "--max-chat-requests",
+            "5",
+        ]
+        fail_cases = [
+            ("max_actual_without_pricing", ["--max-tokens-cap", "256", "--max-actual-usd", "1.00"]),
+            ("max_actual_with_only_input_price", ["--max-tokens-cap", "256", "--price-input-per-m", "0.5", "--max-actual-usd", "1.00"]),
+            ("max_actual_with_max_tokens_cap_zero", ["--max-tokens-cap", "0", "--price-input-per-m", "0.5", "--price-output-per-m", "1.0", "--max-actual-usd", "1.00"]),
+            ("max_actual_with_default_zero_tokens_cap", ["--price-input-per-m", "0.5", "--price-output-per-m", "1.0", "--max-actual-usd", "1.00"]),
+            ("only_input_price", ["--price-input-per-m", "0.5"]),
+            ("only_output_price", ["--price-output-per-m", "1.0"]),
+            ("cached_price_without_base_prices", ["--price-cached-input-per-m", "0.1"]),
+            ("max_chat_requests_above_int32_max", ["--max-chat-requests", "2147483648"]),
+            ("max_chat_requests_zero", ["--max-chat-requests", "0"]),
+            ("max_actual_zero", ["--max-tokens-cap", "256", "--price-input-per-m", "0.5", "--price-output-per-m", "1.0", "--max-actual-usd", "0"]),
+            ("max_actual_scientific", ["--max-tokens-cap", "256", "--price-input-per-m", "0.5", "--price-output-per-m", "1.0", "--max-actual-usd", "1e2"]),
+            ("max_actual_too_many_decimals", ["--max-tokens-cap", "256", "--price-input-per-m", "0.5", "--price-output-per-m", "1.0", "--max-actual-usd", "0.0000001"]),
+            ("max_actual_unicode_digits", ["--max-tokens-cap", "256", "--price-input-per-m", "0.5", "--price-output-per-m", "1.0", "--max-actual-usd", "\u0661.5"]),
+            ("max_actual_overlong", ["--max-tokens-cap", "256", "--price-input-per-m", "0.5", "--price-output-per-m", "1.0", "--max-actual-usd", "1" + ("0" * 33)]),
+            ("max_actual_above_ceiling", ["--max-tokens-cap", "256", "--price-input-per-m", "0.5", "--price-output-per-m", "1.0", "--max-actual-usd", "100000.000001"]),
+            ("price_above_ceiling", ["--price-input-per-m", "10000.000001", "--price-output-per-m", "1.0"]),
+            ("missing_max_actual_value", ["--max-actual-usd"]),
+            ("missing_price_input_value", ["--price-input-per-m"]),
+            ("missing_price_output_value", ["--price-output-per-m"]),
+            ("missing_price_cached_value", ["--price-cached-input-per-m"]),
+        ]
+        for label, extra in fail_cases:
+            with self.subTest(label=label):
+                proc = subprocess.run(base_args + extra, capture_output=True, text=True, timeout=10)
+                self.assertEqual(proc.returncode, 2, f"{label}: rc={proc.returncode} stderr={proc.stderr}")
+
+        # Release binary must reject --test-force-urlsession before Touch ID
+        rel_proc = subprocess.run(
+            [str(RELEASE_BINARY_PATH), "proxy", "--test-force-urlsession"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(rel_proc.returncode, 2, rel_proc.stderr)
+        self.assertIn("Unknown proxy argument", rel_proc.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

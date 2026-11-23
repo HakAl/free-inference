@@ -1138,36 +1138,42 @@ def _store_has_live_pid_record(store: Path) -> bool:
     return False
 
 
-def _effective_runs_dir(runs_dir: Path | None = None) -> Path:
+def resolve_effective_runs_dir_details(
+    runs_dir: Path | None = None,
+) -> tuple[Path, Any | None]:
     if runs_dir is not None:
-        return runs_dir
+        return runs_dir, None
     from .custody import (
         get_active_bootstrap_state,
+        inspect_active_runs_pointer,
         is_custody_tree,
-        read_active_runs_pointer,
         validate_creatable_runs_dir,
     )
 
     state = get_active_bootstrap_state()
     if state is not None:
         if state.cli_runs_dir is not None:
-            return state.cli_runs_dir
+            return state.cli_runs_dir, None
         if state.pinned_runs_dir is not None:
-            return state.pinned_runs_dir
+            return state.pinned_runs_dir, None
         if state.custody_mode:
-            ptr = read_active_runs_pointer()
-            return ptr if ptr is not None else DEFAULT_RUNS_DIR
+            ptr = inspect_active_runs_pointer(pin_fd=True)
+            if ptr.status == "ok" and ptr.path is not None:
+                return ptr.path, ptr
+            return DEFAULT_RUNS_DIR, ptr
         if state.worker_or_reap_cli:
             if _store_has_live_pid_record(DEFAULT_RUNS_DIR):
-                return DEFAULT_RUNS_DIR
-            ptr = read_active_runs_pointer()
-            if ptr is not None and _store_has_live_pid_record(ptr):
-                return ptr
-            return DEFAULT_RUNS_DIR
+                return DEFAULT_RUNS_DIR, None
+            ptr = inspect_active_runs_pointer(pin_fd=True)
+            if ptr.status == "ok" and ptr.path is not None and _store_has_live_pid_record(ptr.path):
+                return ptr.path, ptr
+            return DEFAULT_RUNS_DIR, (ptr if ptr.status == "refused" else None)
 
     if is_custody_tree(ROOT):
-        ptr = read_active_runs_pointer()
-        return ptr if ptr is not None else DEFAULT_RUNS_DIR
+        ptr = inspect_active_runs_pointer(pin_fd=True)
+        if ptr.status == "ok" and ptr.path is not None:
+            return ptr.path, ptr
+        return DEFAULT_RUNS_DIR, ptr
 
     raw_env = os.environ.get("FREE_INFERENCE_RUNS_DIR", "").strip()
     if raw_env:
@@ -1178,8 +1184,12 @@ def _effective_runs_dir(runs_dir: Path | None = None) -> Path:
         )
         if env_err is not None or env_res is None:
             raise RegistryError(env_err or f"Invalid FREE_INFERENCE_RUNS_DIR: {raw_env!r}")
-        return env_res.path
-    return DEFAULT_RUNS_DIR
+        return env_res.path, None
+    return DEFAULT_RUNS_DIR, None
+
+
+def _effective_runs_dir(runs_dir: Path | None = None) -> Path:
+    return resolve_effective_runs_dir_details(runs_dir)[0]
 
 
 def pid_file_for_model(model_id: str, runs_dir: Path | None = None) -> Path:

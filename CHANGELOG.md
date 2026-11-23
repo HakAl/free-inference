@@ -2,6 +2,18 @@
 
 All notable changes to `free-inference` are documented in this file.
 
+## [0.4.0] - 2026-11-22
+
+### Read-Only Health & Security Audit (`./scripts/doctor`), Custody Pointer Diagnostics, and Live Spend Metering
+- **Read-only `./scripts/doctor` CLI and `active-runs.json` custody pointer diagnostics (`local_assist/doctor.py`, `scripts/doctor`, `local_assist/custody.py`, `local_assist/registry.py`, `local_assist/session.py`, `scripts/opencode-local`, `scripts/opencode-attested`, `tests/test_doctor.py`, `tests/test_opencode_worker_runtime.py`)**:
+  - Added read-only, offline-by-default `./scripts/doctor` (`./scripts/free-inference doctor`, `--json`, `--strict`, `--check-catalog`) using the fixed-prefix `/bin/sh` isolated Python (`-I -B`, `set +x +v 2>/dev/null`) launcher so caller `PATH`/`PYTHONPATH`/`SHELLOPTS` cannot hijack or write bytecode during audits. Audits platform/runtime readiness, `active-runs.json` + custody ancestor portability, `se-key-proxy` / `tinfoil-proxy` / `privatemode-proxy` binary integrity, sealed Secure Enclave envelope metadata (zero secrets read), `/dev/bpf0` permissions, model registry + eval manifests, live sessions, legacy containment, and opt-in upstream catalog drift.
+  - Eliminated silent `active-runs.json` pointer refusals when a checkout ancestor directory is group/world-writable (emitting actionable bounded diagnostics and `chmod 0750` guidance at publication and refusal time) while preserving strict custody read-only enforcement.
+- **Live token and estimated USD spend metering + optional `--max-actual-usd` cap (`tools/se_key_proxy/main.swift`, `local_assist/se_key.py`, `local_assist/session.py`, `scripts/serve-model`, `scripts/opencode-attested`, `scripts/models`, `tests/test_session_runtime.py`, `tests/test_session_window.py`, `tests/test_se_key_proxy.py`, `tests/test_registry_and_tools.py`)**:
+  - Added in-memory token and estimated spend metering inside `se-key-proxy` (`EXPECTED_SWIFT_SOURCE_SHA256 = 3d533cab2fd9e023091f87a820fb530d6c0fc09b84f0be938fc353c00d519bde`) via a zero-allocation lexical JSON byte scanner with RFC 3629 UTF-8 validation over bounded `OwnedRawBuffer`s (`2 MiB` `ObserverMemoryPool`), strict raw-byte POSIX HTTP framing (including RFC 9112 §7.1.1 BWS before chunk extensions and SSE §9.2.6 single leading UTF-8 BOM stripping), and exact 128-bit integer picodollar arithmetic (`UInt128Pair`).
+  - Exposed live `prompt_tokens`, `cached_prompt_tokens`, `completion_tokens`, `estimated_micro_usd`, optional `max_actual_micro_usd`, and authoritative cap flags (`spend_cap_exceeded`, `spend_cap_low`, `spend_indeterminate`) over the owner-only Unix control socket (`protocol: 1`), `session status/watch`, and `models --active` (with strict bounded integer/Decimal cap validation and `allow_nan=False`).
+  - Enforced optional `--max-actual-usd` fail-closed post-accounting spend caps (`429 session_spend_budget_exceeded` / `session_spend_indeterminate`, owned single-flight admission with `kqueue EVFILT_WRITE` peer-reset detection preserving legal half-closed clients, post-wait token revalidation, and `renew` refusal) across `se-key-proxy`, `serve-model`, `session start/renew/watch`, and `opencode-attested`.
+- **Cross-platform CI test portability (`tests/test_security_profile.py`, `tests/test_opencode_2_3_support.py`, `tests/test_opencode_worker_runtime.py`, `tests/test_session_window.py`)**: Removed implicit host `opencode` / `/usr/bin/sandbox-exec` / `HTTPServer` reverse-DNS / Darwin `F_GETPATH` assumptions from unit and runtime tests across macOS arm64 and Ubuntu Linux CI.
+
 ## [0.3.1] - 2026-11-22
 
 ### OpenCode `2.3.2` Support, Privatemode Catalog Sync, and Unified CLI Dispatcher

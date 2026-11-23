@@ -112,6 +112,7 @@ from local_assist.registry import (
     _effective_runs_dir,
     load_model,
     read_pid_record_for_model,
+    resolve_effective_runs_dir_details,
     resolve_endpoint,
 )
 from local_assist.security_profile import (
@@ -718,7 +719,12 @@ def _main_inner_local(
         )
     )
     try:
-        session_runs = _effective_runs_dir()
+        session_runs, ptr_info = resolve_effective_runs_dir_details()
+        if ptr_info is not None and ptr_info.status == "refused":
+            err_msg = ptr_info.message or "Active session pointer was refused."
+            rem_msg = ptr_info.remediation or ""
+            print(f"{err_msg} {rem_msg}".strip() if rem_msg else err_msg, file=sys.stderr)
+            return 1
         if not in_custody_main and getattr(args, "runs_dir", None) is None:
             v_sr, sr_err = validate_creatable_runs_dir(
                 session_runs,

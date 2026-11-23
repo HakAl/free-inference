@@ -158,6 +158,7 @@ from local_assist.registry import (
     load_model,
     load_models,
     read_pid_record_for_model,
+    resolve_effective_runs_dir_details,
     resolve_endpoint,
 )
 from local_assist.relay import SessionAuthRelay, _WorkerTokenRelay
@@ -852,6 +853,10 @@ def format_session_banner(
     live_status = session_meta.get('live_status')
     if isinstance(live_status, dict) and live_status.get('state') == 'ON':
         ttl_str = f"{live_status['window_seconds']} ({live_status['remaining_seconds']}s remaining)"
+        live_cap_micro = live_status.get("max_actual_micro_usd")
+        if type(live_cap_micro) is int and live_cap_micro >= 1:
+            from local_assist.session import format_micro_usd_decimal
+            ceiling_str += f"; enforced live --max-actual-usd ${format_micro_usd_decimal(live_cap_micro)}"
     elif session_meta.get("attached") and isinstance(started_at, str) and started_at.strip():
         try:
             started_dt = datetime.strptime(started_at.strip(), "%Y-%m-%dT%H:%M:%S%z")
@@ -1013,6 +1018,7 @@ def ensure_model_served(
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
     stream_timeout_seconds: int = DEFAULT_STREAM_TIMEOUT_SECONDS,
     max_session_usd: float | None = DEFAULT_MAX_SESSION_USD,
+    max_actual_micro_usd: int | None = None,
     inherit_attached_session_caps: bool = False,
     explicit_port: int | None = None,
     explicit_cap_flags: Any = (),
@@ -1291,6 +1297,28 @@ def ensure_model_served(
                     file=sys.stderr,
                 )
         else:
+            attach_extra: dict[str, Any] = {}
+            if max_actual_micro_usd is not None:
+                from local_assist.session import status_for_record, verify_live_spend_cap
+                if not isinstance(active_rec, dict) or not isinstance(active_rec.get("pid"), int) or isinstance(active_rec.get("pid"), bool):
+                    return (
+                        False,
+                        f"Refusing to attach to '{endpoint.model_id}' with --max-actual-usd: active session PID record is missing or malformed.",
+                        None,
+                    )
+                live_attach = status_for_record(active_rec, eff_runs_dir)
+                cap_err = verify_live_spend_cap(
+                    live_attach,
+                    max_actual_micro_usd,
+                    model_id=endpoint.model_id,
+                )
+                if cap_err is not None:
+                    return False, cap_err, None
+                attach_extra = {
+                    "verified_pid": int(active_rec["pid"]),
+                    "verified_session_id": str(live_attach["session_id"]),
+                    "live_status": live_attach,
+                }
             return (
                 True,
                 None,
@@ -1302,6 +1330,7 @@ def ensure_model_served(
                     "low_caps_warning": bool(has_low_caps),
                     "thinking_enabled": rec_thinking,
                     "allocated_port": active_port,
+                    **attach_extra,
                 },
             )
 
@@ -1415,6 +1444,12 @@ def ensure_model_served(
     ]
     if target_port is not None:
         serve_cmd.extend(["--port", str(target_port)])
+    if max_actual_micro_usd is not None:
+        from local_assist.session import format_micro_usd_decimal
+        serve_cmd.extend([
+            "--max-actual-usd",
+            format_micro_usd_decimal(max_actual_micro_usd),
+        ])
     if thinking:
         serve_cmd.append("--thinking")
     if effective_refresh:
@@ -1496,6 +1531,28 @@ def ensure_model_served(
             (active_rec or {}).get("port")
             or (target_port if target_port is not None else endpoint.port)
         )
+        cold_extra: dict[str, Any] = {}
+        if max_actual_micro_usd is not None:
+            from local_assist.session import status_for_record, verify_live_spend_cap
+            if not isinstance(active_rec, dict) or not isinstance(active_rec.get("pid"), int) or isinstance(active_rec.get("pid"), bool):
+                return (
+                    False,
+                    f"Refusing to launch '{endpoint.model_id}' with --max-actual-usd: started session PID record is missing or malformed.",
+                    None,
+                )
+            live_started = status_for_record(active_rec, eff_runs_dir)
+            cap_err = verify_live_spend_cap(
+                live_started,
+                max_actual_micro_usd,
+                model_id=endpoint.model_id,
+            )
+            if cap_err is not None:
+                return False, cap_err, None
+            cold_extra = {
+                "verified_pid": int(active_rec["pid"]),
+                "verified_session_id": str(live_started["session_id"]),
+                "live_status": live_started,
+            }
         return (
             True,
             None,
@@ -1505,6 +1562,7 @@ def ensure_model_served(
                 "ttl_seconds": rec_ttl,
                 "thinking_enabled": bool(thinking),
                 "allocated_port": resolved_port,
+                **cold_extra,
             },
         )
 
@@ -1602,6 +1660,19 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
         type=float,
         default=DEFAULT_MAX_SESSION_USD,
         help="Optional maximum worst-case session spend in USD permitted before launch (when omitted, prints pricing and caps without blocking interactive launch).",
+    )
+    from local_assist.session import parse_usd_to_micro_usd
+    def _parse_max_actual_usd_arg(raw: str) -> int:
+        try:
+            return parse_usd_to_micro_usd(raw)
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(str(exc)) from exc
+    parser.add_argument(
+        "--max-actual-usd",
+        dest="max_actual_micro_usd",
+        type=_parse_max_actual_usd_arg,
+        default=None,
+        help="Optional live post-accounting USD spend cap enforced in se-key-proxy (decimal in 0.000001..100000; does not relax --max-session-usd).",
     )
     parser.add_argument(
         "--inherit-session-caps",
@@ -1927,6 +1998,15 @@ def _main_inner_attested(
         )
         return 1
 
+    requested_max_actual_micro_usd = getattr(args, "max_actual_micro_usd", None)
+    if requested_max_actual_micro_usd is not None and handoff_token:
+        print(
+            "Refusing to combine --max-actual-usd with an explicit session handoff token: "
+            "live spend cap verification requires direct control-socket lease binding.",
+            file=sys.stderr,
+        )
+        return 1
+
     effective_no_serve = True if active_profile is not None else args.no_serve
 
     prechecked_isolated_home: Path | None = None
@@ -1950,7 +2030,12 @@ def _main_inner_attested(
         )
     )
     try:
-        session_runs = _effective_runs_dir()
+        session_runs, ptr_info = resolve_effective_runs_dir_details()
+        if ptr_info is not None and ptr_info.status == "refused":
+            err_msg = ptr_info.message or "Active session pointer was refused."
+            rem_msg = ptr_info.remediation or ""
+            print(f"{err_msg} {rem_msg}".strip() if rem_msg else err_msg, file=sys.stderr)
+            return 1
         if not in_custody_main and getattr(args, "runs_dir", None) is None:
             v_sr, sr_err = validate_creatable_runs_dir(
                 session_runs,
@@ -2040,6 +2125,7 @@ def _main_inner_attested(
         ttl_seconds=eff_ttl,
         stream_timeout_seconds=args.stream_timeout_seconds,
         max_session_usd=effective_max_session_usd,
+        max_actual_micro_usd=requested_max_actual_micro_usd,
         inherit_attached_session_caps=inherit_caps,
         explicit_port=args.port,
         explicit_cap_flags=getattr(args, "explicit_cap_flags", ()),
@@ -2055,47 +2141,126 @@ def _main_inner_attested(
             return EXIT_MODEL_MISMATCH
         return 1
 
-    try:
-        active_pid_record = read_pid_record_for_model(model_id, session_runs)
-        post_port_override = (
-            (session_meta.get("allocated_port") or args.port)
-            if active_pid_record is None
-            else None
-        )
-        endpoint = resolve_endpoint(
-            model,
-            pid_record=active_pid_record,
-            require_api_key=True,
-            port_override=post_port_override,
-            session_token_override=handoff_token,
-        )
-        validate_private_attested_endpoint(
-            endpoint,
-            allow_uncleared_model=effective_allow_uncleared,
-            allow_deprecated_model=bool(getattr(args, "allow_deprecated_model", False)),
-        )
-    except (RegistryError, LocalAssistError) as exc:
-        print(str(exc), file=sys.stderr)
-        return 1
-
-    from local_assist.session import SessionLeaseSupplier, status_for_record, control_path, control_node_present
+    from local_assist.session import (
+        SessionLeaseSupplier,
+        control_node_present,
+        control_path,
+        enrich_status,
+        status_for_record,
+    )
     lease_supplier = None
-    if isinstance(active_pid_record, dict):
-        session_meta['live_status'] = status_for_record(active_pid_record, session_runs)
-        if handoff_token:
-            pass  # Explicit credential overrides remain authoritative; never replace from disk.
-        elif session_meta['live_status']['state'] == 'ON':
-            lease_supplier = SessionLeaseSupplier(active_pid_record, session_runs)
-            try:
-                lease_supplier()
-            except Exception:
-                print('Cannot verify the active session lease; refusing launch.', file=sys.stderr)
-                return 1
-        elif control_node_present(control_path(session_runs, endpoint.model_id)):
-            print('Session control is present but unverifiable; refusing launch.', file=sys.stderr)
+    active_pid_record = read_pid_record_for_model(model_id, session_runs)
+    post_port_override = (
+        (session_meta.get("allocated_port") or args.port)
+        if active_pid_record is None
+        else None
+    )
+    if requested_max_actual_micro_usd is not None:
+        verified_pid = session_meta.get("verified_pid")
+        verified_session_id = session_meta.get("verified_session_id")
+        if (
+            not isinstance(active_pid_record, dict)
+            or type(verified_pid) is not int
+            or type(active_pid_record.get("pid")) is not int
+            or active_pid_record.get("pid") != verified_pid
+            or not isinstance(verified_session_id, str)
+            or not verified_session_id
+        ):
+            print(
+                f"Active session identity for '{model_id}' changed or is unverifiable under --max-actual-usd; refusing launch.",
+                file=sys.stderr,
+            )
             return 1
-        else:
-            print('Live session control is unavailable; using the legacy fixed launch window.', file=sys.stderr)
+        try:
+            endpoint_unauth = resolve_endpoint(
+                model,
+                pid_record=active_pid_record,
+                require_api_key=False,
+                port_override=post_port_override,
+                session_token_override=None,
+            )
+            validate_private_attested_endpoint(
+                endpoint_unauth,
+                allow_uncleared_model=effective_allow_uncleared,
+                allow_deprecated_model=bool(getattr(args, "allow_deprecated_model", False)),
+            )
+        except (RegistryError, LocalAssistError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        lease_supplier = SessionLeaseSupplier(
+            active_pid_record,
+            session_runs,
+            expected_session_id=verified_session_id,
+            required_max_actual_micro_usd=requested_max_actual_micro_usd,
+        )
+        try:
+            initial_lease = lease_supplier()
+        except Exception:
+            print(
+                "Cannot verify the active session lease and live --max-actual-usd cap; refusing launch.",
+                file=sys.stderr,
+            )
+            return 1
+        lease_token = initial_lease.get("token")
+        if not isinstance(lease_token, str) or not lease_token:
+            print(
+                "Verified session lease did not yield a valid session token; refusing launch.",
+                file=sys.stderr,
+            )
+            return 1
+        session_meta["live_status"] = enrich_status(
+            {k: v for k, v in initial_lease.items() if k != "token"},
+            model_id=endpoint_unauth.model_id,
+        )
+        try:
+            endpoint = resolve_endpoint(
+                model,
+                pid_record=active_pid_record,
+                require_api_key=True,
+                port_override=post_port_override,
+                session_token_override=lease_token,
+            )
+            validate_private_attested_endpoint(
+                endpoint,
+                allow_uncleared_model=effective_allow_uncleared,
+                allow_deprecated_model=bool(getattr(args, "allow_deprecated_model", False)),
+            )
+        except (RegistryError, LocalAssistError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+    else:
+        try:
+            endpoint = resolve_endpoint(
+                model,
+                pid_record=active_pid_record,
+                require_api_key=True,
+                port_override=post_port_override,
+                session_token_override=handoff_token,
+            )
+            validate_private_attested_endpoint(
+                endpoint,
+                allow_uncleared_model=effective_allow_uncleared,
+                allow_deprecated_model=bool(getattr(args, "allow_deprecated_model", False)),
+            )
+        except (RegistryError, LocalAssistError) as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+        if isinstance(active_pid_record, dict):
+            session_meta['live_status'] = status_for_record(active_pid_record, session_runs)
+            if handoff_token:
+                pass  # Explicit credential overrides remain authoritative; never replace from disk.
+            elif session_meta['live_status']['state'] == 'ON':
+                lease_supplier = SessionLeaseSupplier(active_pid_record, session_runs)
+                try:
+                    lease_supplier()
+                except Exception:
+                    print('Cannot verify the active session lease; refusing launch.', file=sys.stderr)
+                    return 1
+            elif control_node_present(control_path(session_runs, endpoint.model_id)):
+                print('Session control is present but unverifiable; refusing launch.', file=sys.stderr)
+                return 1
+            else:
+                print('Live session control is unavailable; using the legacy fixed launch window.', file=sys.stderr)
     print(
         format_session_banner(
             endpoint,

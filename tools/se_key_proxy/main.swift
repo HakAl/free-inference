@@ -1213,20 +1213,1332 @@ private func remainingConnectSliceMs(nowNs: UInt64, connectLimitNs: UInt64) -> I
     return Int32(min(100, max(1, remMs)))
 }
 
+// MARK: - Live Usage Metering, Exact 128-Bit Accounting, and Capacity-Bounded Raw Buffers
+
+private let kMaxChatRequestsLimit = 2_147_483_647
+private let kMaxPerRequestTokens: Int64 = 1_000_000_000
+private let kMaxCumulativeTokens: Int64 = 1_000_000_000_000
+private let kMaxWireMicroUsd: Int64 = 100_000_000_000_000
+private let kMaxActualMicroUsdLimit: Int64 = 100_000_000_000
+private let kMaxPriceMicroUsdPerM: Int64 = 10_000_000_000
+private let kMaxTotalObserverBytes = 2_097_152
+private let kMaxUsageJSONBodyBytes = 524_288
+private let kMaxUsageSSELineBytes = 65_536
+private let kMaxUsageSSEEventBytes = 65_536
+private let kMaxOuterJSONScanDepth = 64
+private let kMaxUsageJSONScanDepth = 8
+
+private struct PricingRates {
+    let inputMicroPerM: Int64
+    let outputMicroPerM: Int64
+    let cachedInputMicroPerM: Int64
+}
+
+private struct ParsedTokenUsage: Equatable {
+    let promptTokens: Int64
+    let cachedPromptTokens: Int64
+    let completionTokens: Int64
+}
+
+private enum UsageScanState: Equatable {
+    case missing
+    case nullValue
+    case valid(ParsedTokenUsage)
+    case invalid
+}
+
+private struct UInt128Pair: Equatable, Comparable {
+    let hi: UInt64
+    let lo: UInt64
+
+    static let zero = UInt128Pair(hi: 0, lo: 0)
+    static let max = UInt128Pair(hi: UInt64.max, lo: UInt64.max)
+
+    static func < (lhs: UInt128Pair, rhs: UInt128Pair) -> Bool {
+        if lhs.hi != rhs.hi { return lhs.hi < rhs.hi }
+        return lhs.lo < rhs.lo
+    }
+
+    static func mul64(_ a: UInt64, _ b: UInt64) -> UInt128Pair {
+        let p = a.multipliedFullWidth(by: b)
+        return UInt128Pair(hi: p.high, lo: p.low)
+    }
+
+    func addingClamped(_ other: UInt128Pair) -> UInt128Pair {
+        let (loSum, carryLo) = lo.addingReportingOverflow(other.lo)
+        let (hiPart, carryHi1) = hi.addingReportingOverflow(other.hi)
+        if carryHi1 { return .max }
+        let (hiSum, carryHi2) = hiPart.addingReportingOverflow(carryLo ? 1 : 0)
+        if carryHi2 { return .max }
+        return UInt128Pair(hi: hiSum, lo: loSum)
+    }
+
+    func divMod1000000() -> (quotient: UInt128Pair, remainder: UInt64) {
+        let divisor: UInt64 = 1_000_000
+        var qHi: UInt64 = 0
+        var qLo: UInt64 = 0
+        var rem: UInt64 = 0
+        for bit in stride(from: 63, through: 0, by: -1) {
+            rem = (rem << 1) | ((hi >> bit) & 1)
+            if rem >= divisor {
+                rem -= divisor
+                qHi |= (UInt64(1) << bit)
+            }
+        }
+        for bit in stride(from: 63, through: 0, by: -1) {
+            rem = (rem << 1) | ((lo >> bit) & 1)
+            if rem >= divisor {
+                rem -= divisor
+                qLo |= (UInt64(1) << bit)
+            }
+        }
+        return (UInt128Pair(hi: qHi, lo: qLo), rem)
+    }
+
+    func clampedInt64(max maxVal: Int64) -> Int64 {
+        let limit = UInt64(maxVal)
+        if hi > 0 || lo >= limit {
+            return maxVal
+        }
+        return Int64(lo)
+    }
+}
+
+private func parseDecimalMicroUsd(_ raw: String, minMicro: Int64, maxMicro: Int64) -> Int64? {
+    let bytes = Array(raw.utf8)
+    guard !bytes.isEmpty && bytes.count <= 32 else { return nil }
+    var intDigits = 0
+    var fracDigits = 0
+    var seenDot = false
+    var intPart: Int64 = 0
+    var fracPart: Int64 = 0
+    for b in bytes {
+        if b == 0x2E { // '.'
+            if seenDot || intDigits == 0 { return nil }
+            seenDot = true
+        } else if b >= 0x30 && b <= 0x39 {
+            let d = Int64(b - 0x30)
+            if !seenDot {
+                intDigits += 1
+                if intDigits > 6 { return nil }
+                intPart = intPart * 10 + d
+            } else {
+                fracDigits += 1
+                if fracDigits > 6 { return nil }
+                fracPart = fracPart * 10 + d
+            }
+        } else {
+            return nil
+        }
+    }
+    if intDigits == 0 || (seenDot && fracDigits == 0) {
+        return nil
+    }
+    var scale: Int64 = 1
+    for _ in 0..<(6 - fracDigits) {
+        scale *= 10
+    }
+    let total = intPart * 1_000_000 + fracPart * scale
+    guard total >= minMicro && total <= maxMicro else { return nil }
+    return total
+}
+
+private func formatMicroUsdForMessage(_ micro: Int64) -> String {
+    let whole = micro / 1_000_000
+    let frac = micro % 1_000_000
+    if frac == 0 {
+        return String(format: "$%lld.00", whole)
+    }
+    let fracStr = String(format: "%06lld", frac)
+    var trimmed = fracStr
+    while trimmed.count > 2 && trimmed.hasSuffix("0") {
+        trimmed.removeLast()
+    }
+    return "$\(whole).\(trimmed)"
+}
+
+private func saturatingAddToken(_ cur: Int64, _ delta: Int64, cap: Int64 = kMaxCumulativeTokens) -> Int64 {
+    if delta <= 0 { return cur }
+    if cur >= cap { return cap }
+    let room = cap - cur
+    return delta >= room ? cap : (cur + delta)
+}
+
+private final class ObserverMemoryPool: @unchecked Sendable {
+    private let lock = NSLock()
+    let limitBytes: Int
+    private var currentBytes: Int = 0
+    private var peakBytes: Int = 0
+
+    init(limitBytes: Int = kMaxTotalObserverBytes) {
+        self.limitBytes = max(0, limitBytes)
+    }
+
+    func reserve(_ bytes: Int) -> Bool {
+        if bytes < 0 { return false }
+        if bytes == 0 { return true }
+        lock.lock()
+        defer { lock.unlock() }
+        guard bytes <= limitBytes - currentBytes else { return false }
+        currentBytes += bytes
+        if currentBytes > peakBytes {
+            peakBytes = currentBytes
+        }
+        return true
+    }
+
+    func release(_ bytes: Int) {
+        if bytes <= 0 { return }
+        lock.lock()
+        currentBytes = max(0, currentBytes - bytes)
+        lock.unlock()
+    }
+
+    func stats() -> (current: Int, peak: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (currentBytes, peakBytes)
+    }
+}
+
+private final class OwnedRawBuffer {
+    private let pool: ObserverMemoryPool
+    let maxBytes: Int
+    private var buf: UnsafeMutableBufferPointer<UInt8>? = nil
+    private(set) var capacity: Int = 0
+    private(set) var count: Int = 0
+
+    init(pool: ObserverMemoryPool, maxBytes: Int) {
+        self.pool = pool
+        self.maxBytes = maxBytes
+    }
+
+    deinit {
+        free()
+    }
+
+    func append(bytes ptr: UnsafePointer<UInt8>, length n: Int) -> Bool {
+        if n <= 0 { return true }
+        guard n <= maxBytes - count else { return false }
+        let needed = count + n
+        if needed > capacity {
+            let doubled = capacity > 0 ? (capacity <= maxBytes / 2 ? capacity * 2 : maxBytes) : 256
+            let newCap = min(maxBytes, max(needed, doubled))
+            // Reserve full replacement capacity WHILE old capacity remains charged to the pool.
+            guard pool.reserve(newCap) else { return false }
+            let newBuf = UnsafeMutableBufferPointer<UInt8>.allocate(capacity: newCap)
+            if let oldBuf = buf, let oldBase = oldBuf.baseAddress, let newBase = newBuf.baseAddress {
+                if count > 0 {
+                    newBase.initialize(from: oldBase, count: count)
+                    memset(oldBase, 0, count)
+                }
+                let oldCap = capacity
+                oldBuf.deallocate()
+                buf = newBuf
+                capacity = newCap
+                pool.release(oldCap)
+            } else {
+                buf = newBuf
+                capacity = newCap
+            }
+        }
+        guard let dstBase = buf?.baseAddress else { return false }
+        dstBase.advanced(by: count).initialize(from: ptr, count: n)
+        count += n
+        return true
+    }
+
+    func appendByte(_ byte: UInt8) -> Bool {
+        var b = byte
+        return withUnsafePointer(to: &b) { ptr in
+            append(bytes: ptr, length: 1)
+        }
+    }
+
+    func withReadOnlyBytes<T>(_ body: (UnsafeBufferPointer<UInt8>) -> T) -> T {
+        if let rawBuf = buf, let base = rawBuf.baseAddress, count > 0 {
+            return body(UnsafeBufferPointer(start: base, count: count))
+        }
+        return body(UnsafeBufferPointer(start: nil, count: 0))
+    }
+
+    func free() {
+        guard let oldBuf = buf else {
+            count = 0
+            capacity = 0
+            return
+        }
+        if let base = oldBuf.baseAddress, count > 0 {
+            memset(base, 0, count)
+        }
+        let oldCap = capacity
+        buf = nil
+        capacity = 0
+        count = 0
+        oldBuf.deallocate()
+        pool.release(oldCap)
+    }
+}
+
+// Fixed 64-byte stack-only key buffer for zero-allocation JSON key matching.
+private struct StackKey64 {
+    var b0: UInt64 = 0; var b1: UInt64 = 0; var b2: UInt64 = 0; var b3: UInt64 = 0
+    var b4: UInt64 = 0; var b5: UInt64 = 0; var b6: UInt64 = 0; var b7: UInt64 = 0
+    var count: Int = 0
+    var overflowed: Bool = false
+
+    mutating func append(_ byte: UInt8) {
+        guard count < 64 else {
+            overflowed = true
+            return
+        }
+        let word = count >> 3
+        let shift = (count & 7) << 3
+        let val = UInt64(byte) << shift
+        switch word {
+        case 0: b0 |= val
+        case 1: b1 |= val
+        case 2: b2 |= val
+        case 3: b3 |= val
+        case 4: b4 |= val
+        case 5: b5 |= val
+        case 6: b6 |= val
+        default: b7 |= val
+        }
+        count += 1
+    }
+
+    mutating func appendUTF8(scalar: UInt32) {
+        if scalar <= 0x7F {
+            append(UInt8(scalar))
+        } else if scalar <= 0x7FF {
+            append(UInt8(0xC0 | (scalar >> 6)))
+            append(UInt8(0x80 | (scalar & 0x3F)))
+        } else if scalar <= 0xFFFF {
+            append(UInt8(0xE0 | (scalar >> 12)))
+            append(UInt8(0x80 | ((scalar >> 6) & 0x3F)))
+            append(UInt8(0x80 | (scalar & 0x3F)))
+        } else {
+            append(UInt8(0xF0 | (scalar >> 18)))
+            append(UInt8(0x80 | ((scalar >> 12) & 0x3F)))
+            append(UInt8(0x80 | ((scalar >> 6) & 0x3F)))
+            append(UInt8(0x80 | (scalar & 0x3F)))
+        }
+    }
+
+    func byte(at index: Int) -> UInt8 {
+        let word = index >> 3
+        let shift = (index & 7) << 3
+        let w: UInt64
+        switch word {
+        case 0: w = b0
+        case 1: w = b1
+        case 2: w = b2
+        case 3: w = b3
+        case 4: w = b4
+        case 5: w = b5
+        case 6: w = b6
+        default: w = b7
+        }
+        return UInt8((w >> shift) & 0xFF)
+    }
+
+    func equalsASCII(_ s: StaticString) -> Bool {
+        if overflowed { return false }
+        let n = s.utf8CodeUnitCount
+        if count != n { return false }
+        return s.withUTF8Buffer { ptr in
+            for i in 0..<n {
+                if byte(at: i) != ptr[i] { return false }
+            }
+            return true
+        }
+    }
+}
+
+private struct LexicalJSONUsageScanner {
+    let bytes: UnsafeBufferPointer<UInt8>
+    var pos: Int = 0
+
+    mutating func skipWS() {
+        while pos < bytes.count {
+            let b = bytes[pos]
+            if b == 0x20 || b == 0x09 || b == 0x0A || b == 0x0D {
+                pos += 1
+            } else {
+                break
+            }
+        }
+    }
+
+    mutating func parseHex4() -> UInt16? {
+        guard pos + 4 <= bytes.count else { return nil }
+        var acc: UInt16 = 0
+        for _ in 0..<4 {
+            guard let v = hexDigitValue(bytes[pos]) else { return nil }
+            acc = (acc << 4) | UInt16(v)
+            pos += 1
+        }
+        return acc
+    }
+
+    mutating func parseStringKey() -> StackKey64? {
+        guard pos < bytes.count, bytes[pos] == 0x22 else { return nil }
+        pos += 1
+        var key = StackKey64()
+        while pos < bytes.count {
+            let b = bytes[pos]
+            if b == 0x22 {
+                pos += 1
+                return key
+            }
+            if b < 0x20 { return nil }
+            if b == 0x5C {
+                pos += 1
+                guard pos < bytes.count else { return nil }
+                let esc = bytes[pos]
+                pos += 1
+                switch esc {
+                case 0x22: key.append(0x22)
+                case 0x5C: key.append(0x5C)
+                case 0x2F: key.append(0x2F)
+                case 0x62: key.append(0x08)
+                case 0x66: key.append(0x0C)
+                case 0x6E: key.append(0x0A)
+                case 0x72: key.append(0x0D)
+                case 0x74: key.append(0x09)
+                case 0x75:
+                    guard let cu1 = parseHex4() else { return nil }
+                    if (0xD800...0xDBFF).contains(cu1) {
+                        guard pos + 2 <= bytes.count, bytes[pos] == 0x5C, bytes[pos + 1] == 0x75 else {
+                            return nil
+                        }
+                        pos += 2
+                        guard let cu2 = parseHex4(), (0xDC00...0xDFFF).contains(cu2) else {
+                            return nil
+                        }
+                        let scalar = 0x10000 + ((UInt32(cu1) - 0xD800) << 10) + (UInt32(cu2) - 0xDC00)
+                        key.appendUTF8(scalar: scalar)
+                    } else if (0xDC00...0xDFFF).contains(cu1) {
+                        return nil
+                    } else {
+                        key.appendUTF8(scalar: UInt32(cu1))
+                    }
+                default:
+                    return nil
+                }
+            } else if b >= 0x80 {
+                let seqLen = validUTF8MultibyteLength(at: pos)
+                guard seqLen > 0 else { return nil }
+                for i in 0..<seqLen {
+                    key.append(bytes[pos + i])
+                }
+                pos += seqLen
+            } else {
+                key.append(b)
+                pos += 1
+            }
+        }
+        return nil
+    }
+
+    private func validUTF8MultibyteLength(at idx: Int) -> Int {
+        let b0 = bytes[idx]
+        if b0 >= 0xC2 && b0 <= 0xDF {
+            guard idx + 1 < bytes.count else { return 0 }
+            let b1 = bytes[idx + 1]
+            return (b1 >= 0x80 && b1 <= 0xBF) ? 2 : 0
+        } else if b0 == 0xE0 {
+            guard idx + 2 < bytes.count else { return 0 }
+            let b1 = bytes[idx + 1], b2 = bytes[idx + 2]
+            return (b1 >= 0xA0 && b1 <= 0xBF && b2 >= 0x80 && b2 <= 0xBF) ? 3 : 0
+        } else if (b0 >= 0xE1 && b0 <= 0xEC) || (b0 >= 0xEE && b0 <= 0xEF) {
+            guard idx + 2 < bytes.count else { return 0 }
+            let b1 = bytes[idx + 1], b2 = bytes[idx + 2]
+            return (b1 >= 0x80 && b1 <= 0xBF && b2 >= 0x80 && b2 <= 0xBF) ? 3 : 0
+        } else if b0 == 0xED {
+            guard idx + 2 < bytes.count else { return 0 }
+            let b1 = bytes[idx + 1], b2 = bytes[idx + 2]
+            return (b1 >= 0x80 && b1 <= 0x9F && b2 >= 0x80 && b2 <= 0xBF) ? 3 : 0
+        } else if b0 == 0xF0 {
+            guard idx + 3 < bytes.count else { return 0 }
+            let b1 = bytes[idx + 1], b2 = bytes[idx + 2], b3 = bytes[idx + 3]
+            return (b1 >= 0x90 && b1 <= 0xBF && b2 >= 0x80 && b2 <= 0xBF && b3 >= 0x80 && b3 <= 0xBF) ? 4 : 0
+        } else if b0 >= 0xF1 && b0 <= 0xF3 {
+            guard idx + 3 < bytes.count else { return 0 }
+            let b1 = bytes[idx + 1], b2 = bytes[idx + 2], b3 = bytes[idx + 3]
+            return (b1 >= 0x80 && b1 <= 0xBF && b2 >= 0x80 && b2 <= 0xBF && b3 >= 0x80 && b3 <= 0xBF) ? 4 : 0
+        } else if b0 == 0xF4 {
+            guard idx + 3 < bytes.count else { return 0 }
+            let b1 = bytes[idx + 1], b2 = bytes[idx + 2], b3 = bytes[idx + 3]
+            return (b1 >= 0x80 && b1 <= 0x8F && b2 >= 0x80 && b2 <= 0xBF && b3 >= 0x80 && b3 <= 0xBF) ? 4 : 0
+        }
+        return 0
+    }
+
+    mutating func skipString() -> Bool {
+        guard pos < bytes.count, bytes[pos] == 0x22 else { return false }
+        pos += 1
+        while pos < bytes.count {
+            let b = bytes[pos]
+            if b == 0x22 {
+                pos += 1
+                return true
+            }
+            if b < 0x20 { return false }
+            if b == 0x5C {
+                pos += 1
+                guard pos < bytes.count else { return false }
+                let esc = bytes[pos]
+                pos += 1
+                switch esc {
+                case 0x22, 0x5C, 0x2F, 0x62, 0x66, 0x6E, 0x72, 0x74:
+                    break
+                case 0x75:
+                    guard let cu1 = parseHex4() else { return false }
+                    if (0xD800...0xDBFF).contains(cu1) {
+                        guard pos + 2 <= bytes.count, bytes[pos] == 0x5C, bytes[pos + 1] == 0x75 else {
+                            return false
+                        }
+                        pos += 2
+                        guard let cu2 = parseHex4(), (0xDC00...0xDFFF).contains(cu2) else {
+                            return false
+                        }
+                    } else if (0xDC00...0xDFFF).contains(cu1) {
+                        return false
+                    }
+                default:
+                    return false
+                }
+            } else if b >= 0x80 {
+                let seqLen = validUTF8MultibyteLength(at: pos)
+                guard seqLen > 0 else { return false }
+                pos += seqLen
+            } else {
+                pos += 1
+            }
+        }
+        return false
+    }
+
+    mutating func consumeLiteral(_ lit: StaticString) -> Bool {
+        let n = lit.utf8CodeUnitCount
+        guard pos + n <= bytes.count else { return false }
+        let ok = lit.withUTF8Buffer { ptr in
+            for i in 0..<n {
+                if bytes[pos + i] != ptr[i] { return false }
+            }
+            return true
+        }
+        if ok { pos += n }
+        return ok
+    }
+
+    mutating func skipNumber() -> Bool {
+        let start = pos
+        if pos < bytes.count && bytes[pos] == 0x2D { pos += 1 }
+        guard pos < bytes.count else { return false }
+        if bytes[pos] == 0x30 {
+            pos += 1
+        } else if bytes[pos] >= 0x31 && bytes[pos] <= 0x39 {
+            pos += 1
+            while pos < bytes.count && bytes[pos] >= 0x30 && bytes[pos] <= 0x39 { pos += 1 }
+        } else {
+            return false
+        }
+        if pos < bytes.count && bytes[pos] == 0x2E {
+            pos += 1
+            let fracStart = pos
+            while pos < bytes.count && bytes[pos] >= 0x30 && bytes[pos] <= 0x39 { pos += 1 }
+            if pos == fracStart { return false }
+        }
+        if pos < bytes.count && (bytes[pos] == 0x65 || bytes[pos] == 0x45) {
+            pos += 1
+            if pos < bytes.count && (bytes[pos] == 0x2B || bytes[pos] == 0x2D) { pos += 1 }
+            let expStart = pos
+            while pos < bytes.count && bytes[pos] >= 0x30 && bytes[pos] <= 0x39 { pos += 1 }
+            if pos == expStart { return false }
+        }
+        return pos > start
+    }
+
+    mutating func skipValue(depth: Int, maxDepth: Int) -> Bool {
+        if depth > maxDepth { return false }
+        skipWS()
+        guard pos < bytes.count else { return false }
+        switch bytes[pos] {
+        case 0x7B: // '{'
+            pos += 1
+            skipWS()
+            if pos < bytes.count && bytes[pos] == 0x7D {
+                pos += 1
+                return true
+            }
+            while true {
+                skipWS()
+                guard skipString() else { return false }
+                skipWS()
+                guard pos < bytes.count && bytes[pos] == 0x3A else { return false }
+                pos += 1
+                guard skipValue(depth: depth + 1, maxDepth: maxDepth) else { return false }
+                skipWS()
+                guard pos < bytes.count else { return false }
+                if bytes[pos] == 0x2C {
+                    pos += 1
+                } else if bytes[pos] == 0x7D {
+                    pos += 1
+                    return true
+                } else {
+                    return false
+                }
+            }
+        case 0x5B: // '['
+            pos += 1
+            skipWS()
+            if pos < bytes.count && bytes[pos] == 0x5D {
+                pos += 1
+                return true
+            }
+            while true {
+                guard skipValue(depth: depth + 1, maxDepth: maxDepth) else { return false }
+                skipWS()
+                guard pos < bytes.count else { return false }
+                if bytes[pos] == 0x2C {
+                    pos += 1
+                } else if bytes[pos] == 0x5D {
+                    pos += 1
+                    return true
+                } else {
+                    return false
+                }
+            }
+        case 0x22:
+            return skipString()
+        case 0x74:
+            return consumeLiteral("true")
+        case 0x66:
+            return consumeLiteral("false")
+        case 0x6E:
+            return consumeLiteral("null")
+        default:
+            return skipNumber()
+        }
+    }
+
+    enum LexicalOptionalInt {
+        case nullValue
+        case integer(Int64)
+        case invalid
+    }
+
+    mutating func parseLexicalOptionalNonNegInt64() -> LexicalOptionalInt {
+        skipWS()
+        guard pos < bytes.count else { return .invalid }
+        if bytes[pos] == 0x6E {
+            return consumeLiteral("null") ? .nullValue : .invalid
+        }
+        // Strictly accept exact JSON non-negative integer token: "0" or [1-9][0-9]*
+        // Reject negatives, booleans, strings, leading zeros, fractional (1.0), and exponent (1e2).
+        let first = bytes[pos]
+        var acc: Int64 = 0
+        if first == 0x30 {
+            pos += 1
+        } else if first >= 0x31 && first <= 0x39 {
+            acc = Int64(first - 0x30)
+            pos += 1
+            while pos < bytes.count && bytes[pos] >= 0x30 && bytes[pos] <= 0x39 {
+                let d = Int64(bytes[pos] - 0x30)
+                if acc > (kMaxPerRequestTokens - d) / 10 {
+                    return .invalid
+                }
+                acc = acc * 10 + d
+                pos += 1
+            }
+        } else {
+            return .invalid
+        }
+        // Must be immediately terminated by JSON delimiter (never '.', 'e', 'E', digit, etc.)
+        if pos < bytes.count {
+            let next = bytes[pos]
+            if next != 0x20 && next != 0x09 && next != 0x0A && next != 0x0D && next != 0x2C && next != 0x7D && next != 0x5D {
+                return .invalid
+            }
+        }
+        guard acc <= kMaxPerRequestTokens else { return .invalid }
+        return .integer(acc)
+    }
+
+    mutating func parsePromptTokensDetails() -> LexicalOptionalInt {
+        skipWS()
+        guard pos < bytes.count else { return .invalid }
+        if bytes[pos] == 0x6E {
+            return consumeLiteral("null") ? .nullValue : .invalid
+        }
+        guard bytes[pos] == 0x7B else { return .invalid }
+        pos += 1
+        skipWS()
+        if pos < bytes.count && bytes[pos] == 0x7D {
+            pos += 1
+            return .nullValue
+        }
+        var sawCachedKey = false
+        var cachedVal: Int64? = nil
+        while true {
+            skipWS()
+            guard let key = parseStringKey() else { return .invalid }
+            skipWS()
+            guard pos < bytes.count && bytes[pos] == 0x3A else { return .invalid }
+            pos += 1
+            if key.equalsASCII("cached_tokens") {
+                if sawCachedKey { return .invalid }
+                sawCachedKey = true
+                switch parseLexicalOptionalNonNegInt64() {
+                case .nullValue:
+                    cachedVal = nil
+                case .integer(let v):
+                    cachedVal = v
+                case .invalid:
+                    return .invalid
+                }
+            } else {
+                guard skipValue(depth: 2, maxDepth: kMaxUsageJSONScanDepth) else { return .invalid }
+            }
+            skipWS()
+            guard pos < bytes.count else { return .invalid }
+            if bytes[pos] == 0x2C {
+                pos += 1
+            } else if bytes[pos] == 0x7D {
+                pos += 1
+                break
+            } else {
+                return .invalid
+            }
+        }
+        if let v = cachedVal { return .integer(v) }
+        return .nullValue
+    }
+
+    mutating func parseUsageObject() -> UsageScanState {
+        skipWS()
+        guard pos < bytes.count else { return .invalid }
+        if bytes[pos] == 0x6E {
+            return consumeLiteral("null") ? .nullValue : .invalid
+        }
+        guard bytes[pos] == 0x7B else { return .invalid }
+        pos += 1
+        skipWS()
+        if pos < bytes.count && bytes[pos] == 0x7D {
+            pos += 1
+            return .invalid
+        }
+
+        var seenMask: UInt32 = 0
+        var promptTokens: Int64? = nil
+        var completionTokens: Int64? = nil
+        var cachedFromDetails: Int64? = nil
+        var cachedPromptTokens: Int64? = nil
+        var cachedTokens: Int64? = nil
+        var promptCacheHitTokens: Int64? = nil
+
+        while true {
+            skipWS()
+            guard let key = parseStringKey() else { return .invalid }
+            skipWS()
+            guard pos < bytes.count && bytes[pos] == 0x3A else { return .invalid }
+            pos += 1
+
+            if key.equalsASCII("prompt_tokens") {
+                if (seenMask & 1) != 0 { return .invalid }
+                seenMask |= 1
+                guard case .integer(let v) = parseLexicalOptionalNonNegInt64() else { return .invalid }
+                promptTokens = v
+            } else if key.equalsASCII("completion_tokens") {
+                if (seenMask & 2) != 0 { return .invalid }
+                seenMask |= 2
+                guard case .integer(let v) = parseLexicalOptionalNonNegInt64() else { return .invalid }
+                completionTokens = v
+            } else if key.equalsASCII("prompt_tokens_details") {
+                if (seenMask & 4) != 0 { return .invalid }
+                seenMask |= 4
+                switch parsePromptTokensDetails() {
+                case .nullValue: cachedFromDetails = nil
+                case .integer(let v): cachedFromDetails = v
+                case .invalid: return .invalid
+                }
+            } else if key.equalsASCII("cached_prompt_tokens") {
+                if (seenMask & 8) != 0 { return .invalid }
+                seenMask |= 8
+                switch parseLexicalOptionalNonNegInt64() {
+                case .nullValue: cachedPromptTokens = nil
+                case .integer(let v): cachedPromptTokens = v
+                case .invalid: return .invalid
+                }
+            } else if key.equalsASCII("cached_tokens") {
+                if (seenMask & 16) != 0 { return .invalid }
+                seenMask |= 16
+                switch parseLexicalOptionalNonNegInt64() {
+                case .nullValue: cachedTokens = nil
+                case .integer(let v): cachedTokens = v
+                case .invalid: return .invalid
+                }
+            } else if key.equalsASCII("prompt_cache_hit_tokens") {
+                if (seenMask & 32) != 0 { return .invalid }
+                seenMask |= 32
+                switch parseLexicalOptionalNonNegInt64() {
+                case .nullValue: promptCacheHitTokens = nil
+                case .integer(let v): promptCacheHitTokens = v
+                case .invalid: return .invalid
+                }
+            } else {
+                guard skipValue(depth: 1, maxDepth: kMaxUsageJSONScanDepth) else { return .invalid }
+            }
+
+            skipWS()
+            guard pos < bytes.count else { return .invalid }
+            if bytes[pos] == 0x2C {
+                pos += 1
+            } else if bytes[pos] == 0x7D {
+                pos += 1
+                break
+            } else {
+                return .invalid
+            }
+        }
+
+        guard let pt = promptTokens, let ct = completionTokens else {
+            return .invalid
+        }
+        var agreedCached: Int64? = nil
+        for cand in [cachedFromDetails, cachedPromptTokens, cachedTokens, promptCacheHitTokens] {
+            if let v = cand {
+                if let prev = agreedCached {
+                    if prev != v { return .invalid }
+                } else {
+                    agreedCached = v
+                }
+            }
+        }
+        let finalCached = agreedCached ?? 0
+        guard finalCached <= pt else { return .invalid }
+        return .valid(ParsedTokenUsage(promptTokens: pt, cachedPromptTokens: finalCached, completionTokens: ct))
+    }
+
+    mutating func scanTopLevel() -> UsageScanState {
+        skipWS()
+        guard pos < bytes.count && bytes[pos] == 0x7B else { return .invalid }
+        pos += 1
+        skipWS()
+        if pos < bytes.count && bytes[pos] == 0x7D {
+            pos += 1
+            skipWS()
+            return pos == bytes.count ? .missing : .invalid
+        }
+        var sawUsageKey = false
+        var result: UsageScanState = .missing
+        while true {
+            skipWS()
+            guard let key = parseStringKey() else { return .invalid }
+            skipWS()
+            guard pos < bytes.count && bytes[pos] == 0x3A else { return .invalid }
+            pos += 1
+            if key.equalsASCII("usage") {
+                if sawUsageKey { return .invalid }
+                sawUsageKey = true
+                result = parseUsageObject()
+                if result == .invalid { return .invalid }
+            } else {
+                guard skipValue(depth: 1, maxDepth: kMaxOuterJSONScanDepth) else { return .invalid }
+            }
+            skipWS()
+            guard pos < bytes.count else { return .invalid }
+            if bytes[pos] == 0x2C {
+                pos += 1
+            } else if bytes[pos] == 0x7D {
+                pos += 1
+                break
+            } else {
+                return .invalid
+            }
+        }
+        skipWS()
+        guard pos == bytes.count else { return .invalid }
+        return result
+    }
+}
+
+private func scanTopLevelUsageJSON(_ bytes: UnsafeBufferPointer<UInt8>) -> UsageScanState {
+    var scanner = LexicalJSONUsageScanner(bytes: bytes)
+    return scanner.scanTopLevel()
+}
+
+private func isHTTPTChar(_ b: UInt8) -> Bool {
+    if (b >= 0x30 && b <= 0x39) || (b >= 0x41 && b <= 0x5A) || (b >= 0x61 && b <= 0x7A) {
+        return true
+    }
+    switch b {
+    case 0x21, 0x23, 0x24, 0x25, 0x26, 0x27, 0x2A, 0x2B, 0x2D, 0x2E, 0x5E, 0x5F, 0x60, 0x7C, 0x7E:
+        return true
+    default:
+        return false
+    }
+}
+
+private func isHTTPFieldVCharOrObsOrWS(_ b: UInt8) -> Bool {
+    return b == 0x09 || (b >= 0x20 && b <= 0x7E) || b >= 0x80
+}
+
+private func parseHTTPStatusLineBytes(_ line: [UInt8]) -> Int? {
+    // Require exact "HTTP/1.0" or "HTTP/1.1" + SP + 3 ASCII digits + SP + optional valid reason-phrase bytes
+    guard line.count >= 13 else { return nil }
+    guard line[0] == 0x48 && line[1] == 0x54 && line[2] == 0x54 && line[3] == 0x50
+        && line[4] == 0x2F && line[5] == 0x31 && line[6] == 0x2E
+        && (line[7] == 0x30 || line[7] == 0x31)
+        && line[8] == 0x20 else {
+        return nil
+    }
+    guard line[9] >= 0x31 && line[9] <= 0x35
+        && line[10] >= 0x30 && line[10] <= 0x39
+        && line[11] >= 0x30 && line[11] <= 0x39
+        && line[12] == 0x20 else {
+        return nil
+    }
+    for idx in 13..<line.count {
+        if !isHTTPFieldVCharOrObsOrWS(line[idx]) { return nil }
+    }
+    return Int(line[9] - 0x30) * 100 + Int(line[10] - 0x30) * 10 + Int(line[11] - 0x30)
+}
+
+private func parseHTTPFieldLineBytes(_ line: [UInt8]) -> (nameLowerASCII: String, valueBytes: [UInt8])? {
+    guard let colonIdx = line.firstIndex(of: 0x3A), colonIdx > 0 else {
+        return nil
+    }
+    var lowerName = [UInt8]()
+    lowerName.reserveCapacity(colonIdx)
+    for idx in 0..<colonIdx {
+        let b = line[idx]
+        guard isHTTPTChar(b) else { return nil }
+        if b >= 0x41 && b <= 0x5A {
+            lowerName.append(b + 32)
+        } else {
+            lowerName.append(b)
+        }
+    }
+    for idx in (colonIdx + 1)..<line.count {
+        guard isHTTPFieldVCharOrObsOrWS(line[idx]) else { return nil }
+    }
+    let valSlice = Array(line[(colonIdx + 1)..<line.count])
+    return (String(decoding: lowerName, as: UTF8.self), valSlice)
+}
+
+private func trimASCIIOWS(_ bytes: [UInt8]) -> [UInt8] {
+    var start = 0
+    var end = bytes.count
+    while start < end && (bytes[start] == 0x20 || bytes[start] == 0x09) { start += 1 }
+    while end > start && (bytes[end - 1] == 0x20 || bytes[end - 1] == 0x09) { end -= 1 }
+    return start < end ? Array(bytes[start..<end]) : []
+}
+
+private func parseASCIIPureASCIIString(_ bytes: [UInt8]) -> String? {
+    for b in bytes {
+        if b > 0x7F { return nil }
+    }
+    return String(decoding: bytes, as: UTF8.self)
+}
+
+private func parseChunkSizeLineBytes(_ line: [UInt8]) -> (size: Int, hasExtension: Bool)? {
+    guard !line.isEmpty else { return nil }
+    var hexEnd = line.count
+    var hasExt = false
+    if let semi = line.firstIndex(of: 0x3B) {
+        hexEnd = semi
+        hasExt = true
+        // RFC 9112 §7.1.1: chunk-ext = *( BWS ";" BWS chunk-ext-name ... ) where BWS = *( SP / HTAB )
+        while hexEnd > 0 && (line[hexEnd - 1] == 0x20 || line[hexEnd - 1] == 0x09) {
+            hexEnd -= 1
+        }
+    }
+    guard hexEnd >= 1 && hexEnd <= 8 else { return nil }
+    var val: Int = 0
+    for idx in 0..<hexEnd {
+        guard let nib = hexDigitValue(line[idx]) else { return nil }
+        val = (val << 4) | Int(nib)
+    }
+    return (val, hasExt)
+}
+
+private struct ObserverOutcome {
+    let upstreamRequestWritten: Bool
+    let httpStatus: Int?
+    let transportComplete: Bool
+    let usageState: UsageScanState
+}
+
+private final class ChatUsageObserver: @unchecked Sendable {
+    private enum Mode {
+        case pending
+        case json
+        case sse
+        case unsupported
+    }
+
+    private let lock = NSLock()
+    private let pool: ObserverMemoryPool
+    private var mode: Mode = .pending
+    private var detached = false
+    private var upstreamRequestWritten = false
+    private var httpStatus: Int? = nil
+    private var framingInvalid = false
+    private var transportComplete = false
+    private var overflowed = false
+    private var usageState: UsageScanState = .missing
+    private var sawSSEDone = false
+    private var sseBomDone = false
+    private var sseBomPendingCount = 0
+    private var ssePrevWasCR = false
+    private var sseEventHasData = false
+    private var cachedOutcome: ObserverOutcome? = nil
+
+    private let jsonBuf: OwnedRawBuffer
+    private let ssePartialLine: OwnedRawBuffer
+    private let sseEventBuf: OwnedRawBuffer
+
+    init(pool: ObserverMemoryPool) {
+        self.pool = pool
+        self.jsonBuf = OwnedRawBuffer(pool: pool, maxBytes: kMaxUsageJSONBodyBytes)
+        self.ssePartialLine = OwnedRawBuffer(pool: pool, maxBytes: kMaxUsageSSELineBytes)
+        self.sseEventBuf = OwnedRawBuffer(pool: pool, maxBytes: kMaxUsageSSEEventBytes)
+    }
+
+    private func freeAllBuffersLocked() {
+        jsonBuf.free()
+        ssePartialLine.free()
+        sseEventBuf.free()
+    }
+
+    func markUpstreamRequestWritten() {
+        lock.lock()
+        if !detached {
+            upstreamRequestWritten = true
+        }
+        lock.unlock()
+    }
+
+    func markFramingInvalid() {
+        lock.lock()
+        if !detached {
+            framingInvalid = true
+            transportComplete = false
+        }
+        lock.unlock()
+    }
+
+    func markTransportComplete() {
+        lock.lock()
+        if !detached && !framingInvalid {
+            transportComplete = true
+        }
+        lock.unlock()
+    }
+
+    func onHeaders(status: Int, contentType: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !detached else { return }
+        httpStatus = status
+        guard status == 200 else {
+            mode = .unsupported
+            return
+        }
+        let media = contentType
+            .split(separator: ";", maxSplits: 1, omittingEmptySubsequences: false)
+            .first
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() } ?? ""
+        if media == "text/event-stream" {
+            mode = .sse
+        } else if media == "application/json" || media.hasSuffix("+json") {
+            mode = .json
+        } else {
+            mode = .unsupported
+        }
+    }
+
+    func onChunk(_ data: Data) {
+        if data.isEmpty { return }
+        lock.lock()
+        defer { lock.unlock() }
+        guard !detached && !overflowed else { return }
+        switch mode {
+        case .json:
+            let ok = data.withUnsafeBytes { raw -> Bool in
+                guard let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return true }
+                return jsonBuf.append(bytes: base, length: raw.count)
+            }
+            if !ok {
+                overflowed = true
+                usageState = .invalid
+                freeAllBuffersLocked()
+            }
+        case .sse:
+            data.withUnsafeBytes { raw in
+                guard let base = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+                let total = raw.count
+                var startIdx = 0
+                if !sseBomDone {
+                    // SSE standard §9.2.6: ignore one leading UTF-8 BOM (0xEF 0xBB 0xBF), even if split across chunks
+                    while startIdx < total && !sseBomDone {
+                        let b = base[startIdx]
+                        if sseBomPendingCount == 0 {
+                            if b == 0xEF {
+                                sseBomPendingCount = 1
+                                startIdx += 1
+                            } else {
+                                sseBomDone = true
+                            }
+                        } else if sseBomPendingCount == 1 {
+                            if b == 0xBB {
+                                sseBomPendingCount = 2
+                                startIdx += 1
+                            } else {
+                                sseBomDone = true
+                                sseBomPendingCount = 0
+                                let prev: [UInt8] = [0xEF]
+                                let ok = prev.withUnsafeBufferPointer { buf -> Bool in
+                                    guard let p = buf.baseAddress else { return true }
+                                    return ssePartialLine.append(bytes: p, length: 1)
+                                }
+                                if !ok {
+                                    overflowed = true
+                                    usageState = .invalid
+                                    freeAllBuffersLocked()
+                                    return
+                                }
+                            }
+                        } else {
+                            sseBomDone = true
+                            sseBomPendingCount = 0
+                            if b == 0xBF {
+                                startIdx += 1
+                            } else {
+                                let prev: [UInt8] = [0xEF, 0xBB]
+                                let ok = prev.withUnsafeBufferPointer { buf -> Bool in
+                                    guard let p = buf.baseAddress else { return true }
+                                    return ssePartialLine.append(bytes: p, length: 2)
+                                }
+                                if !ok {
+                                    overflowed = true
+                                    usageState = .invalid
+                                    freeAllBuffersLocked()
+                                    return
+                                }
+                            }
+                        }
+                    }
+                }
+                var segStart = startIdx
+                var i = startIdx
+                while i < total && !overflowed {
+                    let b = base[i]
+                    if ssePrevWasCR {
+                        ssePrevWasCR = false
+                        if b == 0x0A {
+                            i += 1
+                            segStart = i
+                            continue
+                        }
+                    }
+                    if b == 0x0A || b == 0x0D {
+                        if i > segStart {
+                            if !ssePartialLine.append(bytes: base.advanced(by: segStart), length: i - segStart) {
+                                overflowed = true
+                                usageState = .invalid
+                                freeAllBuffersLocked()
+                                return
+                            }
+                        }
+                        processCompleteSSELineLocked()
+                        if overflowed { return }
+                        if b == 0x0D {
+                            ssePrevWasCR = true
+                        }
+                        i += 1
+                        segStart = i
+                    } else {
+                        i += 1
+                    }
+                }
+                if !overflowed && total > segStart {
+                    if !ssePartialLine.append(bytes: base.advanced(by: segStart), length: total - segStart) {
+                        overflowed = true
+                        usageState = .invalid
+                        freeAllBuffersLocked()
+                    }
+                }
+            }
+        case .pending, .unsupported:
+            break
+        }
+    }
+
+    private func processCompleteSSELineLocked() {
+        defer { ssePartialLine.free() }
+        if ssePartialLine.count == 0 {
+            // Blank line = SSE event boundary
+            if sseEventHasData {
+                dispatchSSEEventLocked()
+                sseEventBuf.free()
+                sseEventHasData = false
+            }
+            return
+        }
+        ssePartialLine.withReadOnlyBytes { line in
+            guard line.count > 0 else { return }
+            if line[0] == 0x3A { // ':' comment line
+                return
+            }
+            var colonIdx: Int? = nil
+            for idx in 0..<line.count {
+                if line[idx] == 0x3A {
+                    colonIdx = idx
+                    break
+                }
+            }
+            let fieldLen = colonIdx ?? line.count
+            // Match exact "data" field name (colonless bare "data" OR "data:...")
+            guard fieldLen == 4
+                && line[0] == 0x64 && line[1] == 0x61 && line[2] == 0x74 && line[3] == 0x61 else {
+                return
+            }
+            if sseEventHasData {
+                if !sseEventBuf.appendByte(0x0A) {
+                    overflowed = true
+                    usageState = .invalid
+                    freeAllBuffersLocked()
+                    return
+                }
+            }
+            sseEventHasData = true
+            if let cIdx = colonIdx {
+                var valStart = cIdx + 1
+                if valStart < line.count && line[valStart] == 0x20 {
+                    valStart += 1
+                }
+                let valLen = line.count - valStart
+                if valLen > 0, let base = line.baseAddress {
+                    if !sseEventBuf.append(bytes: base.advanced(by: valStart), length: valLen) {
+                        overflowed = true
+                        usageState = .invalid
+                        freeAllBuffersLocked()
+                        return
+                    }
+                }
+            }
+        }
+    }
+
+    private func dispatchSSEEventLocked() {
+        sseEventBuf.withReadOnlyBytes { payload in
+            if payload.count == 0 { return }
+            // Check exact "[DONE]"
+            let isDone = payload.count == 6
+                && payload[0] == 0x5B && payload[1] == 0x44 && payload[2] == 0x4F
+                && payload[3] == 0x4E && payload[4] == 0x45 && payload[5] == 0x5D
+            if sawSSEDone {
+                usageState = .invalid
+                return
+            }
+            if isDone {
+                sawSSEDone = true
+                return
+            }
+            let scanned = scanTopLevelUsageJSON(payload)
+            switch scanned {
+            case .missing, .nullValue:
+                break
+            case .valid(let parsed):
+                if usageState != .invalid {
+                    usageState = .valid(parsed)
+                }
+            case .invalid:
+                usageState = .invalid
+            }
+        }
+    }
+
+    func detachAndFinalize(forceIncomplete: Bool) -> ObserverOutcome {
+        lock.lock()
+        defer { lock.unlock() }
+        if detached, let prev = cachedOutcome {
+            return prev
+        }
+        detached = true
+        let finalTransportComplete = (!forceIncomplete && !framingInvalid && transportComplete)
+        var finalUsageState = usageState
+        if overflowed || !finalTransportComplete {
+            finalUsageState = .invalid
+        } else if httpStatus == 200 {
+            switch mode {
+            case .json:
+                if jsonBuf.count == 0 {
+                    finalUsageState = .missing
+                } else {
+                    let scanned = jsonBuf.withReadOnlyBytes { scanTopLevelUsageJSON($0) }
+                    finalUsageState = (scanned == .nullValue) ? .missing : scanned
+                }
+            case .sse:
+                // Unfinished SSE event data (non-empty line/event, dangling BOM prefix, or bare/empty data field lacking blank delimiter)
+                if ssePartialLine.count > 0 || sseEventBuf.count > 0 || sseEventHasData || sseBomPendingCount > 0 {
+                    finalUsageState = .invalid
+                }
+            case .pending, .unsupported:
+                finalUsageState = .missing
+            }
+        }
+        freeAllBuffersLocked()
+        let out = ObserverOutcome(
+            upstreamRequestWritten: upstreamRequestWritten,
+            httpStatus: httpStatus,
+            transportComplete: finalTransportComplete,
+            usageState: finalUsageState
+        )
+        cachedOutcome = out
+        return out
+    }
+}
+
 private final class StreamingForwardDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
     private let lock = NSLock()
     private var clientFD: Int32
-    let deadlineUptimeNs: UInt64
+    private let timeoutSecondsClamped: UInt64
+    private(set) var deadlineUptimeNs: UInt64
+    private var _usageObserver: ChatUsageObserver?
     private let sem = DispatchSemaphore(value: 0)
     private var wroteHeaders = false
     private var cancelled = false
     private var signaled = false
     private(set) var completedError: Error?
 
-    init(clientFD: Int32, timeoutSeconds: Int) {
+    init(clientFD: Int32, timeoutSeconds: Int, usageObserver: ChatUsageObserver? = nil) {
         self.clientFD = clientFD
         let clamped = UInt64(max(1, timeoutSeconds))
+        self.timeoutSecondsClamped = clamped
         self.deadlineUptimeNs = DispatchTime.now().uptimeNanoseconds + clamped * 1_000_000_000
+        self._usageObserver = usageObserver
+    }
+
+    func resetDeadline() {
+        self.deadlineUptimeNs = DispatchTime.now().uptimeNanoseconds + timeoutSecondsClamped * 1_000_000_000
+    }
+
+    func setUsageObserver(_ obs: ChatUsageObserver?) {
+        lock.lock()
+        _usageObserver = obs
+        lock.unlock()
+    }
+
+    var usageObserver: ChatUsageObserver? {
+        lock.lock()
+        defer { lock.unlock() }
+        return _usageObserver
     }
 
     func remainingMilliseconds() -> Int32 {
@@ -1402,12 +2714,14 @@ private final class StreamingForwardDelegate: NSObject, URLSessionDataDelegate, 
         }
         let status = httpResp.statusCode
         let contentType = httpResp.value(forHTTPHeaderField: "Content-Type") ?? "application/json"
+        usageObserver?.onHeaders(status: status, contentType: contentType)
         let ok = writeHeadersSafe(status: status, contentType: contentType)
         completionHandler(ok ? .allow : .cancel)
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         if !data.isEmpty {
+            usageObserver?.onChunk(data)
             if !writeSafe(data) {
                 dataTask.cancel()
             }
@@ -1423,6 +2737,8 @@ private final class StreamingForwardDelegate: NSObject, URLSessionDataDelegate, 
                 errorCode: "upstream_error",
                 message: "Upstream connection failed: \(error.localizedDescription)"
             )
+        } else {
+            usageObserver?.markTransportComplete()
         }
         lock.lock()
         let shouldSignal = !signaled
@@ -1962,9 +3278,21 @@ private final class ProxyServer: @unchecked Sendable {
     let forceURLSession: Bool
     let sessionTokenFile: String?
     let defaultChatParams: [String: Any]
+    let pricing: PricingRates?
+    let maxActualMicroUsd: Int64?
 
-    private let lock = NSLock()
+    private let lock = NSCondition()
+    private let observerPool = ObserverMemoryPool(limitBytes: kMaxTotalObserverBytes)
     private var chatRequestsUsed = 0
+    private var uncachedPromptTokensTotal: Int64 = 0
+    private var cachedPromptTokensTotal: Int64 = 0
+    private var completionTokensTotal: Int64 = 0
+    private var usageReportedRequests = 0
+    private var usageUnreportedRequests = 0
+    private var spendPicoUsd = UInt128Pair.zero
+    private var spendIndeterminate = false
+    private var cappedChatOwnerID: UInt64? = nil
+    private var nextAdmissionID: UInt64 = 0
     private var cleanedUp = false
     private let urlSession: URLSession
     private let renewalLock = NSLock()
@@ -1996,6 +3324,8 @@ private final class ProxyServer: @unchecked Sendable {
         sessionTokenFile: String?,
         defaultChatParams: [String: Any] = [:],
         ttlSeconds: Int = 3600,
+        pricing: PricingRates? = nil,
+        maxActualMicroUsd: Int64? = nil,
         renewalAuthorizer: ((Int) throws -> Data)? = nil
     ) {
         self.listenPort = listenPort
@@ -2015,6 +3345,8 @@ private final class ProxyServer: @unchecked Sendable {
         self.windowSeconds = ttlSeconds
         self.deadline = continuousSeconds() + Double(ttlSeconds)
         self.expiresAt = Int(Date().timeIntervalSince1970) + ttlSeconds
+        self.pricing = pricing
+        self.maxActualMicroUsd = maxActualMicroUsd
         self.renewalAuthorizer = renewalAuthorizer
 
         let cfg = URLSessionConfiguration.ephemeral
@@ -2028,14 +3360,99 @@ private final class ProxyServer: @unchecked Sendable {
         self.urlSession = URLSession(configuration: cfg)
     }
 
+    private func estimatedMicroUsdLocked() -> Int64 {
+        let rounded = spendPicoUsd.addingClamped(UInt128Pair(hi: 0, lo: 500_000)).divMod1000000().quotient
+        return rounded.clampedInt64(max: kMaxWireMicroUsd)
+    }
+
+    private func isSpendCapExceededLocked() -> Bool {
+        guard let capMicro = maxActualMicroUsd else { return false }
+        let capPico = UInt128Pair.mul64(UInt64(capMicro), 1_000_000)
+        return spendPicoUsd >= capPico
+    }
+
+    private func isSpendCapLowLocked() -> Bool {
+        guard let capMicro = maxActualMicroUsd else { return false }
+        if isSpendCapExceededLocked() { return false }
+        let warnPico = UInt128Pair.mul64(UInt64(capMicro), 900_000)
+        return spendPicoUsd >= warnPico
+    }
+
+    private func settleChatOutcomeLocked(outcome: ObserverOutcome, admissionID: UInt64?) {
+        defer {
+            if let owner = admissionID, cappedChatOwnerID == owner {
+                cappedChatOwnerID = nil
+                lock.broadcast()
+            }
+        }
+        guard outcome.upstreamRequestWritten else {
+            return
+        }
+        if outcome.transportComplete && outcome.httpStatus == 200, case .valid(let usage) = outcome.usageState {
+            let uncached = usage.promptTokens - usage.cachedPromptTokens
+            uncachedPromptTokensTotal = saturatingAddToken(uncachedPromptTokensTotal, uncached)
+            cachedPromptTokensTotal = saturatingAddToken(cachedPromptTokensTotal, usage.cachedPromptTokens)
+            completionTokensTotal = saturatingAddToken(completionTokensTotal, usage.completionTokens)
+            if usageReportedRequests < kMaxChatRequestsLimit {
+                usageReportedRequests += 1
+            }
+            if let rates = pricing {
+                let p1 = UInt128Pair.mul64(UInt64(uncached), UInt64(rates.inputMicroPerM))
+                let p2 = UInt128Pair.mul64(UInt64(usage.cachedPromptTokens), UInt64(rates.cachedInputMicroPerM))
+                let p3 = UInt128Pair.mul64(UInt64(usage.completionTokens), UInt64(rates.outputMicroPerM))
+                spendPicoUsd = spendPicoUsd.addingClamped(p1).addingClamped(p2).addingClamped(p3)
+            }
+            return
+        }
+        if maxActualMicroUsd != nil {
+            if usageUnreportedRequests < kMaxChatRequestsLimit {
+                usageUnreportedRequests += 1
+            }
+            spendIndeterminate = true
+            return
+        }
+        // Uncapped session: clean non-200 HTTP rejections are non-metered; 200 without usage or interrupted framing increments telemetry only.
+        if outcome.transportComplete, let st = outcome.httpStatus, st != 200 {
+            return
+        }
+        if usageUnreportedRequests < kMaxChatRequestsLimit {
+            usageUnreportedRequests += 1
+        }
+    }
+
     private func snapshotLocked() -> [String: Any] {
         let remaining = max(0, deadline - continuousSeconds())
         let left = Int(ceil(remaining))
-        return ["protocol": 1, "session_id": sessionID, "pid": Int(getpid()),
-                "model": allowedModel, "state": left > 0 && !cleanedUp ? "ON" : "OFF",
-                "generation": generation, "remaining_seconds": left, "remaining_milliseconds": Int(floor(remaining * 1000)), "expires_at": expiresAt,
-                "window_seconds": windowSeconds, "requests_used": chatRequestsUsed,
-                "request_limit": maxChatRequests, "requests_remaining": max(0, maxChatRequests - chatRequestsUsed)]
+        var snap: [String: Any] = [
+            "protocol": 1,
+            "session_id": sessionID,
+            "pid": Int(getpid()),
+            "model": allowedModel,
+            "state": left > 0 && !cleanedUp ? "ON" : "OFF",
+            "generation": generation,
+            "remaining_seconds": left,
+            "remaining_milliseconds": Int(floor(remaining * 1000)),
+            "expires_at": expiresAt,
+            "window_seconds": windowSeconds,
+            "requests_used": chatRequestsUsed,
+            "request_limit": maxChatRequests,
+            "requests_remaining": max(0, maxChatRequests - chatRequestsUsed),
+            "prompt_tokens": uncachedPromptTokensTotal + cachedPromptTokensTotal,
+            "cached_prompt_tokens": cachedPromptTokensTotal,
+            "completion_tokens": completionTokensTotal,
+            "usage_reported_requests": usageReportedRequests,
+            "usage_unreported_requests": usageUnreportedRequests,
+        ]
+        if pricing != nil {
+            snap["estimated_micro_usd"] = estimatedMicroUsdLocked()
+        }
+        if let capMicro = maxActualMicroUsd {
+            snap["max_actual_micro_usd"] = capMicro
+            snap["spend_cap_exceeded"] = isSpendCapExceededLocked()
+            snap["spend_cap_low"] = isSpendCapLowLocked()
+            snap["spend_indeterminate"] = spendIndeterminate
+        }
+        return snap
     }
 
     private func credentialEnvelope(token: Data, generation: Int) throws -> Data {
@@ -2157,6 +3574,13 @@ private final class ProxyServer: @unchecked Sendable {
         if action == "status", request.count == 1 {
             lock.lock(); let result = snapshotLocked(); lock.unlock(); reply(result); return
         }
+        #if SE_KEY_TESTING
+        if action == "debug_pool_stats", request.count == 1 {
+            let st = observerPool.stats()
+            reply(["current_reserved_bytes": st.current, "peak_reserved_bytes": st.peak, "limit_bytes": observerPool.limitBytes])
+            return
+        }
+        #endif
         guard action == "renew", Set(request.keys) == Set(["action", "seconds", "session_id", "generation"]),
               let number = request["seconds"] as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID(),
               number.doubleValue == Double(number.intValue), (1...86400).contains(number.intValue),
@@ -2170,6 +3594,7 @@ private final class ProxyServer: @unchecked Sendable {
             return !cleanedUp && generation == requestedGeneration.intValue
                 && generation < maxSessionGenerations
                 && continuousSeconds() < deadline && chatRequestsUsed < maxChatRequests
+                && !spendIndeterminate && !isSpendCapExceededLocked() && cappedChatOwnerID == nil
         }
         lock.lock(); let canRenew = eligible(); lock.unlock()
         guard canRenew, let authorize = renewalAuthorizer, let tokenPath = sessionTokenFile else {
@@ -2251,6 +3676,7 @@ private final class ProxyServer: @unchecked Sendable {
         lock.lock()
         if !cleanedUp {
             cleanedUp = true
+            lock.broadcast()
             bestEffortZero(&apiKeyData)
             bestEffortZero(&activeSessionToken)
             for index in retiredSessionTokens.indices { bestEffortZero(&retiredSessionTokens[index]) }
@@ -2271,8 +3697,32 @@ private final class ProxyServer: @unchecked Sendable {
     }
 
     func handleClient(fd: Int32) {
+        var myAdmissionID: UInt64? = nil
+        var usageObserver: ChatUsageObserver? = nil
+        var forceIncompleteOnFinalize = false
+        var finalizedOutcome = false
+        func finishRequestUsageOnce() {
+            if finalizedOutcome { return }
+            finalizedOutcome = true
+            if let obs = usageObserver {
+                let outcome = obs.detachAndFinalize(forceIncomplete: forceIncompleteOnFinalize)
+                lock.lock()
+                settleChatOutcomeLocked(outcome: outcome, admissionID: myAdmissionID)
+                lock.unlock()
+            } else if let owner = myAdmissionID {
+                lock.lock()
+                if cappedChatOwnerID == owner {
+                    cappedChatOwnerID = nil
+                    lock.broadcast()
+                }
+                lock.unlock()
+            }
+        }
         let delegate = StreamingForwardDelegate(clientFD: fd, timeoutSeconds: streamTimeoutSeconds)
-        defer { delegate.closeClientSocket() }
+        defer {
+            finishRequestUsageOnce()
+            delegate.closeClientSocket()
+        }
         lock.lock(); let expired = continuousSeconds() >= deadline; lock.unlock()
         if expired {
             sendHTTPError(clientFD: fd, status: 401, statusText: "Unauthorized", errorCode: "session_expired", message: "Session authorization expired")
@@ -2694,11 +4144,74 @@ private final class ProxyServer: @unchecked Sendable {
                 return
             }
 
-            // Enforce session chat request budget before forwarding
+            // Enforce session chat request and spend budgets (with owned single-flight admission on capped sessions)
+            let waitDeadline = continuousSeconds() + Double(streamTimeoutSeconds)
+            var waitedInQueue = false
             lock.lock()
-            if continuousSeconds() >= deadline {
+            if maxActualMicroUsd != nil {
+                while cappedChatOwnerID != nil {
+                    waitedInQueue = true
+                    if isClientWriteSideDisconnected(fd) {
+                        lock.unlock()
+                        return
+                    }
+                    if cleanedUp || continuousSeconds() >= deadline {
+                        lock.unlock()
+                        sendHTTPError(clientFD: fd, status: 401, statusText: "Unauthorized", errorCode: "session_expired", message: "Session authorization expired")
+                        return
+                    }
+                    if continuousSeconds() >= waitDeadline {
+                        lock.unlock()
+                        sendHTTPError(clientFD: fd, status: 503, statusText: "Service Unavailable", errorCode: "session_busy", message: "Timed out waiting for in-flight spend-capped request to complete")
+                        return
+                    }
+                    lock.wait(until: Date(timeIntervalSinceNow: 0.1))
+                }
+                if isClientWriteSideDisconnected(fd) {
+                    lock.unlock()
+                    return
+                }
+                if waitedInQueue && continuousSeconds() >= waitDeadline {
+                    lock.unlock()
+                    sendHTTPError(clientFD: fd, status: 503, statusText: "Service Unavailable", errorCode: "session_busy", message: "Timed out waiting for in-flight spend-capped request to complete")
+                    return
+                }
+            }
+            if isClientWriteSideDisconnected(fd) {
+                lock.unlock()
+                return
+            }
+            if cleanedUp || continuousSeconds() >= deadline {
                 lock.unlock()
                 sendHTTPError(clientFD: fd, status: 401, statusText: "Unauthorized", errorCode: "session_expired", message: "Session authorization expired")
+                return
+            }
+            // Revalidate presented token under lock after any wait (closes token-rotation race across queued chats)
+            if !constantTimeEquals(providedToken, activeSessionToken) {
+                lock.unlock()
+                rejectStaleCredential(fd: fd, providedToken: providedToken, nonce: sessionRequestID)
+                return
+            }
+            if spendIndeterminate {
+                lock.unlock()
+                sendHTTPError(
+                    clientFD: fd,
+                    status: 429,
+                    statusText: "Too Many Requests",
+                    errorCode: "session_spend_indeterminate",
+                    message: "Session spend could not be verified after an unreported or interrupted upstream request; stop and start a fresh session."
+                )
+                return
+            }
+            if let capMicro = maxActualMicroUsd, isSpendCapExceededLocked() {
+                lock.unlock()
+                sendHTTPError(
+                    clientFD: fd,
+                    status: 429,
+                    statusText: "Too Many Requests",
+                    errorCode: "session_spend_budget_exceeded",
+                    message: "Session spend cap (\(formatMicroUsdForMessage(capMicro))) reached"
+                )
                 return
             }
             if chatRequestsUsed >= maxChatRequests {
@@ -2712,8 +4225,20 @@ private final class ProxyServer: @unchecked Sendable {
                 )
                 return
             }
+            if maxActualMicroUsd != nil {
+                nextAdmissionID &+= 1
+                if nextAdmissionID == 0 { nextAdmissionID = 1 }
+                myAdmissionID = nextAdmissionID
+                cappedChatOwnerID = myAdmissionID
+            }
             chatRequestsUsed += 1
             lock.unlock()
+
+            // Start the upstream request timeout window after single-flight admission is acquired.
+            delegate.resetDeadline()
+            let obs = ChatUsageObserver(pool: observerPool)
+            usageObserver = obs
+            delegate.setUsageObserver(obs)
             outboundBody = canonicalBody
         }
 
@@ -2736,6 +4261,7 @@ private final class ProxyServer: @unchecked Sendable {
             forwardViaVerifiedLoopbackSocket(
                 binding: binding,
                 delegate: delegate,
+                usageObserver: usageObserver,
                 method: method,
                 upstreamBaseURL: upstreamBaseURL,
                 upstreamPath: upstreamPath,
@@ -2744,6 +4270,7 @@ private final class ProxyServer: @unchecked Sendable {
                 outboundBody: outboundBody,
                 apiKeyStr: apiKeyStr
             )
+            finishRequestUsageOnce()
             return
         }
 
@@ -2775,9 +4302,11 @@ private final class ProxyServer: @unchecked Sendable {
 
         let session = URLSession(configuration: urlSession.configuration, delegate: delegate, delegateQueue: nil)
         let task = session.dataTask(with: upstreamReq)
+        usageObserver?.markUpstreamRequestWritten()
         task.resume()
         let finished = delegate.waitForCompletion(timeoutSeconds: Double(streamTimeoutSeconds))
         if !finished {
+            forceIncompleteOnFinalize = true
             delegate.cancelAndShutdownSocket()
             task.cancel()
             session.invalidateAndCancel()
@@ -2785,6 +4314,40 @@ private final class ProxyServer: @unchecked Sendable {
         } else {
             session.finishTasksAndInvalidate()
         }
+        finishRequestUsageOnce()
+    }
+
+    private func isClientWriteSideDisconnected(_ fd: Int32) -> Bool {
+        // Detect peer write-side teardown (RST / EPIPE / ECONNRESET / EBADF) without falsely rejecting
+        // a legal HTTP/1.1 client that has merely half-closed its write side via shutdown(SHUT_WR).
+        let kq = kqueue()
+        if kq >= 0 {
+            defer { close(kq) }
+            var ch = kevent(
+                ident: UInt(fd),
+                filter: Int16(EVFILT_WRITE),
+                flags: UInt16(EV_ADD | EV_ONESHOT),
+                fflags: 0,
+                data: 0,
+                udata: nil
+            )
+            var ev = kevent()
+            var ts = timespec(tv_sec: 0, tv_nsec: 0)
+            let n = kevent(kq, &ch, 1, &ev, 1, &ts)
+            if n < 0 {
+                if errno == EBADF { return true }
+            } else if n > 0 {
+                if (ev.flags & UInt16(EV_EOF | EV_ERROR)) != 0 || ev.fflags != 0 {
+                    return true
+                }
+            }
+        }
+        var errVal: Int32 = 0
+        var errLen = socklen_t(MemoryLayout<Int32>.size)
+        if getsockopt(fd, SOL_SOCKET, SO_ERROR, &errVal, &errLen) == 0 && errVal != 0 {
+            return true
+        }
+        return false
     }
 
     private func writeNonBlocking(_ fd: Int32, data: Data, delegate: StreamingForwardDelegate) -> Bool {
@@ -2901,6 +4464,7 @@ private final class ProxyServer: @unchecked Sendable {
     private func forwardViaVerifiedLoopbackSocket(
         binding: UpstreamProcessBinding,
         delegate: StreamingForwardDelegate,
+        usageObserver: ChatUsageObserver?,
         method: String,
         upstreamBaseURL: URL,
         upstreamPath: String,
@@ -3023,8 +4587,18 @@ private final class ProxyServer: @unchecked Sendable {
         }
         reqHeader += "\r\n"
 
-        guard let reqHeaderData = reqHeader.data(using: .utf8),
-              writeNonBlocking(upFD, data: reqHeaderData, delegate: delegate) else {
+        guard let reqHeaderData = reqHeader.data(using: .utf8) else {
+            delegate.sendErrorSafe(
+                status: 502,
+                statusText: "Bad Gateway",
+                errorCode: "upstream_error",
+                message: "Failed encoding request headers for upstream"
+            )
+            return
+        }
+        // Conservative write milestone: mark upstream write attempted immediately before first write()
+        usageObserver?.markUpstreamRequestWritten()
+        guard writeNonBlocking(upFD, data: reqHeaderData, delegate: delegate) else {
             delegate.sendErrorSafe(
                 status: 502,
                 statusText: "Bad Gateway",
@@ -3080,8 +4654,7 @@ private final class ProxyServer: @unchecked Sendable {
             }
         }
 
-        guard let headerEnd = respHeaderEnd,
-              let respHeaderStr = String(data: upBuf.subdata(in: 0..<headerEnd.lowerBound), encoding: .utf8) else {
+        guard let headerEnd = respHeaderEnd else {
             delegate.sendErrorSafe(
                 status: 502,
                 statusText: "Bad Gateway",
@@ -3091,22 +4664,26 @@ private final class ProxyServer: @unchecked Sendable {
             return
         }
 
+        // Strict raw-byte parsing of status line and RFC 9110 header field lines (preserves legal obs-text 0x80..0xFF)
+        let rawHeaderBytes = [UInt8](upBuf.subdata(in: 0..<headerEnd.lowerBound))
         var remBuf = Data(upBuf.subdata(in: headerEnd.upperBound..<upBuf.count))
-        let respLines = respHeaderStr.components(separatedBy: "\r\n")
-        guard let statusLine = respLines.first else {
-            delegate.sendErrorSafe(
-                status: 502,
-                statusText: "Bad Gateway",
-                errorCode: "upstream_error",
-                message: "Empty upstream status line"
-            )
-            return
+
+        var rawLines: [[UInt8]] = []
+        var lineStart = 0
+        var scanIdx = 0
+        while scanIdx < rawHeaderBytes.count {
+            if scanIdx + 1 < rawHeaderBytes.count && rawHeaderBytes[scanIdx] == 0x0D && rawHeaderBytes[scanIdx + 1] == 0x0A {
+                rawLines.append(Array(rawHeaderBytes[lineStart..<scanIdx]))
+                scanIdx += 2
+                lineStart = scanIdx
+            } else {
+                scanIdx += 1
+            }
         }
-        let statusParts = statusLine.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
-        guard statusParts.count >= 2,
-              statusParts[0].hasPrefix("HTTP/1."),
-              let statusCode = Int(statusParts[1]),
-              (100...599).contains(statusCode) else {
+        rawLines.append(Array(rawHeaderBytes[lineStart..<rawHeaderBytes.count]))
+
+        guard let statusLineBytes = rawLines.first,
+              let statusCode = parseHTTPStatusLineBytes(statusLineBytes) else {
             delegate.sendErrorSafe(
                 status: 502,
                 statusText: "Bad Gateway",
@@ -3119,28 +4696,59 @@ private final class ProxyServer: @unchecked Sendable {
         var respContentType = "application/json"
         var isChunked = false
         var respContentLength: Int? = nil
+        var contentLengthCount = 0
+        var transferEncodingCount = 0
+        var framingInvalid = false
 
-        for line in respLines.dropFirst() {
-            if line.isEmpty { continue }
-            guard let colonIdx = line.firstIndex(of: ":") else { continue }
-            let hName = String(line[..<colonIdx]).trimmingCharacters(in: .whitespaces).lowercased()
-            let hVal = String(line[line.index(after: colonIdx)...]).trimmingCharacters(in: .whitespaces)
-            switch hName {
+        for lineBytes in rawLines.dropFirst() {
+            if lineBytes.isEmpty {
+                framingInvalid = true
+                continue
+            }
+            guard let parsed = parseHTTPFieldLineBytes(lineBytes) else {
+                framingInvalid = true
+                continue
+            }
+            switch parsed.nameLowerASCII {
             case "content-type":
-                respContentType = hVal
+                let trimmed = trimASCIIOWS(parsed.valueBytes)
+                if let ct = parseASCIIPureASCIIString(trimmed), !ct.isEmpty {
+                    respContentType = ct
+                } else {
+                    framingInvalid = true
+                }
             case "transfer-encoding":
-                if hVal.lowercased().contains("chunked") {
+                transferEncodingCount += 1
+                let trimmed = trimASCIIOWS(parsed.valueBytes)
+                if let teStr = parseASCIIPureASCIIString(trimmed), teStr.lowercased() == "chunked" {
                     isChunked = true
+                } else {
+                    framingInvalid = true
                 }
             case "content-length":
-                if let cl = Int(hVal), cl >= 0 {
+                contentLengthCount += 1
+                let trimmed = trimASCIIOWS(parsed.valueBytes)
+                if let clStr = parseASCIIPureASCIIString(trimmed),
+                   !clStr.isEmpty,
+                   clStr.utf8.allSatisfy({ $0 >= 0x30 && $0 <= 0x39 }),
+                   let cl = Int(clStr), cl >= 0 {
                     respContentLength = cl
+                } else {
+                    framingInvalid = true
                 }
             default:
-                // Strip Set-Cookie and all other non-essential headers
+                // Strip Set-Cookie and all other non-essential headers; legal obs-text accepted above
                 break
             }
         }
+
+        if contentLengthCount > 1 || transferEncodingCount > 1 || (transferEncodingCount > 0 && contentLengthCount > 0) {
+            framingInvalid = true
+        }
+        if framingInvalid {
+            usageObserver?.markFramingInvalid()
+        }
+        usageObserver?.onHeaders(status: statusCode, contentType: respContentType)
 
         guard delegate.writeHeadersSafe(status: statusCode, contentType: respContentType) else {
             return
@@ -3148,6 +4756,7 @@ private final class ProxyServer: @unchecked Sendable {
 
         if isChunked {
             let crlf = Data([0x0D, 0x0A])
+            var sawCleanTerminalTrailer = false
             while true {
                 // Find chunk-size line ending in \r\n
                 while remBuf.range(of: crlf) == nil {
@@ -3159,36 +4768,47 @@ private final class ProxyServer: @unchecked Sendable {
                         return
                     }
                 }
-                guard let lineRange = remBuf.range(of: crlf),
-                      let sizeLine = String(data: remBuf.subdata(in: 0..<lineRange.lowerBound), encoding: .utf8) else {
+                guard let lineRange = remBuf.range(of: crlf) else {
                     return
                 }
+                let sizeLineBytes = [UInt8](remBuf.subdata(in: 0..<lineRange.lowerBound))
                 remBuf.removeSubrange(0..<lineRange.upperBound)
 
-                let hexPart = sizeLine.split(separator: ";", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init)?.trimmingCharacters(in: .whitespaces) ?? ""
-                // Cap chunk hex digits at 8 (<= 0xFFFFFFFF) and require every character to be a hex digit
-                guard !hexPart.isEmpty, hexPart.count <= 8,
-                      hexPart.allSatisfy({ $0.isHexDigit }),
-                      let chunkSize = Int(hexPart, radix: 16), chunkSize >= 0 else {
+                guard let parsedChunk = parseChunkSizeLineBytes(sizeLineBytes) else {
+                    usageObserver?.markFramingInvalid()
                     return
                 }
+                if parsedChunk.hasExtension {
+                    // Chunk extensions are unsupported for metering; fail closed on framing completeness.
+                    framingInvalid = true
+                    usageObserver?.markFramingInvalid()
+                }
+                let chunkSize = parsedChunk.size
 
                 if chunkSize == 0 {
-                    // Terminal chunk: consume optional trailers up to final \r\n
+                    // Terminal chunk: validate every non-empty trailer line and require explicit terminating empty \r\n
                     while true {
                         if let tRange = remBuf.range(of: crlf) {
                             let trailerLen = tRange.lowerBound
+                            let trailerBytes = [UInt8](remBuf.subdata(in: 0..<trailerLen))
                             remBuf.removeSubrange(0..<tRange.upperBound)
                             if trailerLen == 0 {
+                                sawCleanTerminalTrailer = true
                                 break
+                            }
+                            if parseHTTPFieldLineBytes(trailerBytes) == nil {
+                                framingInvalid = true
+                                usageObserver?.markFramingInvalid()
                             }
                         } else {
                             if remBuf.count > 16384 {
+                                usageObserver?.markFramingInvalid()
                                 return
                             }
                             let n = readIntoBufferNonBlocking(upFD, buffer: &remBuf, delegate: delegate)
                             if n <= 0 {
-                                break
+                                // EOF before terminating empty trailer line -> framing incomplete!
+                                return
                             }
                         }
                     }
@@ -3202,6 +4822,7 @@ private final class ProxyServer: @unchecked Sendable {
                         let slice = Data(remBuf.subdata(in: 0..<take))
                         remBuf.removeSubrange(0..<take)
                         remainingChunk -= take
+                        usageObserver?.onChunk(slice)
                         if !delegate.writeSafe(slice) {
                             return
                         }
@@ -3221,9 +4842,13 @@ private final class ProxyServer: @unchecked Sendable {
                     }
                 }
                 guard remBuf[remBuf.startIndex] == 0x0D && remBuf[remBuf.startIndex + 1] == 0x0A else {
+                    usageObserver?.markFramingInvalid()
                     return
                 }
                 remBuf.removeSubrange(0..<2)
+            }
+            if sawCleanTerminalTrailer && !framingInvalid {
+                usageObserver?.markTransportComplete()
             }
         } else if let cl = respContentLength {
             var remaining = cl
@@ -3232,6 +4857,7 @@ private final class ProxyServer: @unchecked Sendable {
                 let slice = Data(remBuf.subdata(in: 0..<take))
                 remBuf.removeSubrange(0..<take)
                 remaining -= take
+                usageObserver?.onChunk(slice)
                 if !delegate.writeSafe(slice) {
                     return
                 }
@@ -3243,27 +4869,40 @@ private final class ProxyServer: @unchecked Sendable {
                     return
                 }
                 remaining -= chunkBuf.count
+                usageObserver?.onChunk(chunkBuf)
                 if !delegate.writeSafe(chunkBuf) {
                     return
                 }
             }
+            if remaining == 0 && !framingInvalid {
+                usageObserver?.markTransportComplete()
+            }
         } else {
             if !remBuf.isEmpty {
+                usageObserver?.onChunk(remBuf)
                 if !delegate.writeSafe(remBuf) {
                     return
                 }
                 remBuf.removeAll()
             }
+            var sawCleanEOF = false
             while true {
                 var chunkBuf = Data()
                 let n = readIntoBufferNonBlocking(upFD, buffer: &chunkBuf, maxChunk: 16384, delegate: delegate)
                 if n > 0 {
+                    usageObserver?.onChunk(chunkBuf)
                     if !delegate.writeSafe(chunkBuf) {
                         return
                     }
+                } else if n == 0 {
+                    sawCleanEOF = true
+                    break
                 } else {
                     break
                 }
+            }
+            if sawCleanEOF && !framingInvalid {
+                usageObserver?.markTransportComplete()
             }
         }
     }
@@ -4234,6 +5873,75 @@ private func runSelftest() -> Int32 {
             return 1
         }
 
+        // Track 2: Deterministic offline metering, lexical JSON, SSE, raw-buffer pool, and 128-bit arithmetic selftests
+        func scanStr(_ s: String) -> UsageScanState {
+            let arr = Array(s.utf8)
+            return arr.withUnsafeBufferPointer { scanTopLevelUsageJSON($0) }
+        }
+        guard scanStr("{\"choices\":[{\"text\":\"hi\"}],\"us\\u0061ge\":{\"prompt_tokens\":100,\"completion_tokens\":25,\"prompt_tokens_details\":{\"cached_tokens\":40}}}")
+            == .valid(ParsedTokenUsage(promptTokens: 100, cachedPromptTokens: 40, completionTokens: 25)),
+              scanStr("{\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"cached_prompt_tokens\":3,\"cached_tokens\":3}}")
+            == .valid(ParsedTokenUsage(promptTokens: 10, cachedPromptTokens: 3, completionTokens: 5)),
+              scanStr("{\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5,\"cached_prompt_tokens\":3,\"cached_tokens\":4}}") == .invalid,
+              scanStr("{\"usage\":{\"prompt_tokens\":10,\"prompt_tokens\":12,\"completion_tokens\":5}}") == .invalid,
+              scanStr("{\"usage\":{\"prompt_tokens\":10.0,\"completion_tokens\":5}}") == .invalid,
+              scanStr("{\"usage\":{\"prompt_tokens\":1e2,\"completion_tokens\":5}}") == .invalid,
+              scanStr("{\"usage\":{\"prompt_tokens\":true,\"completion_tokens\":5}}") == .invalid,
+              scanStr("{\"usage\":{\"prompt_tokens\":0,\"completion_tokens\":0}}")
+            == .valid(ParsedTokenUsage(promptTokens: 0, cachedPromptTokens: 0, completionTokens: 0)) else {
+            writeStderr("selftest failed: lexical JSON usage scanner self-check failed")
+            return 1
+        }
+        // 128-bit exact half-microdollar check: 1000 tokens * $0.0005/1M = 500_000 pico = 0.5 microdollar
+        let halfMicroPico = UInt128Pair.mul64(1000, 500)
+        let displayMicro = halfMicroPico.addingClamped(UInt128Pair(hi: 0, lo: 500_000)).divMod1000000().quotient.clampedInt64(max: kMaxWireMicroUsd)
+        let cap1MicroPico = UInt128Pair.mul64(1, 1_000_000)
+        guard displayMicro == 1, halfMicroPico < cap1MicroPico,
+              halfMicroPico.addingClamped(halfMicroPico) >= cap1MicroPico else {
+            writeStderr("selftest failed: 128-bit half-microdollar arithmetic check failed")
+            return 1
+        }
+        // Pool hard ceiling + non-COW replacement check
+        let testPool = ObserverMemoryPool(limitBytes: 600)
+        let rb = OwnedRawBuffer(pool: testPool, maxBytes: 1024)
+        let chunk300 = [UInt8](repeating: 0x41, count: 300)
+        let ok1 = chunk300.withUnsafeBufferPointer { rb.append(bytes: $0.baseAddress!, length: $0.count) }
+        // Growing from 300 -> 600 requires reserving 600 while 300 is charged (= 900 > 600), so must fail without exceeding 600!
+        let ok2 = chunk300.withUnsafeBufferPointer { rb.append(bytes: $0.baseAddress!, length: $0.count) }
+        let peakDuring = testPool.stats().peak
+        rb.free()
+        let afterFree = testPool.stats().current
+        guard ok1 && !ok2 && peakDuring <= 600 && afterFree == 0 else {
+            writeStderr("selftest failed: OwnedRawBuffer pool ceiling/release check failed")
+            return 1
+        }
+        // SSE multi-line + bare colonless trailing data EOF + post-detach no-op + status-line & UTF-8 checks
+        let ssePool = ObserverMemoryPool(limitBytes: 131_072)
+        let sseObs = ChatUsageObserver(pool: ssePool)
+        sseObs.markUpstreamRequestWritten()
+        sseObs.onHeaders(status: 200, contentType: "text/event-stream")
+        sseObs.onChunk(Data("data: {\"usage\":\ndata: {\"prompt_tokens\":12,\"completion_tokens\":8}}\n\ndata\n".utf8))
+        sseObs.markTransportComplete()
+        let sseOut = sseObs.detachAndFinalize(forceIncomplete: false)
+        // Late callbacks after detachAndFinalize must remain strict no-ops with zero pool reservation
+        sseObs.onHeaders(status: 200, contentType: "application/json")
+        sseObs.onChunk(Data("{\"usage\":{\"prompt_tokens\":99,\"completion_tokens\":99}}".utf8))
+        sseObs.markTransportComplete()
+        let badUtf8Val: [UInt8] = Array("{\"choices\":\"".utf8) + [0xFF] + Array("\",\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}".utf8)
+        let badUtf8Key: [UInt8] = Array("{\"k".utf8) + [0xFF] + Array("\":1,\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}".utf8)
+        let goodUtf8Val: [UInt8] = Array("{\"choices\":\"caf\u{00E9}\u{1F680}\",\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":5}}".utf8)
+        let badValRes = badUtf8Val.withUnsafeBufferPointer { scanTopLevelUsageJSON($0) }
+        let badKeyRes = badUtf8Key.withUnsafeBufferPointer { scanTopLevelUsageJSON($0) }
+        let goodValRes = goodUtf8Val.withUnsafeBufferPointer { scanTopLevelUsageJSON($0) }
+        guard sseOut.usageState == .invalid && ssePool.stats().current == 0,
+              parseHTTPStatusLineBytes(Array("HTTP/1.1 200".utf8)) == nil,
+              parseHTTPStatusLineBytes(Array("HTTP/1.1 200 ".utf8)) == 200,
+              badValRes == .invalid && badKeyRes == .invalid,
+              goodValRes == .valid(ParsedTokenUsage(promptTokens: 10, cachedPromptTokens: 0, completionTokens: 5)) else {
+            writeStderr("selftest failed: SSE/post-detach/status-line/UTF-8 self-check failed")
+            return 1
+        }
+
         let laContext = LAContext()
         var bioErr: NSError?
         let canEvalBio = laContext.canEvaluatePolicy(.deviceOwnerAuthenticationWithBiometrics, error: &bioErr)
@@ -4364,6 +6072,10 @@ private func runProxy(args: [String]) -> Int32 {
     var controlSocket: String?
     var streamTimeoutSeconds = 300
     var defaultChatParamsRaw: String? = nil
+    var priceInputRaw: String? = nil
+    var priceOutputRaw: String? = nil
+    var priceCachedInputRaw: String? = nil
+    var maxActualUsdRaw: String? = nil
     var forceURLSession = false
     #if SE_KEY_TESTING
     var testEphemeralKeyFD: Int32?
@@ -4409,7 +6121,11 @@ private func runProxy(args: [String]) -> Int32 {
             if i < args.count { controlSocket = args[i] }
         case "--max-chat-requests":
             i += 1
-            if i < args.count, let v = Int(args[i]), v > 0 { maxChatRequests = v }
+            guard i < args.count, let v = Int(args[i]), v >= 1 && v <= kMaxChatRequestsLimit else {
+                writeStderr("Invalid value for --max-chat-requests: must be an integer in 1...\(kMaxChatRequestsLimit)")
+                return 2
+            }
+            maxChatRequests = v
         case "--max-request-bytes":
             i += 1
             if i < args.count, let v = Int(args[i]), v > 0 { maxRequestBytes = v }
@@ -4429,6 +6145,34 @@ private func runProxy(args: [String]) -> Int32 {
                 return 2
             }
             defaultChatParamsRaw = args[i]
+        case "--price-input-per-m":
+            i += 1
+            guard i < args.count else {
+                writeStderr("Missing value for --price-input-per-m")
+                return 2
+            }
+            priceInputRaw = args[i]
+        case "--price-output-per-m":
+            i += 1
+            guard i < args.count else {
+                writeStderr("Missing value for --price-output-per-m")
+                return 2
+            }
+            priceOutputRaw = args[i]
+        case "--price-cached-input-per-m":
+            i += 1
+            guard i < args.count else {
+                writeStderr("Missing value for --price-cached-input-per-m")
+                return 2
+            }
+            priceCachedInputRaw = args[i]
+        case "--max-actual-usd":
+            i += 1
+            guard i < args.count else {
+                writeStderr("Missing value for --max-actual-usd")
+                return 2
+            }
+            maxActualUsdRaw = args[i]
         default:
             #if SE_KEY_TESTING
             if args[i] == "--test-ephemeral-key-fd" {
@@ -4493,6 +6237,55 @@ private func runProxy(args: [String]) -> Int32 {
             writeStderr("Invalid --default-chat-params-json: \(error.localizedDescription)")
             return 2
         }
+    }
+
+    var pricingRates: PricingRates? = nil
+    let anyPricingFlag = (priceInputRaw != nil || priceOutputRaw != nil || priceCachedInputRaw != nil)
+    if anyPricingFlag {
+        guard let inRaw = priceInputRaw, let outRaw = priceOutputRaw else {
+            writeStderr("Both --price-input-per-m and --price-output-per-m are required whenever pricing flags are provided")
+            return 2
+        }
+        guard let inMicro = parseDecimalMicroUsd(inRaw, minMicro: 0, maxMicro: kMaxPriceMicroUsdPerM) else {
+            writeStderr("Invalid --price-input-per-m '\(inRaw)': must be a decimal in 0...10000 with at most 6 fractional digits")
+            return 2
+        }
+        guard let outMicro = parseDecimalMicroUsd(outRaw, minMicro: 0, maxMicro: kMaxPriceMicroUsdPerM) else {
+            writeStderr("Invalid --price-output-per-m '\(outRaw)': must be a decimal in 0...10000 with at most 6 fractional digits")
+            return 2
+        }
+        let cachedMicro: Int64
+        if let cRaw = priceCachedInputRaw {
+            guard let cm = parseDecimalMicroUsd(cRaw, minMicro: 0, maxMicro: kMaxPriceMicroUsdPerM) else {
+                writeStderr("Invalid --price-cached-input-per-m '\(cRaw)': must be a decimal in 0...10000 with at most 6 fractional digits")
+                return 2
+            }
+            cachedMicro = cm
+        } else {
+            cachedMicro = inMicro
+        }
+        pricingRates = PricingRates(
+            inputMicroPerM: inMicro,
+            outputMicroPerM: outMicro,
+            cachedInputMicroPerM: cachedMicro
+        )
+    }
+
+    var maxActualMicroUsd: Int64? = nil
+    if let capRaw = maxActualUsdRaw {
+        guard pricingRates != nil else {
+            writeStderr("--max-actual-usd requires --price-input-per-m and --price-output-per-m")
+            return 2
+        }
+        guard maxTokensCap > 0 else {
+            writeStderr("--max-actual-usd requires --max-tokens-cap > 0 so per-request output tokens are clamped")
+            return 2
+        }
+        guard let capMicro = parseDecimalMicroUsd(capRaw, minMicro: 1, maxMicro: kMaxActualMicroUsdLimit) else {
+            writeStderr("Invalid --max-actual-usd '\(capRaw)': must be a decimal in 0.000001...100000 with at most 6 fractional digits")
+            return 2
+        }
+        maxActualMicroUsd = capMicro
     }
 
     let scheme = (upURL.scheme ?? "").lowercased()
@@ -4637,6 +6430,8 @@ private func runProxy(args: [String]) -> Int32 {
         sessionTokenFile: sessionTokenFile,
         defaultChatParams: defaultChatParams,
         ttlSeconds: ttlSeconds,
+        pricing: pricingRates,
+        maxActualMicroUsd: maxActualMicroUsd,
         renewalAuthorizer: authorizeRenewal
     )
     #if SE_KEY_TESTING

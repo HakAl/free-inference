@@ -5550,7 +5550,7 @@ class LookoutRound3RegressionTests(unittest.TestCase):
                 with (
                     patch.dict(os.environ, env_map, clear=True),
                     patch.object(custody, "_resolve_passwd_home_dir", return_value=fake_home),
-                    patch.object(sess_mod, "_effective_runs_dir", return_value=target_runs),
+                    patch.object(sess_mod, "resolve_effective_runs_dir_details", return_value=(target_runs, None)),
                     patch.object(sess_mod, "select_model", return_value="tinfoil-deepseek-v4-1-flash"),
                     patch.object(sess_mod, "read_pid_record_for_model", return_value=fake_record),
                     patch.object(sess_mod, "status_for_record", return_value=dict(on_info)),
@@ -5596,7 +5596,7 @@ class LookoutRound3RegressionTests(unittest.TestCase):
             with (
                 patch.dict(os.environ, clean_env, clear=True),
                 patch.object(custody, "_resolve_passwd_home_dir", return_value=fake_home),
-                patch.object(sess_mod, "_effective_runs_dir", return_value=runs_dir),
+                patch.object(sess_mod, "resolve_effective_runs_dir_details", return_value=(runs_dir, None)),
                 patch.object(sess_mod, "select_model", return_value="tinfoil-deepseek-v4-1-flash"),
                 patch.object(sess_mod, "read_pid_record_for_model", return_value=fake_record),
                 patch.object(sess_mod, "status_for_record", return_value=dict(on_info)),
@@ -5622,7 +5622,7 @@ class LookoutRound3RegressionTests(unittest.TestCase):
             with (
                 patch.dict(os.environ, clean_env, clear=True),
                 patch.object(custody, "_resolve_passwd_home_dir", return_value=fake_home),
-                patch.object(sess_mod, "_effective_runs_dir", return_value=swap_runs),
+                patch.object(sess_mod, "resolve_effective_runs_dir_details", return_value=(swap_runs, None)),
                 patch.object(sess_mod, "select_model", return_value="tinfoil-deepseek-v4-1-flash"),
                 patch.object(sess_mod, "read_pid_record_for_model", return_value=fake_record),
                 patch.object(sess_mod, "status_for_record", side_effect=_swap_during_status),
@@ -5634,6 +5634,432 @@ class LookoutRound3RegressionTests(unittest.TestCase):
             self.assertEqual(ptr_after_swap["runs_ino"], int(orig_swap_st.st_ino))
         finally:
             shutil.rmtree(short_root, ignore_errors=True)
+
+    def test_inspect_active_runs_pointer_refusal_fifo_swaps_legacy_v1_and_pin_preservation(self) -> None:
+        from local_assist import custody
+
+        with tempfile.TemporaryDirectory(dir=SHORT_TMP_DIR) as tmp:
+            tmp_path = Path(tmp)
+            fake_home = tmp_path / "home"
+            fake_home.mkdir(mode=0o700)
+            live_runs = tmp_path / "live_runs"
+            live_runs.mkdir(mode=0o700)
+            fi_dir = fake_home / ".config" / "free-inference"
+            ptr_path = fi_dir / "active-runs.json"
+
+            with patch.object(custody, "_resolve_passwd_home_dir", return_value=fake_home):
+                # 1. Strictly absent when .config, free-inference, or active-runs.json is missing
+                self.assertEqual(custody.inspect_active_runs_pointer(pin_fd=False).status, "absent")
+                (fake_home / ".config").mkdir(mode=0o700)
+                self.assertEqual(custody.inspect_active_runs_pointer(pin_fd=False).status, "absent")
+                fi_dir.mkdir(mode=0o700)
+                os.chmod(fi_dir, 0o700)
+                self.assertEqual(custody.inspect_active_runs_pointer(pin_fd=False).status, "absent")
+
+                # 2. Schema-v1 compatibility when BOTH runs_dev and runs_ino are omitted (derives stat from descriptor)
+                ptr_path.write_text(json.dumps({"schema_version": 1, "runs_dir": str(live_runs)}) + "\n", encoding="utf-8")
+                os.chmod(ptr_path, 0o600)
+                res_legacy = custody.inspect_active_runs_pointer(pin_fd=True)
+                self.assertEqual(res_legacy.status, "ok")
+                self.assertEqual(res_legacy.path, live_runs.resolve())
+                self.assertEqual(res_legacy.stat_id, (live_runs.lstat().st_dev, live_runs.lstat().st_ino))
+
+                # Save pinned fd state to prove pin_fd=False leaves it completely untouched!
+                orig_pin_state = custody._PINNED_POINTER_FD_STATE
+                self.assertIsNotNone(orig_pin_state)
+
+                # Partial runs_dev/runs_ino pairs rejected without echoing raw content
+                for bad_obj in (
+                    {"schema_version": 1, "runs_dir": str(live_runs), "runs_dev": 1},
+                    {"schema_version": 1, "runs_dir": str(live_runs), "runs_ino": 1},
+                    {"schema_version": 1, "runs_dir": str(live_runs), "runs_dev": True, "runs_ino": 1},
+                ):
+                    ptr_path.write_text(json.dumps(bad_obj) + "\n", encoding="utf-8")
+                    os.chmod(ptr_path, 0o600)
+                    r_bad = custody.inspect_active_runs_pointer(pin_fd=False)
+                    self.assertEqual(r_bad.status, "refused")
+                    self.assertEqual(r_bad.reason_code, "pointer_malformed")
+                    # Existing pin untouched!
+                    self.assertEqual(custody._PINNED_POINTER_FD_STATE, orig_pin_state)
+
+                # 3. Token / control-character / embedded-NUL / deep-recursion / 0777-ancestor redaction
+                for hostile_raw in (
+                    json.dumps({"schema_version": 1, "runs_dir": "/tmp/se-session-0123456789abcdef0123456789abcdef\x1b[31m"}) + "\n",
+                    json.dumps({"schema_version": 1, "runs_dir": "/tmp/has\x00nul"}) + "\n",
+                    ("[" * 500) + ("]" * 500),
+                ):
+                    ptr_path.write_text(hostile_raw, encoding="utf-8")
+                    os.chmod(ptr_path, 0o600)
+                    r_hostile = custody.inspect_active_runs_pointer(pin_fd=False)
+                    self.assertEqual(r_hostile.status, "refused")
+                    self.assertNotIn("se-session-", r_hostile.message or "")
+                    self.assertNotIn("\x1b", r_hostile.message or "")
+                    self.assertNotIn("\x00", r_hostile.message or "")
+                    self.assertNotIn("se-session-", r_hostile.remediation or "")
+
+                # Sentinel-bearing 0777 ancestor must NOT leak ancestor name in refusal message!
+                world_parent = tmp_path / "SENTINEL_WORLD_ANCESTOR_777"
+                world_parent.mkdir(mode=0o700)
+                os.chmod(world_parent, 0o777)
+                world_runs = world_parent / "runs"
+                world_runs.mkdir(mode=0o700)
+                try:
+                    ptr_path.write_text(json.dumps({"schema_version": 1, "runs_dir": str(world_runs)}) + "\n", encoding="utf-8")
+                    os.chmod(ptr_path, 0o600)
+                    r_world = custody.inspect_active_runs_pointer(pin_fd=False, allow_code_root_ancestors=False)
+                    self.assertEqual(r_world.status, "refused")
+                    self.assertEqual(r_world.reason_code, "target_untrusted_ancestor")
+                    self.assertFalse(r_world.ancestor_owned_group_writable)
+                    self.assertNotIn("SENTINEL_WORLD_ANCESTOR_777", r_world.message or "")
+                    self.assertNotIn("SENTINEL_WORLD_ANCESTOR_777", r_world.remediation or "")
+                    self.assertIsNone(r_world.untrusted_ancestor)
+                finally:
+                    os.chmod(world_parent, 0o700)
+
+                # Owned 0770 ancestor with spaces emits shell-quoted chmod whose operand round-trips to the exact path!
+                import shlex as _shlex
+
+                space_parent = tmp_path / "gw dev dir"
+                space_parent.mkdir(mode=0o700)
+                os.chmod(space_parent, 0o770)
+                space_runs = space_parent / "runs"
+                space_runs.mkdir(mode=0o700)
+                try:
+                    ptr_path.write_text(json.dumps({"schema_version": 1, "runs_dir": str(space_runs)}) + "\n", encoding="utf-8")
+                    os.chmod(ptr_path, 0o600)
+                    r_space = custody.inspect_active_runs_pointer(pin_fd=False, allow_code_root_ancestors=False)
+                    self.assertEqual(r_space.status, "refused")
+                    self.assertTrue(r_space.ancestor_owned_group_writable)
+                    self.assertTrue(r_space.ancestor_path_shell_safe)
+                    rem_text = r_space.remediation or ""
+                    self.assertIn("chmod 0750 ", rem_text)
+                    cmd_inner = rem_text.split("(", 1)[1].split(")", 1)[0]
+                    parsed_argv = _shlex.split(cmd_inner)
+                    self.assertEqual(parsed_argv[:2], ["chmod", "0750"])
+                    self.assertEqual(Path(parsed_argv[2]).resolve(), space_parent.resolve())
+                finally:
+                    os.chmod(space_parent, 0o700)
+
+                # Owned 0770 ancestor with Unicode line-separator escapes display text AND omits bogus chmod command!
+                sp_parent = tmp_path / "gw dev\u2028dir"
+                sp_parent.mkdir(mode=0o700)
+                os.chmod(sp_parent, 0o770)
+                sp_runs = sp_parent / "runs"
+                sp_runs.mkdir(mode=0o700)
+                try:
+                    ptr_path.write_text(json.dumps({"schema_version": 1, "runs_dir": str(sp_runs)}) + "\n", encoding="utf-8")
+                    os.chmod(ptr_path, 0o600)
+                    r_sp = custody.inspect_active_runs_pointer(pin_fd=False, allow_code_root_ancestors=False)
+                    self.assertEqual(r_sp.status, "refused")
+                    self.assertTrue(r_sp.ancestor_owned_group_writable)
+                    self.assertFalse(r_sp.ancestor_path_shell_safe)
+                    self.assertNotIn("\u2028", r_sp.message or "")
+                    self.assertIn("\\u2028", r_sp.message or "")
+                    self.assertNotIn("chmod 0750", r_sp.remediation or "")
+                    # write_active_runs_pointer warning also omits bogus chmod operand for escaped path!
+                    fake_sp_anc = frozenset({str(sp_parent.resolve()), str(sp_runs.resolve())})
+                    w_err = io.StringIO()
+                    with (
+                        patch.object(custody, "_CODE_ROOT_ANCESTORS", fake_sp_anc),
+                        redirect_stderr(w_err),
+                    ):
+                        custody.write_active_runs_pointer(sp_runs)
+                    self.assertIn("\\u2028", w_err.getvalue())
+                    self.assertNotIn("chmod 0750", w_err.getvalue())
+                finally:
+                    os.chmod(sp_parent, 0o700)
+
+                # 4. Non-blocking FIFO refusal (must never hang!)
+                ptr_path.unlink()
+                os.mkfifo(ptr_path, 0o600)
+                try:
+                    r_fifo = custody.inspect_active_runs_pointer(pin_fd=False)
+                    self.assertEqual(r_fifo.status, "refused")
+                    self.assertEqual(r_fifo.reason_code, "pointer_mode_invalid")
+                finally:
+                    ptr_path.unlink()
+
+                # 5. 0770 group-writable ancestor refused when allow_code_root_ancestors=False
+                gw_parent = tmp_path / "gw_dev"
+                gw_parent.mkdir(mode=0o700)
+                os.chmod(gw_parent, 0o770)
+                gw_runs = gw_parent / "runs"
+                gw_runs.mkdir(mode=0o700)
+                try:
+                    ptr_path.write_text(json.dumps({"schema_version": 1, "runs_dir": str(gw_runs)}) + "\n", encoding="utf-8")
+                    os.chmod(ptr_path, 0o600)
+                    r_gw = custody.inspect_active_runs_pointer(pin_fd=False, allow_code_root_ancestors=False)
+                    self.assertEqual(r_gw.status, "refused")
+                    self.assertEqual(r_gw.reason_code, "target_untrusted_ancestor")
+                    self.assertTrue(r_gw.ancestor_owned_group_writable)
+                    self.assertIn("chmod 0750", r_gw.remediation or "")
+                finally:
+                    os.chmod(gw_parent, 0o700)
+
+                # 6. Parent-chain swaps on BOTH post-read AND ENOENT for both .config and free-inference
+                for swap_target in ("free-inference", ".config"):
+                    for mode_kind in ("post_read", "enoent"):
+                        h_sw = tmp_path / f"h_{swap_target.strip('.')}_{mode_kind}"
+                        h_sw.mkdir(mode=0o700)
+                        c_sw = h_sw / ".config"
+                        c_sw.mkdir(mode=0o700)
+                        f_sw = c_sw / "free-inference"
+                        f_sw.mkdir(mode=0o700)
+                        os.chmod(f_sw, 0o700)
+                        p_sw = f_sw / "active-runs.json"
+                        if mode_kind == "post_read":
+                            p_sw.write_text(json.dumps({"schema_version": 1, "runs_dir": str(live_runs)}) + "\n", encoding="utf-8")
+                            os.chmod(p_sw, 0o600)
+
+                        def _do_swap(_t=swap_target, _c=c_sw, _f=f_sw) -> None:
+                            if _t == "free-inference":
+                                _f.rename(_c / "free-inference.old")
+                                _f.mkdir(mode=0o700)
+                                os.chmod(_f, 0o700)
+                            else:
+                                _c.rename(_c.parent / ".config.old")
+                                _c.mkdir(mode=0o700)
+
+                        with (
+                            patch.object(custody, "_resolve_passwd_home_dir", return_value=h_sw),
+                            patch.object(custody, "_before_pointer_chain_recheck_hook", side_effect=_do_swap),
+                        ):
+                            r_sw = custody.inspect_active_runs_pointer(pin_fd=False)
+                        self.assertEqual(r_sw.status, "refused", f"{swap_target}/{mode_kind}")
+                        self.assertEqual(r_sw.reason_code, "config_dir_untrusted", f"{swap_target}/{mode_kind}")
+
+                custody.clear_pinned_pointer_fd()
+
+    def test_write_active_runs_pointer_advisory_portability_warning_and_io_safety(self) -> None:
+        from local_assist import custody
+
+        with tempfile.TemporaryDirectory(dir=SHORT_TMP_DIR) as tmp:
+            tmp_path = Path(tmp)
+            fake_home = tmp_path / "home"
+            fake_home.mkdir(mode=0o700)
+            gw_parent = tmp_path / "gw_dev"
+            gw_parent.mkdir(mode=0o700)
+            os.chmod(gw_parent, 0o770)
+            gw_runs = gw_parent / "runs"
+            gw_runs.mkdir(mode=0o700)
+            try:
+                fake_ancestors = frozenset({str(gw_parent.resolve()), str(gw_runs.resolve())})
+                out_buf = io.StringIO()
+                err_buf = io.StringIO()
+                with (
+                    patch.object(custody, "_resolve_passwd_home_dir", return_value=fake_home),
+                    patch.object(custody, "_CODE_ROOT_ANCESTORS", fake_ancestors),
+                    redirect_stdout(out_buf),
+                    redirect_stderr(err_buf),
+                ):
+                    ptr = custody.write_active_runs_pointer(gw_runs)
+                self.assertTrue(ptr.is_file())
+                self.assertEqual(out_buf.getvalue(), "")
+                err_lines = [ln for ln in err_buf.getvalue().splitlines() if ln.strip()]
+                self.assertEqual(len(err_lines), 1)
+                self.assertIn("WARNING:", err_lines[0])
+                self.assertIn("chmod 0750", err_lines[0])
+
+                # Non-chmod portability failure (e.g. target_identity_changed) must NOT suggest chmod
+                fake_non_chmod = custody._build_pointer_refusal("target_identity_changed")
+                err_buf2 = io.StringIO()
+                with (
+                    patch.object(custody, "_resolve_passwd_home_dir", return_value=fake_home),
+                    patch.object(custody, "_CODE_ROOT_ANCESTORS", fake_ancestors),
+                    patch.object(custody, "check_runs_dir_custody_portability", return_value=fake_non_chmod),
+                    redirect_stderr(err_buf2),
+                ):
+                    ptr2 = custody.write_active_runs_pointer(gw_runs)
+                self.assertTrue(ptr2.is_file())
+                self.assertIn("WARNING:", err_buf2.getvalue())
+                self.assertNotIn("chmod", err_buf2.getvalue())
+
+                # Broken stderr write must NEVER fail an already-committed publication!
+                class _BrokenStderr:
+                    def write(self, _s: str) -> int:
+                        raise OSError("broken pipe")
+
+                with (
+                    patch.object(custody, "_resolve_passwd_home_dir", return_value=fake_home),
+                    patch.object(custody, "_CODE_ROOT_ANCESTORS", fake_ancestors),
+                    patch.object(sys, "stderr", _BrokenStderr()),
+                ):
+                    ptr3 = custody.write_active_runs_pointer(gw_runs)
+                self.assertTrue(ptr3.is_file())
+            finally:
+                os.chmod(gw_parent, 0o700)
+
+    def test_custody_refused_pointer_cli_and_resolver_precedence(self) -> None:
+        from local_assist import custody, registry, session as sess_mod
+
+        with tempfile.TemporaryDirectory(dir=SHORT_TMP_DIR) as tmp:
+            tmp_path = Path(tmp)
+            fake_home = tmp_path / "home"
+            fake_home.mkdir(mode=0o700)
+            fi_dir = fake_home / ".config" / "free-inference"
+            fi_dir.mkdir(parents=True, mode=0o700)
+            os.chmod(fake_home / ".config", 0o700)
+            os.chmod(fi_dir, 0o700)
+
+            gw_parent = tmp_path / "gw_dev"
+            gw_parent.mkdir(mode=0o700)
+            os.chmod(gw_parent, 0o770)
+            gw_runs = gw_parent / "runs"
+            gw_runs.mkdir(mode=0o700)
+            ptr_path = fi_dir / "active-runs.json"
+            ptr_path.write_text(json.dumps({"schema_version": 1, "runs_dir": str(gw_runs)}) + "\n", encoding="utf-8")
+            os.chmod(ptr_path, 0o600)
+
+            try:
+                # 1. Resolver precedence: worker_or_reap_cli with live DEFAULT_RUNS_DIR skips pointer even if is_custody_tree returns True!
+                boot_worker = custody.CustodyBootstrapState(
+                    custody_mode=False,
+                    worker_or_reap_cli=True,
+                    launcher_site_packages=None,
+                    cli_runs_dir=None,
+                )
+                with (
+                    patch.object(custody, "get_active_bootstrap_state", return_value=boot_worker),
+                    patch.object(registry, "_store_has_live_pid_record", return_value=True),
+                    patch.object(custody, "is_custody_tree", return_value=True),
+                    patch.object(custody, "inspect_active_runs_pointer") as mock_ptr,
+                ):
+                    resolved_dir, resolved_ptr = registry.resolve_effective_runs_dir_details()
+                self.assertEqual(resolved_dir, registry.DEFAULT_RUNS_DIR)
+                self.assertIsNone(resolved_ptr)
+                mock_ptr.assert_not_called()
+
+                # 2. Custody session status/watch/start/stop/renew on refused pointer WITH real fallback PID records on disk!
+                fallback_runs = tmp_path / "fallback_custody_runs"
+                fallback_runs.mkdir(mode=0o700)
+                (fallback_runs / ".serve-tinfoil-deepseek-v4-1-flash-b41fc330.pid").write_text(
+                    json.dumps({
+                        "model_id": "tinfoil-deepseek-v4-1-flash",
+                        "repo": "deepseek-v4-1-flash",
+                        "pid": os.getpid(),
+                        "pid_lstart": "Sat Nov 21 07:00:00 2026",
+                        "session_token_file": str(fallback_runs / ".se-session-fake.token"),
+                        "status": "ready",
+                    }),
+                    encoding="utf-8",
+                )
+                (fallback_runs / ".serve-qwen3-30b-a3b-2507-mlx-4bit-2aee4a3e.pid").write_text(
+                    json.dumps({
+                        "model_id": "qwen3-30b-a3b-2507-mlx-4bit",
+                        "repo": "mlx-community/Qwen3-30B-A3B-Instruct-2507-4bit",
+                        "pid": os.getpid(),
+                        "pid_lstart": "Sat Nov 21 07:00:00 2026",
+                        "status": "ready",
+                    }),
+                    encoding="utf-8",
+                )
+                boot_custody = custody.CustodyBootstrapState(
+                    custody_mode=True,
+                    worker_or_reap_cli=False,
+                    launcher_site_packages=None,
+                    cli_runs_dir=None,
+                )
+                with (
+                    patch.object(custody, "_resolve_passwd_home_dir", return_value=fake_home),
+                    patch.object(custody, "get_active_bootstrap_state", return_value=boot_custody),
+                    patch.object(custody, "is_custody_tree", return_value=True),
+                    patch.object(registry, "DEFAULT_RUNS_DIR", fallback_runs),
+                ):
+                    for action in ("status", "watch"):
+                        out_b = io.StringIO()
+                        err_b = io.StringIO()
+                        with redirect_stdout(out_b), redirect_stderr(err_b):
+                            rc = sess_mod.main([action, "--model", "tinfoil-deepseek-v4-1-flash", "--json"])
+                        self.assertEqual(rc, 1)
+                        payload = json.loads(out_b.getvalue())
+                        self.assertEqual(payload["state"], "UNKNOWN")
+                        self.assertEqual(payload["pointer_status"], "refused")
+                        self.assertEqual(payload["pointer_reason"], "target_untrusted_ancestor")
+                        self.assertIn("chmod 0750", err_b.getvalue())
+
+                    for action in ("start", "stop", "renew"):
+                        err_b = io.StringIO()
+                        with redirect_stderr(err_b):
+                            rc = sess_mod.main([action, "--model", "tinfoil-deepseek-v4-1-flash"])
+                        self.assertEqual(rc, 1)
+                        self.assertIn("refused", err_b.getvalue().lower())
+
+                # 3. Real CLI scripts/opencode-attested and scripts/opencode-local in custody mode WITH real fallback PID records:
+                #    - Refused pointer -> exit 1 (NOT exit 4 opencode_session_unavailable, zero launcher_exit.json)
+                #    - Absent pointer + no live session -> opencode-attested worker mode exits 4 + launcher_exit.json;
+                #      opencode-local --print-config preserves existing behavior (exit 0)
+                att_mod = _load_script_module("opencode_attested_ptr_refusal", "scripts/opencode-attested")
+                loc_mod = _load_script_module("opencode_local_ptr_refusal", "scripts/opencode-local")
+                exit_file = tmp_path / "launcher_exit.json"
+                with (
+                    patch.object(custody, "_resolve_passwd_home_dir", return_value=fake_home),
+                    patch.object(custody, "get_active_bootstrap_state", return_value=boot_custody),
+                    patch.object(custody, "is_custody_tree", return_value=True),
+                    patch.object(registry, "DEFAULT_RUNS_DIR", fallback_runs),
+                ):
+                    err_att = io.StringIO()
+                    with redirect_stderr(err_att):
+                        rc_att = att_mod.main([
+                            "--unattended-worker",
+                            "--model", "tinfoil-deepseek-v4-1-flash",
+                            "--run-token", "run-token-ptr-refused-1",
+                            "--launcher-exit-file", str(exit_file),
+                            "--", "run", "hi",
+                        ])
+                    self.assertEqual(rc_att, 1)
+                    self.assertFalse(exit_file.exists(), "Refused pointer must not emit exit-4 launcher_exit.json")
+                    self.assertIn("refused", err_att.getvalue().lower())
+
+                    err_loc = io.StringIO()
+                    with redirect_stderr(err_loc):
+                        rc_loc = loc_mod.main(["opencode-local", "--print-config"])
+                    self.assertEqual(rc_loc, 1)
+                    self.assertIn("refused", err_loc.getvalue().lower())
+
+                # Absent pointer + no live session -> attested worker mode preserves exit 4 + launcher_exit.json;
+                # opencode-local --print-config preserves existing exit 0 behavior!
+                ptr_path.unlink()
+                fake_oc = tmp_path / "fake-opencode"
+                fake_oc.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                os.chmod(fake_oc, 0o755)
+                fake_sb = tmp_path / "fake-sandbox-exec"
+                fake_sb.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+                os.chmod(fake_sb, 0o755)
+                empty_runs = tmp_path / "empty_custody_runs"
+                empty_runs.mkdir(mode=0o700)
+                loc_iso_home = tmp_path / "loc_iso_home"
+                with (
+                    patch.object(custody, "_resolve_passwd_home_dir", return_value=fake_home),
+                    patch.object(custody, "get_active_bootstrap_state", return_value=boot_custody),
+                    patch.object(custody, "is_custody_tree", return_value=True),
+                    patch.object(registry, "DEFAULT_RUNS_DIR", empty_runs),
+                    patch.object(att_mod, "resolve_opencode_binary", return_value=(str(fake_oc), None)),
+                    patch.dict(os.environ, {"FREE_INFERENCE_SANDBOX_EXEC_BIN": str(fake_sb)}, clear=False),
+                    redirect_stderr(io.StringIO()),
+                ):
+                    rc_abs = att_mod.main([
+                        "--unattended-worker",
+                        "--model", "tinfoil-deepseek-v4-1-flash",
+                        "--run-token", "run-token-ptr-absent-1",
+                        "--launcher-exit-file", str(exit_file),
+                        "--", "run", "hi",
+                    ])
+                    out_loc_abs = io.StringIO()
+                    with (
+                        patch.object(loc_mod, "_resolve_isolated_home", return_value=loc_iso_home),
+                        patch.object(loc_mod, "ensure_model_served", return_value=(True, "")) as mock_loc_serve,
+                        redirect_stdout(out_loc_abs),
+                    ):
+                        rc_loc_abs = loc_mod.main(["opencode-local", "--print-config"])
+                    mock_loc_serve.assert_called_once()
+                self.assertEqual(rc_abs, 4)
+                self.assertTrue(exit_file.is_file())
+                ex_doc = json.loads(exit_file.read_text(encoding="utf-8"))
+                self.assertEqual(ex_doc["reason"], "opencode_session_unavailable")
+                self.assertEqual(rc_loc_abs, 0)
+                self.assertIn("private-local", out_loc_abs.getvalue())
+            finally:
+                os.chmod(gw_parent, 0o700)
 
 
 if __name__ == "__main__":

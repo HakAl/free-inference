@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+from decimal import Decimal, InvalidOperation
 import errno
 import functools
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -23,10 +25,16 @@ from typing import Any
 from .paths import ROOT
 from .registry import (ATTESTED_ENCLAVE_TIERS, RegistryError, list_pid_records, load_model, load_models,
                        read_pid_record_for_model, resolve_endpoint, session_token_file_for_model)
-from .registry import _effective_runs_dir
+from .registry import _effective_runs_dir, resolve_effective_runs_dir_details
 
 DEFAULT_WINDOW_SECONDS = 7200
 MAX_WINDOW_SECONDS = 86400
+MAX_CHAT_REQUESTS_LIMIT = 2_147_483_647
+MAX_CUMULATIVE_TOKENS = 1_000_000_000_000
+MAX_WIRE_MICRO_USD = 100_000_000_000_000
+MAX_ACTUAL_MICRO_USD = 100_000_000_000
+MAX_PRICE_MICRO_USD_PER_M = 10_000_000_000
+_ASCII_DECIMAL_RE = re.compile(r'([0-9]{1,6})(?:\.([0-9]{1,6}))?', re.ASCII)
 
 
 class OperatorError(ValueError):
@@ -101,6 +109,52 @@ def parse_duration(text: str) -> int:
     if not 1 <= seconds <= MAX_WINDOW_SECONDS:
         raise ValueError('Window must be between 1s and 24h.')
     return seconds
+
+
+def parse_usd_to_micro_usd(raw: str) -> int:
+    """Parse a strict ASCII decimal USD cap in [0.000001, 100000] into exact integer microdollars."""
+    if not isinstance(raw, str) or not raw or len(raw) > 32:
+        raise ValueError('USD amount must be a decimal in 0.000001..100000 with at most 6 fractional digits.')
+    m = _ASCII_DECIMAL_RE.fullmatch(raw)
+    if m is None:
+        raise ValueError('USD amount must be a decimal in 0.000001..100000 with at most 6 fractional digits.')
+    whole = int(m.group(1))
+    frac = int((m.group(2) or '').ljust(6, '0'))
+    micro = whole * 1_000_000 + frac
+    if not 1 <= micro <= MAX_ACTUAL_MICRO_USD:
+        raise ValueError('USD amount must be between 0.000001 and 100000.')
+    return micro
+
+
+def price_float_to_micro_usd(val: Any) -> int:
+    """Convert normalized numeric YAML pricing (USD per 1M tokens) in [0, 10000] to integer microdollars."""
+    if isinstance(val, bool) or not isinstance(val, (int, float)):
+        raise ValueError('Price per 1M tokens must be a finite non-negative number.')
+    if not math.isfinite(float(val)):
+        raise ValueError('Price per 1M tokens must be finite.')
+    try:
+        dec = Decimal(str(val))
+    except InvalidOperation as exc:
+        raise ValueError('Invalid numeric price value.') from exc
+    if dec < 0 or dec > Decimal(10000):
+        raise ValueError('Price per 1M tokens must be between 0 and 10000.')
+    scaled = dec * Decimal(1_000_000)
+    if scaled != scaled.to_integral_value():
+        raise ValueError('Price per 1M tokens supports at most 6 fractional digits.')
+    micro = int(scaled)
+    if not 0 <= micro <= MAX_PRICE_MICRO_USD_PER_M:
+        raise ValueError('Price per 1M tokens out of range.')
+    return micro
+
+
+def format_micro_usd_decimal(micro: int) -> str:
+    """Format exact non-negative integer microdollars as a canonical ASCII decimal string without exponent notation."""
+    if type(micro) is not int or micro < 0:
+        raise ValueError('microdollars must be a non-negative integer.')
+    whole, frac = divmod(micro, 1_000_000)
+    if frac == 0:
+        return str(whole)
+    return f'{whole}.{frac:06d}'.rstrip('0')
 
 
 def control_path(runs_dir: Path, model_id: str) -> Path:
@@ -237,7 +291,10 @@ def _probe_control_socket_via_ctl_fd(
         if 0 < proc.returncode < 126:
             raise OSError(proc.returncode, 'Session control connection failed.')
         raise ValueError('Session control helper unavailable.')
-    result = json.loads(proc.stdout.split(b'\n', 1)[0])
+    try:
+        result = json.loads(proc.stdout.split(b'\n', 1)[0])
+    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError):
+        raise ValueError('Malformed session control response.') from None
     if not isinstance(result, dict) or 'error' in result:
         raise ValueError('Session control refused the operation; check status before retrying.')
     return result
@@ -361,7 +418,192 @@ def sanitize_status(raw: dict, *, expected_model: str, expected_pid: int) -> dic
                 or not max(0, raw['remaining_seconds']-1)*1000 <= milliseconds <= raw['remaining_seconds']*1000):
             raise ValueError('Invalid continuous remaining time.')
         result['remaining_milliseconds'] = milliseconds
+
+    usage_keys = (
+        'prompt_tokens',
+        'cached_prompt_tokens',
+        'completion_tokens',
+        'usage_reported_requests',
+        'usage_unreported_requests',
+    )
+    usage_present = [k for k in usage_keys if k in raw]
+    if usage_present:
+        if len(usage_present) != len(usage_keys):
+            raise ValueError('Incomplete session usage counters.')
+        if raw['requests_used'] > MAX_CHAT_REQUESTS_LIMIT:
+            raise ValueError('Session requests_used exceeds wire range.')
+        for k in usage_keys:
+            v = raw[k]
+            if type(v) is not int or v < 0:
+                raise ValueError('Invalid session usage counter.')
+        cached_tok = raw['cached_prompt_tokens']
+        prompt_tok = raw['prompt_tokens']
+        comp_tok = raw['completion_tokens']
+        rep_reqs = raw['usage_reported_requests']
+        unrep_reqs = raw['usage_unreported_requests']
+        if (
+            cached_tok > MAX_CUMULATIVE_TOKENS
+            or cached_tok > prompt_tok
+            or (prompt_tok - cached_tok) > MAX_CUMULATIVE_TOKENS
+            or comp_tok > MAX_CUMULATIVE_TOKENS
+            or rep_reqs > MAX_CHAT_REQUESTS_LIMIT
+            or unrep_reqs > MAX_CHAT_REQUESTS_LIMIT
+            or (rep_reqs + unrep_reqs) > raw['requests_used']
+        ):
+            raise ValueError('Inconsistent or out-of-range session usage counters.')
+        for k in usage_keys:
+            result[k] = raw[k]
+
+    if 'estimated_micro_usd' in raw:
+        if not usage_present:
+            raise ValueError('estimated_micro_usd requires session usage counters.')
+        est_micro = raw['estimated_micro_usd']
+        if type(est_micro) is not int or not 0 <= est_micro <= MAX_WIRE_MICRO_USD:
+            raise ValueError('Invalid estimated_micro_usd.')
+        result['estimated_micro_usd'] = est_micro
+
+    cap_keys = (
+        'max_actual_micro_usd',
+        'spend_cap_exceeded',
+        'spend_cap_low',
+        'spend_indeterminate',
+    )
+    cap_present = [k for k in cap_keys if k in raw]
+    if cap_present:
+        if len(cap_present) != len(cap_keys) or 'estimated_micro_usd' not in result:
+            raise ValueError('Incomplete session spend-cap status.')
+        cap_micro = raw['max_actual_micro_usd']
+        if type(cap_micro) is not int or not 1 <= cap_micro <= MAX_ACTUAL_MICRO_USD:
+            raise ValueError('Invalid max_actual_micro_usd.')
+        for bk in ('spend_cap_exceeded', 'spend_cap_low', 'spend_indeterminate'):
+            if type(raw[bk]) is not bool:
+                raise ValueError(f'Invalid boolean spend-cap flag: {bk}.')
+        if raw['spend_cap_exceeded'] and raw['spend_cap_low']:
+            raise ValueError('Inconsistent spend_cap_exceeded and spend_cap_low flags.')
+        for k in cap_keys:
+            result[k] = raw[k]
+
     return result
+
+
+def compute_estimated_usd(
+    status: dict,
+    pricing: dict[str, Any] | None = None,
+) -> tuple[float | None, str | None]:
+    if 'estimated_micro_usd' in status and type(status['estimated_micro_usd']) is int:
+        return round(status['estimated_micro_usd'] / 1_000_000.0, 6), 'proxy'
+    if (
+        'prompt_tokens' in status
+        and 'cached_prompt_tokens' in status
+        and 'completion_tokens' in status
+        and isinstance(pricing, dict)
+        and 'input' in pricing
+        and 'output' in pricing
+    ):
+        try:
+            in_micro = price_float_to_micro_usd(pricing['input'])
+            out_micro = price_float_to_micro_usd(pricing['output'])
+            cached_micro = (
+                price_float_to_micro_usd(pricing['cached_input'])
+                if pricing.get('cached_input') is not None
+                else in_micro
+            )
+        except ValueError:
+            return None, None
+        uncached = int(status['prompt_tokens']) - int(status['cached_prompt_tokens'])
+        if uncached < 0:
+            return None, None
+        pico = (
+            uncached * in_micro
+            + int(status['cached_prompt_tokens']) * cached_micro
+            + int(status['completion_tokens']) * out_micro
+        )
+        micro = min(MAX_WIRE_MICRO_USD, (pico + 500_000) // 1_000_000)
+        return round(micro / 1_000_000.0, 6), 'catalog'
+    return None, None
+
+
+def enrich_status(status: dict, *, model_id: str) -> dict:
+    """Return a credential-free status copy enriched with derived USD fields and provenance."""
+    out = {k: v for k, v in status.items() if k != 'token'}
+    out['model_id'] = model_id
+    if 'prompt_tokens' in out:
+        pricing: dict[str, Any] | None = None
+        if 'estimated_micro_usd' not in out:
+            try:
+                ep = resolve_endpoint(load_model(model_id), require_api_key=False)
+                pricing = ep.pricing_per_m_tokens
+            except Exception:
+                pricing = None
+        est_usd, est_src = compute_estimated_usd(out, pricing)
+        out['estimated_usd'] = est_usd
+        out['estimated_usd_source'] = est_src
+    if 'max_actual_micro_usd' in out and type(out['max_actual_micro_usd']) is int:
+        out['max_actual_usd'] = round(out['max_actual_micro_usd'] / 1_000_000.0, 6)
+    return out
+
+
+def verify_live_spend_cap(
+    info: dict,
+    requested_max_actual_micro_usd: int,
+    *,
+    model_id: str,
+    require_exact: bool = False,
+) -> str | None:
+    """Verify live control-socket status satisfies the requested spend cap and is currently usable."""
+    if not isinstance(info, dict) or info.get('state') != 'ON':
+        state = info.get('state', 'UNKNOWN') if isinstance(info, dict) else 'UNKNOWN'
+        return (
+            f"Refusing session for '{model_id}': live control state is {state!r}; "
+            "an active ON session enforcing --max-actual-usd is required."
+        )
+    if type(info.get('requests_remaining')) is not int or info['requests_remaining'] <= 0:
+        return (
+            f"Refusing session for '{model_id}': active session has 0 requests remaining. "
+            f"Run './scripts/stop-model {model_id}' and start a fresh session."
+        )
+    live_cap = info.get('max_actual_micro_usd')
+    if type(live_cap) is not int or live_cap < 1:
+        return (
+            f"Refusing session for '{model_id}': active session does not enforce a live --max-actual-usd spend cap "
+            f"(requested ${format_micro_usd_decimal(requested_max_actual_micro_usd)}). "
+            f"Run './scripts/stop-model {model_id}' and relaunch with --max-actual-usd."
+        )
+    if info.get('spend_indeterminate') is not False:
+        if info.get('spend_indeterminate') is True:
+            return (
+                f"Refusing session for '{model_id}': active session spend is indeterminate after an unreported or interrupted request. "
+                f"Run './scripts/stop-model {model_id}' and start a fresh session."
+            )
+        return (
+            f"Refusing session for '{model_id}': active session status is missing a valid boolean spend_indeterminate flag. "
+            f"Run './scripts/stop-model {model_id}' and start a fresh session."
+        )
+    if info.get('spend_cap_exceeded') is not False:
+        if info.get('spend_cap_exceeded') is True:
+            return (
+                f"Refusing session for '{model_id}': active session spend cap (${format_micro_usd_decimal(live_cap)}) is already exhausted. "
+                f"Run './scripts/stop-model {model_id}' and start a fresh session."
+            )
+        return (
+            f"Refusing session for '{model_id}': active session status is missing a valid boolean spend_cap_exceeded flag. "
+            f"Run './scripts/stop-model {model_id}' and start a fresh session."
+        )
+    if require_exact:
+        if live_cap != requested_max_actual_micro_usd:
+            return (
+                f"Refusing session for '{model_id}': started proxy reported max_actual_usd="
+                f"${format_micro_usd_decimal(live_cap)}, expected ${format_micro_usd_decimal(requested_max_actual_micro_usd)}."
+            )
+    else:
+        if live_cap > requested_max_actual_micro_usd:
+            return (
+                f"Refusing session for '{model_id}': active session spend cap "
+                f"(${format_micro_usd_decimal(live_cap)}) exceeds requested --max-actual-usd "
+                f"${format_micro_usd_decimal(requested_max_actual_micro_usd)}. "
+                f"Run './scripts/stop-model {model_id}' and relaunch."
+            )
+    return None
 
 
 def status_for_record(record: dict, runs_dir: Path) -> dict:
@@ -378,9 +620,27 @@ def status_for_record(record: dict, runs_dir: Path) -> dict:
         raw = control_request(control_path(runs_dir, model_id), {'action': 'status'},
                               expected_pid=record['pid'])
         result = sanitize_status(raw, expected_model=record['repo'], expected_pid=record['pid'])
-        return dict(result, model_id=model_id)
+        return enrich_status(result, model_id=model_id)
     except (OSError, ValueError, KeyError):
         return {'state': 'UNKNOWN', 'model_id': model_id}
+
+
+def _format_token_count(count: int) -> str:
+    if count >= 1_000_000:
+        return f'{count / 1_000_000:.2f}M'
+    if count >= 1_000:
+        return f'{count / 1_000:.1f}k'
+    return str(count)
+
+
+def _format_usd_display(amount: float) -> str:
+    if amount == 0:
+        return '$0.00'
+    if amount < 0.01:
+        return f'${amount:.6f}'.rstrip('0').rstrip('.')
+    if amount < 1.0:
+        return f'${amount:.4f}'
+    return f'${amount:.2f}'
 
 
 def format_status(info: dict) -> str:
@@ -389,26 +649,68 @@ def format_status(info: dict) -> str:
     if state != 'ON':
         return f'{state}  {model}'
     remaining = info['remaining_seconds']
-    return (f"ON  {model}  {remaining // 3600}h {(remaining % 3600) // 60}m {remaining % 60}s remaining  "
+    base = (f"ON  {model}  {remaining // 3600}h {(remaining % 3600) // 60}m {remaining % 60}s remaining  "
             f"{info['requests_remaining']}/{info['request_limit']} requests left")
+    if 'prompt_tokens' not in info:
+        return base
+    prompt_tok = int(info['prompt_tokens'])
+    cached_tok = int(info.get('cached_prompt_tokens', 0))
+    comp_tok = int(info.get('completion_tokens', 0))
+    in_str = (
+        f"{_format_token_count(prompt_tok)} in ({_format_token_count(cached_tok)} cached)"
+        if cached_tok > 0
+        else f"{_format_token_count(prompt_tok)} in"
+    )
+    parts = [base, f"{in_str} / {_format_token_count(comp_tok)} out"]
+    est_usd = info.get('estimated_usd')
+    cap_usd = info.get('max_actual_usd')
+    if est_usd is not None:
+        usd_part = f"~{_format_usd_display(float(est_usd))}"
+        if cap_usd is not None:
+            usd_part += f"/{_format_usd_display(float(cap_usd))} cap"
+        elif info.get('estimated_usd_source') == 'catalog':
+            usd_part += ' (catalog est.)'
+        parts.append(usd_part)
+    if info.get('spend_indeterminate') is True:
+        parts.append('SPEND INDETERMINATE')
+    elif info.get('spend_cap_exceeded') is True:
+        parts.append('SPEND CAP REACHED')
+    unrep = int(info.get('usage_unreported_requests', 0))
+    if unrep > 0:
+        parts.append(f'({unrep} unreported)')
+    return '  '.join(parts)
 
 
 def warning_reason(info: dict) -> str | None:
     if info.get('state') != 'ON':
         return None
+    if info.get('spend_indeterminate') is True:
+        return 'spend indeterminate'
+    if info.get('spend_cap_exceeded') is True:
+        return 'spend cap reached'
     if info['remaining_seconds'] <= 300:
         return 'expires soon'
     if info['requests_remaining'] <= min(10, max(1, info['request_limit'] // 10)):
         return 'requests low'
+    if info.get('spend_cap_low') is True:
+        return 'spend cap low'
     return None
 
 
 class SessionLeaseSupplier:
     """Trusted parent only; identity-bound reads of atomically published credentials."""
-    def __init__(self, record: dict, runs_dir: Path):
+    def __init__(
+        self,
+        record: dict,
+        runs_dir: Path,
+        *,
+        expected_session_id: str | None = None,
+        required_max_actual_micro_usd: int | None = None,
+    ):
         self.record = dict(record)
         self.runs_dir = runs_dir
-        self.session_id: str | None = None
+        self.session_id: str | None = expected_session_id
+        self.required_max_actual_micro_usd: int | None = required_max_actual_micro_usd
         self._cached: dict | None = None
         self._lock = threading.RLock()
         self._watch: _ProcessWatch | None = None
@@ -458,15 +760,34 @@ class SessionLeaseSupplier:
             self._cached = result
             return dict(result)
 
+    def _check_cap_binding(self, snapshot: dict, *, initial: bool) -> None:
+        if self.required_max_actual_micro_usd is None:
+            return
+        model_id = str(self.record.get('model_id') or 'session')
+        if initial:
+            err = verify_live_spend_cap(
+                snapshot,
+                self.required_max_actual_micro_usd,
+                model_id=model_id,
+            )
+            if err is not None:
+                raise ValueError(err)
+        else:
+            live_cap = snapshot.get('max_actual_micro_usd')
+            if type(live_cap) is not int or live_cap < 1 or live_cap > self.required_max_actual_micro_usd:
+                raise ValueError('Session spend cap changed or disappeared; launch a new client.')
+
     def _read_current(self) -> dict:
         _validate_store(self.runs_dir)
         path = session_token_file_for_model(self.record['model_id'], self.runs_dir)
+        is_initial = self._cached is None
         for _ in range(2):
             before = status_for_record(self.record, self.runs_dir)
             if before['state'] != 'ON' or before['remaining_seconds'] <= 0:
                 raise ValueError('Session authorization is unavailable.')
             if self.session_id is not None and self.session_id != before['session_id']:
                 raise ValueError('Session was replaced; launch a new client.')
+            self._check_cap_binding(before, initial=is_initial)
             self.session_id = before['session_id']
             if self._watch is None:
                 self._watch = _ProcessWatch(self.record['pid'])
@@ -486,6 +807,7 @@ class SessionLeaseSupplier:
             if (after.get('session_id') != before['session_id']
                     or after.get('generation') != before['generation']):
                 continue
+            self._check_cap_binding(after, initial=is_initial)
             if (not isinstance(envelope, dict) or envelope.get('session_id') != before['session_id']
                     or envelope.get('generation') != before['generation']
                     or type(envelope.get('generation')) is not int
@@ -495,7 +817,7 @@ class SessionLeaseSupplier:
             if self.session_id is not None and self.session_id != before['session_id']:
                 raise ValueError('Session was replaced; launch a new client.')
             self.session_id = before['session_id']
-            return dict(before, token=envelope['token'])
+            return dict(after, token=envelope['token'])
         raise ValueError('Session changed during credential read.')
 
 
@@ -535,11 +857,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument('action', choices=['status', 'start', 'stop', 'renew', 'watch'])
     parser.add_argument('--model')
     parser.add_argument('--for', dest='window', type=parse_duration, default=DEFAULT_WINDOW_SECONDS)
+    parser.add_argument(
+        '--max-actual-usd',
+        dest='max_actual_micro_usd',
+        type=parse_usd_to_micro_usd,
+        default=None,
+        help='Optional live post-accounting USD spend cap enforced in se-key-proxy (start only).',
+    )
     parser.add_argument('--json', action='store_true')
     parser.add_argument('--notify', action='store_true', help='Send macOS notifications from foreground watch.')
     parser.add_argument('--launcher-site-packages', default=None, help='Explicit custody dependency directory.')
     parser.add_argument('--runs-dir', default=None, help='Explicit non-custody session store directory.')
     args = parser.parse_args(argv)
+    if args.max_actual_micro_usd is not None and args.action != 'start':
+        print('--max-actual-usd is only supported with session start.', file=sys.stderr)
+        return 2
     from .custody import (
         PINNED_RUNS_STAT_ENV_VAR,
         ensure_creatable_runs_dir,
@@ -572,7 +904,24 @@ def main(argv: list[str] | None = None) -> int:
         and not bool(os.environ.get('FREE_INFERENCE_RUNS_DIR', '').strip())
     )
     try:
-        runs = _effective_runs_dir()
+        runs, ptr_info = resolve_effective_runs_dir_details()
+        if ptr_info is not None and ptr_info.status == 'refused':
+            err_msg = ptr_info.message or 'Active session pointer was refused.'
+            rem_msg = ptr_info.remediation or ''
+            diag_line = f'{err_msg} {rem_msg}'.strip() if rem_msg else err_msg
+            if args.action in ('status', 'watch'):
+                print(diag_line, file=sys.stderr)
+                refused_info: dict[str, Any] = {
+                    'state': 'UNKNOWN',
+                    'model_id': args.model or 'unknown',
+                    'pointer_status': 'refused',
+                    'pointer_reason': ptr_info.reason_code,
+                    'pointer_error': err_msg,
+                    'remediation': rem_msg or None,
+                }
+                print(json.dumps(refused_info) if args.json else format_status(refused_info))
+                return 1
+            raise OperatorError(diag_line)
         if not in_custody and args.runs_dir is None:
             v_eff, eff_err = validate_creatable_runs_dir(runs, label='FREE_INFERENCE_RUNS_DIR')
             if eff_err is not None or v_eff is None:
@@ -587,6 +936,14 @@ def main(argv: list[str] | None = None) -> int:
             if info['state'] == 'UNKNOWN':
                 raise OperatorError('Existing session state is unknown; refusing automatic replacement.')
             if info['state'] == 'ON':
+                if args.max_actual_micro_usd is not None:
+                    cap_err = verify_live_spend_cap(
+                        info,
+                        args.max_actual_micro_usd,
+                        model_id=model_id,
+                    )
+                    if cap_err is not None:
+                        raise OperatorError(cap_err)
                 if should_publish_pointer and pinned_stat is not None:
                     try:
                         write_active_runs_pointer(runs, expected_stat=pinned_stat)
@@ -625,6 +982,11 @@ def main(argv: list[str] | None = None) -> int:
                     serve_env = dict(os.environ)
                     serve_env[PINNED_RUNS_STAT_ENV_VAR] = format_pinned_runs_stat(pinned_stat)
                 serve_cmd.extend([model_id, '--interactive', '--ttl-seconds', str(args.window)])
+                if args.max_actual_micro_usd is not None:
+                    serve_cmd.extend([
+                        '--max-actual-usd',
+                        format_micro_usd_decimal(args.max_actual_micro_usd),
+                    ])
                 sub_kw: dict[str, Any] = {'check': False, 'stdout': sys.stderr if args.json else None}
                 if serve_env is not None:
                     sub_kw['env'] = serve_env
@@ -633,6 +995,14 @@ def main(argv: list[str] | None = None) -> int:
                     return rc
                 record = read_pid_record_for_model(model_id, runs)
                 info = status_for_record(record, runs) if record else {'state': 'UNKNOWN', 'model_id': model_id}
+                if args.max_actual_micro_usd is not None:
+                    cap_err = verify_live_spend_cap(
+                        info,
+                        args.max_actual_micro_usd,
+                        model_id=model_id,
+                    )
+                    if cap_err is not None:
+                        raise OperatorError(cap_err)
         elif args.action == 'stop':
             # Existing stop code revalidates exact process identities before signaling.
             if record:
@@ -659,11 +1029,18 @@ def main(argv: list[str] | None = None) -> int:
         elif args.action == 'renew':
             if info['state'] != 'ON' or info['requests_remaining'] <= 0:
                 raise OperatorError('Renewal requires a live session with remaining requests.')
-            print(f"Authorize {model_id} for {args.window}s; request budget unchanged.", file=sys.stderr)
+            if info.get('spend_indeterminate') is True:
+                raise OperatorError('Renewal refused: session spend is indeterminate; stop and start a fresh session.')
+            if info.get('spend_cap_exceeded') is True:
+                raise OperatorError('Renewal requires remaining spend budget; stop and start a fresh session.')
+            print(f"Authorize {model_id} for {args.window}s; request and spend budgets unchanged.", file=sys.stderr)
             raw = control_request(control_path(runs, model_id), dict(action='renew', seconds=args.window,
                                   session_id=info['session_id'], generation=info['generation']),
                                   expected_pid=record['pid'], timeout=180)
-            info = dict(sanitize_status(raw, expected_model=record['repo'], expected_pid=record['pid']), model_id=model_id)
+            info = enrich_status(
+                sanitize_status(raw, expected_model=record['repo'], expected_pid=record['pid']),
+                model_id=model_id,
+            )
         elif args.action == 'watch':
             warned = set()
             while True:
@@ -672,9 +1049,12 @@ def main(argv: list[str] | None = None) -> int:
                 key = (info.get('session_id'), info.get('generation'), reason)
                 if reason and key not in warned:
                     warned.add(key)
-                    advice = ('Run session renew to authorize more time.' if reason == 'expires soon'
-                              and info['requests_remaining'] > 0 else
-                              'Renewal does not refill requests; a fresh budget needs an explicit stop/start.')
+                    if reason == 'expires soon' and info['requests_remaining'] > 0 and not info.get('spend_cap_exceeded') and not info.get('spend_indeterminate'):
+                        advice = 'Run session renew to authorize more time.'
+                    elif reason in ('spend indeterminate', 'spend cap reached', 'spend cap low'):
+                        advice = 'Renewal does not refill or clear spend caps; a fresh budget needs an explicit stop/start.'
+                    else:
+                        advice = 'Renewal does not refill requests; a fresh budget needs an explicit stop/start.'
                     message = f'{model_id}: {reason}. {advice}'
                     print(message, file=sys.stderr, flush=True)
                     if args.notify and sys.platform == 'darwin':
