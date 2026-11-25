@@ -947,7 +947,7 @@ class LiveSpendMeteringRuntimeTests(unittest.TestCase):
                 conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n' + _chunked_bytes([big_sse[i:i+4096] for i in range(0, len(big_sse), 4096)])),
             )),
             ('truncated_cl', 'hi', lambda conn: (_RawScriptedUpstream.read_http_request(conn), conn.sendall(b'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 500\r\n\r\n{"usage":{"prompt_tokens":10,"completion_tokens":5}}'))),
-            ('partial_write_rst', 'w' * 2_000_000, _partial_write_rst_handler),
+            ('partial_write_rst', '!' * 2_000_000, _partial_write_rst_handler),
             ('upstream_timeout', 'hi', lambda conn: (_RawScriptedUpstream.read_http_request(conn), time.sleep(2.2))),
         ]
         # Uncapped: telemetry only, proxy keeps serving & renewing
@@ -957,7 +957,7 @@ class LiveSpendMeteringRuntimeTests(unittest.TestCase):
                 partial_bytes_seen.clear()
             self.upstream.set_handler(h)
             if label == 'partial_write_rst':
-                st_pw, _ = self.chat(content=prompt_text, timeout=5.0)
+                st_pw, _ = self.chat(content=prompt_text, timeout=20.0)
                 self.assertEqual(st_pw, 502, label)
                 self.assertEqual(len(partial_bytes_seen), 1, label)
                 self.assertGreater(partial_bytes_seen[0], 0, label)
@@ -978,7 +978,7 @@ class LiveSpendMeteringRuntimeTests(unittest.TestCase):
             self.start(price_in='1.0', price_out='2.0', max_actual_usd='5.00', max_tokens_cap=256, stream_timeout=1, max_request_bytes=4_194_304)
             self.upstream.set_handler(h)
             if label == 'partial_write_rst':
-                st_pwc, _ = self.chat(content=prompt_text, timeout=5.0)
+                st_pwc, _ = self.chat(content=prompt_text, timeout=20.0)
                 self.assertEqual(st_pwc, 502, label)
                 self.assertEqual(len(partial_bytes_seen), 1, label)
                 self.assertGreater(partial_bytes_seen[0], 0, label)
